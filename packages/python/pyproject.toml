@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zerobucket"
-version = "0.1.0"
+version = "0.1.1"
 description = "Database-native image storage. Your database. Your images. Zero buckets."
 readme = "README.md"
 license = "MIT"
@@ -15,11 +15,14 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Database",
     "Topic :: Multimedia :: Graphics",
+    "Typing :: Typed",
 ]
 dependencies = [
     "psycopg[binary]>=3.1",
@@ -38,6 +41,8 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/KedarGhadyalji/ZeroBucket"
 Repository = "https://github.com/KedarGhadyalji/ZeroBucket"
+Issues = "https://github.com/KedarGhadyalji/ZeroBucket/issues"
+Changelog = "https://github.com/KedarGhadyalji/ZeroBucket/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zerobucket"]
