@@ -71,6 +71,9 @@ class PostgresBackend(StorageBackend):
             try:
                 self.migrate()
             except Exception:
+                # Don't leak the pool's background worker threads if setup
+                # fails partway through -- close it before propagating so
+                # callers (and test runners) don't hang on shutdown.
                 self._pool.close()
                 raise
 

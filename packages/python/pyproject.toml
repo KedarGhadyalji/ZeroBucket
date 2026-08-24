@@ -9,7 +9,7 @@ description = "Database-native image storage. Your database. Your images. Zero b
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-authors = [{ name = "ZeroBucket contributors" }]
+authors = [{ name = "Kedar Ghadyalji", email = "kedarghadyalji@gmail.com" }]
 keywords = ["image", "storage", "postgresql", "bytea", "s3-alternative"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -36,8 +36,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/zerobucket/zerobucket"
-Repository = "https://github.com/zerobucket/zerobucket"
+Homepage = "https://github.com/KedarGhadyalji/ZeroBucket"
+Repository = "https://github.com/KedarGhadyalji/ZeroBucket"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zerobucket"]
