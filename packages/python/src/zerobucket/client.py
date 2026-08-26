@@ -19,6 +19,7 @@ from typing import BinaryIO, Union
 from .adapters.base import StorageBackend
 from .adapters.postgres import PostgresBackend
 from .exceptions import ImageNotFoundError
+from .optimization import optimize_image
 from .types import Image, ImageMetadata
 from .validation import DEFAULT_MAX_PIXELS, SUPPORTED_FORMATS, validate_image
 
@@ -67,11 +68,41 @@ class ZeroBucket:
         self._max_pixels = max_pixels
         self._allowed_formats = allowed_formats
 
-    def put(self, image: ImageInput, *, filename: str | None = None) -> str:
-        """Validate, process, and store an image. Returns its id.
+    def put(
+        self,
+        image: ImageInput,
+        *,
+        filename: str | None = None,
+        optimize: bool = False,
+        max_width: int | None = None,
+        format: str | None = None,
+        quality: int | None = None,
+    ) -> str:
+        """Validate, optionally optimize, and store an image. Returns its id.
 
         Accepts a file path (str or PathLike), raw bytes, or any
         file-like object with a .read() method.
+
+        By default (optimize=False), the exact input bytes are stored
+        unchanged -- what you put in is byte-for-byte what you get back.
+
+        Args:
+            optimize: If True, strips metadata (EXIF/GPS/ICC) and applies
+                the max_width/format/quality options below. If False
+                (default), all of those are ignored and the original
+                bytes are stored as-is.
+            max_width: Downscale if wider than this (aspect ratio
+                preserved). Only applies when optimize=True.
+            format: Re-encode target -- "jpeg", "png", or "webp". None
+                keeps the original format. Only applies when
+                optimize=True. Note: quality has no effect when the
+                target (or original) format is PNG -- PNG has no lossy
+                quality setting.
+            quality: 1-100, JPEG/WebP only. Defaults to values chosen to
+                be visually lossless for typical photos (see
+                zerobucket.optimization for the reasoning and
+                tests/test_optimization.py for the SSIM regression test
+                that enforces it). Only applies when optimize=True.
         """
         data, resolved_filename = _read_image_input(image, filename)
 
@@ -81,15 +112,40 @@ class ZeroBucket:
             max_pixels=self._max_pixels,
             allowed_formats=self._allowed_formats,
         )
-        checksum = hashlib.sha256(data).hexdigest()
+
+        if optimize:
+            result = optimize_image(
+                data,
+                max_width=max_width,
+                target_format=format,
+                quality=quality,
+                max_bytes=self._max_bytes,
+                max_pixels=self._max_pixels,
+            )
+            final_data = result.data
+            mime_type = result.mime_type
+            width = result.width
+            height = result.height
+            size_bytes = result.size_bytes
+        else:
+            final_data = data
+            mime_type = validated.mime_type
+            width = validated.width
+            height = validated.height
+            size_bytes = validated.size_bytes
+
+        # Checksum is of the FINAL stored bytes, not the original input --
+        # this matters once dedup is built, so two uploads that produce
+        # identical stored bytes are recognized as identical.
+        checksum = hashlib.sha256(final_data).hexdigest()
 
         return self._backend.put(
-            data=data,
-            mime_type=validated.mime_type,
+            data=final_data,
+            mime_type=mime_type,
             original_filename=resolved_filename,
-            size_bytes=validated.size_bytes,
-            width=validated.width,
-            height=validated.height,
+            size_bytes=size_bytes,
+            width=width,
+            height=height,
             checksum_sha256=checksum,
         )
 
@@ -157,7 +213,9 @@ def _read_image_input(
         if isinstance(data, str):
             raise TypeError("File-like object must be opened in binary mode")
         raw_name = getattr(image, "filename", None) or getattr(image, "name", None)
-        resolved_filename = filename or (os.path.basename(raw_name) if raw_name else None)
+        resolved_filename = filename or (
+            os.path.basename(raw_name) if raw_name else None
+        )
         return data, resolved_filename
     raise TypeError(
         f"Unsupported image input type: {type(image)!r}. "

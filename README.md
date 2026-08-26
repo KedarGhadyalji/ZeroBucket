@@ -47,7 +47,7 @@ Application
 Images are stored as raw bytes in a `BYTEA` column, right next to the
 rest of your data. One database, one backup strategy, one thing to run.
 
-**What ZeroBucket does *not* do:** magically compress images into smaller
+**What ZeroBucket does _not_ do:** magically compress images into smaller
 strings, eliminate the storage cost of the bytes themselves, or replace
 S3 for large files or high-traffic media workloads. See
 [Limitations](#limitations) below -- this is a deliberate scope decision,
@@ -129,6 +129,31 @@ def serve_image(image_id):
 No manual decoding, no Base64, no internal transformation. `image.data`
 is the same bytes you'd get from `open(path, "rb").read()`.
 
+### Optimizing images (compression)
+
+`optimize=True` unlocks metadata stripping, resizing, and quality-based
+re-encoding -- off by default, so `put()` stores your exact input bytes
+unless you opt in:
+
+```python
+image_id = images.put(
+    "photo.jpg",
+    optimize=True,
+    max_width=1600,      # downscale if wider, aspect ratio preserved
+    format="webp",       # optional re-encode target: "jpeg", "png", "webp"
+    quality=90,           # 1-100, JPEG/WebP only; omit for data-backed defaults
+)
+```
+
+Defaults (`quality=90` JPEG, `quality=88` WebP) aren't guessed -- they're
+backed by real SSIM measurements across multiple content types. Typical
+photos see 70-95% size reduction with no visible quality loss; dense
+fine-texture content (foliage, fabric) sees smaller but still real gains.
+**One thing this data caught: don't convert flat/graphic content (UI
+screenshots, logos) to JPEG** -- it can make them larger, not smaller.
+See [`benchmarks/COMPRESSION_RESULTS.md`](benchmarks/COMPRESSION_RESULTS.md)
+for the full methodology and numbers.
+
 ## Supported formats
 
 JPEG, PNG, WebP. Format is detected from file content, not from filename
@@ -142,11 +167,11 @@ This isn't an arbitrary number -- see
 [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for measured latency and
 memory cost across image sizes. In short:
 
-| Range      | Behavior                                                          |
-|------------|--------------------------------------------------------------------|
-| up to ~1MB | Sub-50ms writes, sub-10ms reads, no measurable memory pressure. Feels like any other database write. |
-| 1-5MB      | Fine for occasional uploads (avatars, scans, product photos). Noticeable latency under load. |
-| 5-8MB      | Real latency and memory cost per request. Usable, but don't put it in a tight request loop. |
+| Range      | Behavior                                                                                              |
+| ---------- | ----------------------------------------------------------------------------------------------------- |
+| up to ~1MB | Sub-50ms writes, sub-10ms reads, no measurable memory pressure. Feels like any other database write.  |
+| 1-5MB      | Fine for occasional uploads (avatars, scans, product photos). Noticeable latency under load.          |
+| 5-8MB      | Real latency and memory cost per request. Usable, but don't put it in a tight request loop.           |
 | above 8MB  | Rejected by default. Raise `max_bytes` if you understand the tradeoff, or use object storage instead. |
 
 ## Limitations
@@ -172,7 +197,7 @@ Be honest with yourself about whether ZeroBucket fits your workload:
 - **Storing bytes in BYTEA does not compress them further than they
   already are.** JPEG/WebP files are already near-maximum entropy;
   Postgres's TOAST compression does essentially nothing to them (see
-  benchmark results). ZeroBucket saves you *infrastructure*, not
+  benchmark results). ZeroBucket saves you _infrastructure_, not
   storage bytes.
 
 ## Project structure
@@ -212,7 +237,7 @@ ruff check src/ tests/
 Not yet built, tracked honestly rather than implied:
 
 - [ ] TypeScript/npm package with an equivalent API
-- [ ] Optional resize/format-conversion pipeline (`optimize=True, max_width=...`)
+- [x] Optional resize/format-conversion pipeline (`optimize=True, max_width=...`)
 - [ ] Deduplication with reference counting
 - [ ] SQLite and MySQL adapters
 - [ ] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`)

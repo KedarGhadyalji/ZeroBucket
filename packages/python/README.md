@@ -38,14 +38,14 @@ in since Postgres 13).
 
 ## Quick reference
 
-| Method                             | What it does                                                                                                                                                         |
-| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `images.put(image, filename=None)` | Validates, checksums, and stores an image. Accepts a file path, raw `bytes`, or a file-like object (including framework upload objects). Returns the new image's id. |
-| `images.get(image_id)`             | Returns an `Image` (data, mime_type, filename, width, height, size_bytes, checksum_sha256). Raises `ImageNotFoundError` if missing.                                  |
-| `images.metadata(image_id)`        | Same fields as `get()` but without the raw bytes — cheap existence/info check.                                                                                       |
-| `images.exists(image_id)`          | Returns `True`/`False`.                                                                                                                                              |
-| `images.delete(image_id)`          | Deletes the image. Returns `True` if it existed.                                                                                                                     |
-| `images.close()`                   | Releases database connections. `ZeroBucket` also works as a context manager.                                                                                         |
+| Method                                                                                        | What it does                                                                                                                                                                               |
+| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `images.put(image, filename=None, optimize=False, max_width=None, format=None, quality=None)` | Validates, optionally optimizes, checksums, and stores an image. Accepts a file path, raw `bytes`, or a file-like object (including framework upload objects). Returns the new image's id. |
+| `images.get(image_id)`                                                                        | Returns an `Image` (data, mime_type, filename, width, height, size_bytes, checksum_sha256). Raises `ImageNotFoundError` if missing.                                                        |
+| `images.metadata(image_id)`                                                                   | Same fields as `get()` but without the raw bytes -- cheap existence/info check.                                                                                                            |
+| `images.exists(image_id)`                                                                     | Returns `True`/`False`.                                                                                                                                                                    |
+| `images.delete(image_id)`                                                                     | Deletes the image. Returns `True` if it existed.                                                                                                                                           |
+| `images.close()`                                                                              | Releases database connections. `ZeroBucket` also works as a context manager.                                                                                                               |
 
 ```python
 from zerobucket import ZeroBucket, ImageNotFoundError, ImageValidationError
@@ -87,36 +87,55 @@ def serve_image(image_id):
     return Response(image.data, mimetype=image.mime_type)
 ```
 
+### Optimizing images (compression)
+
+Off by default -- `put()` stores your exact input bytes unless you opt in:
+
+```python
+image_id = images.put(
+    "photo.jpg",
+    optimize=True,
+    max_width=1600,      # downscale if wider, aspect ratio preserved
+    format="webp",       # optional re-encode target: "jpeg", "png", "webp"
+    quality=90,           # 1-100, JPEG/WebP only; omit for data-backed defaults
+)
+```
+
+Quality defaults (JPEG=90, WebP=88) are backed by measured SSIM data
+across multiple content types -- typical photos see 70-95% size
+reduction with no visible quality loss. One thing this data caught:
+**don't target `format="jpeg"` for flat/graphic content** (screenshots,
+logos) -- it can make them larger, not smaller. See
+[`COMPRESSION_RESULTS.md`](https://github.com/KedarGhadyalji/ZeroBucket/blob/main/benchmarks/COMPRESSION_RESULTS.md)
+on GitHub for the full methodology.
+
 ## What it validates
 
-- **Format**: JPEG, PNG, WebP — detected from actual file content, never
+- **Format**: JPEG, PNG, WebP -- detected from actual file content, never
   from filename extension or a client-supplied `Content-Type` header.
 - **Corruption**: truncated or malformed images are decoded and rejected
   before they reach the database.
 - **Decompression bombs**: a tiny compressed file that decodes to an
   enormous pixel grid is rejected, not silently allocated.
-- **Size**: configurable via `max_bytes` (default 8MB) — see the
+- **Size**: configurable via `max_bytes` (default 8MB) -- see the
   [benchmark results](https://github.com/KedarGhadyalji/ZeroBucket/blob/main/benchmarks/RESULTS.md)
   for why.
 
 ## Limitations (read before using in production)
 
 - **Not built for large files or high-volume media.** Full images are
-  read into memory on both ends of every request — no streaming, no
+  read into memory on both ends of every request -- no streaming, no
   range requests, no CDN.
 - **No deduplication yet.** A SHA-256 checksum is stored on every row,
   but duplicate uploads currently create duplicate rows.
-- **No resize/optimization pipeline yet.** ZeroBucket validates and
-  stores what you give it; it doesn't transform it.
 - **PostgreSQL only, for now.** The storage layer is abstracted for
   future adapters, but only Postgres exists today.
 
 See the full
 [README](https://github.com/KedarGhadyalji/ZeroBucket#readme) and
 [roadmap](https://github.com/KedarGhadyalji/ZeroBucket#roadmap) on
-GitHub for more detail, including why BYTEA storage doesn't compress
-image bytes any further than they already are.
+GitHub for more detail.
 
 ## License
 
-MIT — see [LICENSE](https://github.com/KedarGhadyalji/ZeroBucket/blob/main/LICENSE).
+MIT -- see [LICENSE](https://github.com/KedarGhadyalji/ZeroBucket/blob/main/LICENSE).

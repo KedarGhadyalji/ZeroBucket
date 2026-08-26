@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zerobucket"
-version = "0.1.1"
+version = "0.2.0"
 description = "Database-native image storage. Your database. Your images. Zero buckets."
 readme = "README.md"
 license = "MIT"
@@ -36,6 +36,8 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "mypy>=1.10",
+    "scikit-image>=0.22",
+    "numpy>=1.26",
 ]
 
 [project.urls]
