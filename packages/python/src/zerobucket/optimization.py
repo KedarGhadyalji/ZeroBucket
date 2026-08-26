@@ -27,19 +27,30 @@ from dataclasses import dataclass
 from PIL import Image as PILImage
 
 from .exceptions import ImageValidationError
-from .validation import DEFAULT_MAX_PIXELS, SUPPORTED_FORMATS, validate_image
+from .validation import (
+    DEFAULT_MAX_PIXELS,
+    HEIF_SUPPORT_INSTALLED,
+    SUPPORTED_FORMATS,
+    validate_image,
+)
 
-# Canonical MIME type -> Pillow format name, and back. Kept separate from
-# validation.py's version to avoid a circular import; the two must be kept
-# in sync if formats are ever added.
-_MIME_TO_PIL_FORMAT = {
-    "image/jpeg": "JPEG",
-    "image/png": "PNG",
-    "image/webp": "WEBP",
+# Normalizes user-facing target_format strings to what Pillow's save()
+# actually expects. Most formats are their own name uppercased, but HEIC
+# is the one exception: Pillow (via pillow-heif) only recognizes the save
+# format string "HEIF", never "HEIC" -- even though "HEIC" is what the
+# file extension and most people call it. Verified empirically; passing
+# format="HEIC" directly to Pillow raises KeyError, not a graceful error.
+_FORMAT_ALIASES = {
+    "HEIC": "HEIF",
 }
 
 DEFAULT_JPEG_QUALITY = 90
 DEFAULT_WEBP_QUALITY = 88
+# NOT measured with the same SSIM methodology as the two defaults above
+# (see benchmarks/COMPRESSION_RESULTS.md) -- this is a reasonable starting
+# point, not a verified claim. Treat it as provisional until it's been
+# through the same measurement process.
+DEFAULT_HEIC_QUALITY = 90
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,9 +92,13 @@ def optimize_image(
             (aspect ratio preserved, LANCZOS resampling -- the sharpest
             standard downscale filter, chosen specifically to avoid
             introducing blur that a cheaper filter like BILINEAR would).
-        target_format: "jpeg", "png", or "webp". None keeps the original
-            format. Converting a PNG to WebP/JPEG is usually the right
-            call when the PNG is actually a photo, not flat-color art.
+        target_format: "jpeg", "png", "webp", or "heic"/"heif". None keeps
+            the original format. Converting a PNG to WebP/JPEG is usually
+            the right call when the PNG is actually a photo, not
+            flat-color art. Converting TO heic requires the optional
+            pillow-heif dependency; if it's missing, this raises
+            ImageValidationError with an install hint rather than
+            producing an unclear internal error.
         quality: 1-100. Only meaningful for JPEG/WebP output -- PNG has
             no lossy quality knob and this is ignored for PNG targets.
             None uses DEFAULT_JPEG_QUALITY / DEFAULT_WEBP_QUALITY.
@@ -117,8 +132,12 @@ def optimize_image(
         working = img
 
         output_format = (target_format or source_format or "JPEG").upper()
+        output_format = _FORMAT_ALIASES.get(output_format, output_format)
         if output_format == "JPEG" and working.mode in ("RGBA", "P", "LA"):
             working = working.convert("RGB")
+        # Note: unlike JPEG, HEIF encoding via pillow-heif handles RGBA
+        # source images fine (verified empirically) -- no forced conversion
+        # needed there.
 
         if max_width is not None and working.width > max_width:
             ratio = max_width / working.width
@@ -138,8 +157,15 @@ def optimize_image(
             save_kwargs = {
                 "quality": quality or DEFAULT_WEBP_QUALITY,
                 "method": 6,  # slowest, best-compression effort; fine for
-                               # a one-time encode on upload, not a hot path
+                # a one-time encode on upload, not a hot path
             }
+        elif output_format == "HEIF":
+            if not HEIF_SUPPORT_INSTALLED:
+                raise ImageValidationError(
+                    "Converting to HEIC/HEIF requires an optional dependency. "
+                    "Install it with: pip install zerobucket[heic]"
+                )
+            save_kwargs = {"quality": quality or DEFAULT_HEIC_QUALITY}
         elif output_format == "PNG":
             # No lossy quality knob for PNG. `quality` is silently ignored
             # here by design -- see the docstring above.

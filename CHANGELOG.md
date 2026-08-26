@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.0] - 2026-08-26
+
+### Added
+
+- HEIC/HEIF format support (iPhone photos), via the optional
+  `pip install zerobucket[heic]` extra (`pillow-heif`). Not in the base
+  install, since it pulls in a native library and not everyone needs it.
+- `put()` accepts HEIC input directly; `optimize=True, format="jpeg"` (or
+  `"webp"`) converts it, which matters because most browsers still can't
+  display HEIC natively.
+- `format="heic"` (or `"heif"`) also works as an `optimize=True` output
+  target, for symmetry -- though the primary real-world need is HEIC-in,
+  not HEIC-out.
+- Uploading a HEIC file without the optional dependency installed now
+  raises a clear, actionable error (magic-byte sniffed) instead of a
+  confusing "corrupted image" message.
+
+### Notes
+
+- `DEFAULT_HEIC_QUALITY` is a reasonable starting default, _not_ verified
+  with the same SSIM measurement process as the JPEG/WebP defaults --
+  flagged explicitly in the source rather than implied to be
+  equally rigorous.
+
 ## [0.2.0] - 2026-08-25
 
 ### Added

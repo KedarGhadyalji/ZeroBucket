@@ -10,15 +10,27 @@ from PIL import Image as PILImage
 from zerobucket.exceptions import (
     CorruptedImageError,
     ImageTooLargeError,
+    ImageValidationError,
     UnsupportedFormatError,
 )
-from zerobucket.validation import validate_image
+from zerobucket.validation import (
+    HEIF_SUPPORT_INSTALLED,
+    _looks_like_heic,
+    validate_image,
+)
 
 
 def _jpeg(size=(32, 32)) -> bytes:
     img = PILImage.new("RGB", size, color=(10, 20, 30))
     buf = io.BytesIO()
     img.save(buf, format="JPEG")
+    return buf.getvalue()
+
+
+def _heic(size=(32, 32)) -> bytes:
+    img = PILImage.new("RGB", size, color=(10, 20, 30))
+    buf = io.BytesIO()
+    img.save(buf, format="HEIF", quality=90)
     return buf.getvalue()
 
 
@@ -60,7 +72,9 @@ def test_empty_bytes_rejected():
 
 def test_random_bytes_rejected():
     with pytest.raises(CorruptedImageError):
-        validate_image(b"not an image, just some random bytes here" * 5, max_bytes=10_000_000)
+        validate_image(
+            b"not an image, just some random bytes here" * 5, max_bytes=10_000_000
+        )
 
 
 def test_truncated_image_rejected():
@@ -98,3 +112,48 @@ def test_decompression_bomb_guard():
     data = buf.getvalue()
     with pytest.raises((ImageTooLargeError, CorruptedImageError)):
         validate_image(data, max_bytes=10_000_000, max_pixels=1_000_000)
+
+
+@pytest.mark.skipif(not HEIF_SUPPORT_INSTALLED, reason="pillow-heif not installed")
+def test_valid_heic_passes():
+    data = _heic((100, 50))
+    result = validate_image(data, max_bytes=10_000_000)
+    assert result.mime_type == "image/heic"
+    assert result.width == 100
+    assert result.height == 50
+
+
+def test_looks_like_heic_detects_real_heic_magic_bytes():
+    """Sanity check for the sniffer itself, independent of whether
+    pillow-heif is installed -- this only inspects raw bytes."""
+    # A real HEIC ftyp box: box size (4 bytes) + 'ftyp' + 'heic' brand.
+    heic_like = b"\x00\x00\x00\x1cftypheic\x00\x00\x00\x00" + b"\x00" * 20
+    assert _looks_like_heic(heic_like) is True
+
+
+def test_looks_like_heic_rejects_non_heic_bytes():
+    assert _looks_like_heic(b"not an image at all, just text" * 3) is False
+    assert _looks_like_heic(_jpeg()) is False
+    assert _looks_like_heic(b"") is False
+    assert _looks_like_heic(b"short") is False
+
+
+def test_heic_without_optional_dependency_gives_actionable_error(monkeypatch):
+    """If pillow-heif isn't installed, a real HEIC upload should get a
+    clear "install this extra" message -- not a generic "corrupted image"
+    error that looks like the file itself is broken.
+
+    Simulated via monkeypatch rather than an actual separate environment,
+    since pillow-heif IS installed in the test/dev environment (it's in
+    the dev extra) -- this only forces the code path, it doesn't prove
+    the real uninstalled environment behaves identically. That was
+    verified manually in a clean venv during development; see the PR/
+    commit notes for that verification.
+    """
+    import zerobucket.validation as validation_module
+
+    monkeypatch.setattr(validation_module, "HEIF_SUPPORT_INSTALLED", False)
+
+    heic_bytes = b"\x00\x00\x00\x1cftypheic\x00\x00\x00\x00" + b"\x00" * 500
+    with pytest.raises(ImageValidationError, match=r"pip install zerobucket\[heic\]"):
+        validate_image(heic_bytes, max_bytes=10_000_000)

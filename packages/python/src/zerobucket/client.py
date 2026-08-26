@@ -93,7 +93,8 @@ class ZeroBucket:
                 bytes are stored as-is.
             max_width: Downscale if wider than this (aspect ratio
                 preserved). Only applies when optimize=True.
-            format: Re-encode target -- "jpeg", "png", or "webp". None
+            format: Re-encode target -- "jpeg", "png", "webp", or
+                "heic"/"heif". None
                 keeps the original format. Only applies when
                 optimize=True. Note: quality has no effect when the
                 target (or original) format is PNG -- PNG has no lossy

@@ -33,6 +33,7 @@ from zerobucket.optimization import (
     DEFAULT_WEBP_QUALITY,
     optimize_image,
 )
+from zerobucket.validation import HEIF_SUPPORT_INSTALLED
 
 from .photo_fixtures import ALL_FIXTURES
 
@@ -79,7 +80,9 @@ def test_default_jpeg_quality_meets_content_appropriate_floor(fixture_name):
     original = fixture_fn()
     floor = SSIM_FLOOR_BY_FIXTURE[fixture_name]
 
-    result = optimize_image(original, target_format="jpeg", max_bytes=_MAX_BYTES)
+    result = optimize_image(
+        original, target_format="jpeg", max_bytes=_MAX_BYTES
+    )
 
     score = _compute_ssim(original, result.data)
     assert score >= floor, (
@@ -94,7 +97,9 @@ def test_default_webp_quality_meets_content_appropriate_floor(fixture_name):
     original = fixture_fn()
     floor = SSIM_FLOOR_BY_FIXTURE[fixture_name]
 
-    result = optimize_image(original, target_format="webp", max_bytes=_MAX_BYTES)
+    result = optimize_image(
+        original, target_format="webp", max_bytes=_MAX_BYTES
+    )
 
     score = _compute_ssim(original, result.data)
     assert score >= floor, (
@@ -111,10 +116,7 @@ def test_low_quality_actually_degrades_ssim():
     original = ALL_FIXTURES["busy_texture"]()
 
     good = optimize_image(
-        original,
-        target_format="jpeg",
-        quality=DEFAULT_JPEG_QUALITY,
-        max_bytes=_MAX_BYTES,
+        original, target_format="jpeg", quality=DEFAULT_JPEG_QUALITY, max_bytes=_MAX_BYTES
     )
     bad = optimize_image(
         original, target_format="jpeg", quality=15, max_bytes=_MAX_BYTES
@@ -215,3 +217,51 @@ def test_optimized_output_size_still_enforces_max_bytes():
     original = ALL_FIXTURES["busy_texture"]()
     with pytest.raises(ImageTooLargeError):
         optimize_image(original, target_format="jpeg", quality=100, max_bytes=100)
+
+
+@pytest.mark.skipif(not HEIF_SUPPORT_INSTALLED, reason="pillow-heif not installed")
+def test_heic_source_converts_to_jpeg():
+    """The main real-world use case: iPhone uploads HEIC, app wants JPEG
+    for broad browser compatibility."""
+    img = PILImage.new("RGB", (200, 150), color=(100, 150, 200))
+    buf = io.BytesIO()
+    img.save(buf, format="HEIF", quality=95)
+    original = buf.getvalue()
+
+    result = optimize_image(original, target_format="jpeg", max_bytes=_MAX_BYTES)
+    assert result.mime_type == "image/jpeg"
+    assert result.width == 200
+    assert result.height == 150
+
+
+@pytest.mark.skipif(not HEIF_SUPPORT_INSTALLED, reason="pillow-heif not installed")
+def test_jpeg_source_converts_to_heic():
+    """Reverse direction: also supported, since it's effectively free
+    through Pillow's plugin architecture, even though the main real-world
+    need is HEIC-in, not HEIC-out."""
+    original = ALL_FIXTURES["gradient_landscape"]()
+    result = optimize_image(original, target_format="heic", max_bytes=_MAX_BYTES)
+    assert result.mime_type == "image/heic"
+
+
+@pytest.mark.skipif(not HEIF_SUPPORT_INSTALLED, reason="pillow-heif not installed")
+def test_heic_target_accepts_both_heic_and_heif_spelling():
+    """Users will naturally type 'heic' (the file extension they know),
+    not 'heif' (Pillow's internal format name) -- both must work."""
+    original = ALL_FIXTURES["flat_graphic"]()
+    result_heic = optimize_image(original, target_format="heic", max_bytes=_MAX_BYTES)
+    result_heif = optimize_image(original, target_format="heif", max_bytes=_MAX_BYTES)
+    assert result_heic.mime_type == "image/heic"
+    assert result_heif.mime_type == "image/heic"
+
+
+def test_heic_target_without_optional_dependency_gives_actionable_error(monkeypatch):
+    """Requesting format='heic' without pillow-heif installed should fail
+    clearly, not with a raw Pillow KeyError."""
+    import zerobucket.optimization as optimization_module
+
+    monkeypatch.setattr(optimization_module, "HEIF_SUPPORT_INSTALLED", False)
+
+    original = ALL_FIXTURES["flat_graphic"]()
+    with pytest.raises(ImageValidationError, match=r"pip install zerobucket\[heic\]"):
+        optimize_image(original, target_format="heic", max_bytes=_MAX_BYTES)

@@ -15,6 +15,7 @@ from PIL import Image as PILImage
 from .exceptions import (
     CorruptedImageError,
     ImageTooLargeError,
+    ImageValidationError,
     UnsupportedFormatError,
 )
 
@@ -25,6 +26,20 @@ _FORMAT_TO_MIME = {
     "PNG": "image/png",
     "WEBP": "image/webp",
 }
+
+# HEIC/HEIF support is optional (pip install zerobucket[heic]) because
+# pillow-heif pulls in a native libheif wheel -- not everyone needs it, and
+# we don't want it in the default install. If it's present, registering the
+# opener makes Image.open()/save() handle HEIC transparently everywhere
+# else in this codebase; no other code needs to know HEIC exists.
+try:
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+    _FORMAT_TO_MIME["HEIF"] = "image/heic"
+    HEIF_SUPPORT_INSTALLED = True
+except ImportError:
+    HEIF_SUPPORT_INSTALLED = False
 
 SUPPORTED_FORMATS = frozenset(_FORMAT_TO_MIME)
 
@@ -44,6 +59,22 @@ class ValidatedImage:
     size_bytes: int
 
 
+def _looks_like_heic(data: bytes) -> bool:
+    """Sniff for an ISO-BMFF 'ftyp' box with a HEIC/HEIF brand.
+
+    Used only to give a clear, actionable error when pillow-heif isn't
+    installed -- without this, a genuinely valid HEIC file would fail with
+    a generic "could not decode image" message that looks like corruption
+    rather than a missing optional dependency.
+    """
+    if len(data) < 12:
+        return False
+    if data[4:8] != b"ftyp":
+        return False
+    brand = data[8:12]
+    return brand in (b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1")
+
+
 def validate_image(
     data: bytes,
     *,
@@ -53,14 +84,21 @@ def validate_image(
 ) -> ValidatedImage:
     """Validate raw image bytes and return derived metadata.
 
-    Raises ImageTooLargeError, UnsupportedFormatError, or CorruptedImageError.
-    Never raises for reasons unrelated to the image itself.
+    Raises ImageTooLargeError, UnsupportedFormatError, ImageValidationError,
+    or CorruptedImageError. Never raises for reasons unrelated to the image
+    itself.
     """
     size_bytes = len(data)
     if size_bytes > max_bytes:
         raise ImageTooLargeError(size_bytes, max_bytes)
     if size_bytes == 0:
         raise CorruptedImageError("Image data is empty")
+
+    if not HEIF_SUPPORT_INSTALLED and _looks_like_heic(data):
+        raise ImageValidationError(
+            "This looks like a HEIC/HEIF image, which requires an optional "
+            "dependency. Install it with: pip install zerobucket[heic]"
+        )
 
     # Pillow's own decompression-bomb guard, in pixels (not compressed bytes).
     # We set it per-call rather than mutating the module-global so concurrent
@@ -91,7 +129,9 @@ def validate_image(
             with PILImage.open(io.BytesIO(data)) as img:
                 img.load()
         except Exception as exc:  # noqa: BLE001
-            raise CorruptedImageError(f"Image data is truncated or corrupted: {exc}") from exc
+            raise CorruptedImageError(
+                f"Image data is truncated or corrupted: {exc}"
+            ) from exc
     finally:
         PILImage.MAX_IMAGE_PIXELS = original_max_pixels
 

@@ -111,8 +111,10 @@ on GitHub for the full methodology.
 
 ## What it validates
 
-- **Format**: JPEG, PNG, WebP -- detected from actual file content, never
-  from filename extension or a client-supplied `Content-Type` header.
+- **Format**: JPEG, PNG, WebP built in, plus HEIC/HEIF (iPhone photos) via
+  the optional `pip install zerobucket[heic]` extra -- detected from
+  actual file content, never from filename extension or a client-supplied
+  `Content-Type` header.
 - **Corruption**: truncated or malformed images are decoded and rejected
   before they reach the database.
 - **Decompression bombs**: a tiny compressed file that decodes to an

@@ -156,8 +156,24 @@ for the full methodology and numbers.
 
 ## Supported formats
 
-JPEG, PNG, WebP. Format is detected from file content, not from filename
-extension or client-supplied MIME type.
+JPEG, PNG, WebP built in. Format is detected from file content, not from
+filename extension or client-supplied MIME type.
+
+**HEIC/HEIF** (the default format for iPhone photos) is supported via an
+optional dependency, since it requires a native library and we don't want
+to force that on everyone who doesn't need it:
+
+```bash
+pip install zerobucket[heic]
+```
+
+Once installed, HEIC works exactly like any other format -- `put()`
+accepts it, content-sniffing detects it correctly, and `optimize=True,
+format="jpeg"` converts it if you plan to serve images directly to
+browsers (most browsers still can't display HEIC natively, unlike JPEG/
+WebP/PNG). Without `zerobucket[heic]` installed, uploading a HEIC file
+raises a clear error telling you to install the extra, rather than a
+confusing "corrupted image" message.
 
 ## Size limits
 
