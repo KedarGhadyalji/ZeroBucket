@@ -135,6 +135,20 @@ against the same database. Pass your own open `psycopg` connection via
   on GitHub for a worked example -- this was verified by direct experiment
   during development, not assumed.
 
+## CLI
+
+```bash
+zerobucket init      # create the schema if missing
+zerobucket info      # image count, total size, breakdown by format
+zerobucket verify    # re-checksum every image to detect corruption
+```
+
+Takes `--database-url` or reads `ZEROBUCKET_DATABASE_URL` from the
+environment. `verify` exits non-zero on any mismatch, so it's usable in
+cron/CI. See the
+[full CLI docs](https://github.com/KedarGhadyalji/ZeroBucket#cli) on
+GitHub.
+
 ## Limitations (read before using in production)
 
 - **Not built for large files or high-volume media.** Full images are

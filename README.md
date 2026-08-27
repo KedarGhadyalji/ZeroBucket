@@ -150,7 +150,7 @@ backed by real SSIM measurements across multiple content types. Typical
 photos see 70-95% size reduction with no visible quality loss; dense
 fine-texture content (foliage, fabric) sees smaller but still real gains.
 **One thing this data caught: don't convert flat/graphic content (UI
-screenshots, logos) to JPEG** -- it can make them larger, not smaller.
+screenshots, logos) to JPEG** -- it can make them _larger_, not smaller.
 See [`benchmarks/COMPRESSION_RESULTS.md`](benchmarks/COMPRESSION_RESULTS.md)
 for the full methodology and numbers.
 
@@ -297,6 +297,29 @@ pytest                 # unit tests run standalone; integration tests need
 ruff check src/ tests/
 ```
 
+## CLI
+
+```bash
+zerobucket init      # create the zerobucket_images table and indexes if missing
+zerobucket migrate   # currently the same as init -- no versioned migrations yet
+zerobucket info      # image count, total size, on-disk size, breakdown by format
+zerobucket verify    # re-checksum every stored image to detect corruption
+zerobucket verify --sample 100   # check a random sample instead of everything
+```
+
+All commands take `--database-url`, or read `ZEROBUCKET_DATABASE_URL` from
+the environment:
+
+```bash
+export ZEROBUCKET_DATABASE_URL=postgresql://user:pass@localhost/mydb
+zerobucket info
+```
+
+`verify` exits with status 1 if any mismatches are found (and prints
+which image IDs), so it's usable as a cron job or CI check, not just an
+interactive command. It streams one image's bytes at a time rather than
+loading the whole table into memory -- safe to run against a large table.
+
 ## Operations
 
 Running this with real, growing data? See
@@ -314,7 +337,7 @@ Not yet built, tracked honestly rather than implied:
 - [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)
 - [ ] Deduplication with reference counting
 - [ ] SQLite and MySQL adapters
-- [ ] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`)
+- [x] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`, `zerobucket verify`)
 - [ ] Optional object-storage backend for files that outgrow the database tier
 - [ ] `asyncpg` / async client support
 - [ ] Batch operations (`put_many`/`get_many`/`delete_many`)

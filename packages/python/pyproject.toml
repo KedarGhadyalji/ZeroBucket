@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zerobucket"
-version = "0.4.0"
+version = "0.5.0"
 description = "Database-native image storage. Your database. Your images. Zero buckets."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-authors = [{ name = "Kedar Ghadyalji", email = "kedarghadyalji@gmail.com" }]
+authors = [{ name = "Kedar Ghadyalji", email = "your-email@example.com" }]
 keywords = ["image", "storage", "postgresql", "bytea", "s3-alternative"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -43,6 +43,9 @@ dev = [
     "numpy>=1.26",
     "pillow-heif>=0.13",
 ]
+
+[project.scripts]
+zerobucket = "zerobucket.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/KedarGhadyalji/ZeroBucket"

@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here.
 
+## [0.5.0] - 2026-08-27
+
+### Added
+
+- `zerobucket` CLI, installed as a real console script
+  (`pip install zerobucket` gives you the `zerobucket` command directly):
+  - `init` -- create the schema if it doesn't exist
+  - `migrate` -- currently identical to `init`; kept as a stable command
+    name for when real versioned migrations exist (there's only ever
+    been one schema shape so far, so there's nothing to migrate yet --
+    documented honestly rather than implying more than exists)
+  - `info` -- image count, total size, on-disk size (including TOAST),
+    breakdown by format
+  - `verify` -- re-checksums every stored image against its recorded
+    SHA-256 to detect corruption; streams one image at a time rather
+    than loading the whole table into memory, exits non-zero on any
+    mismatch (usable in cron/CI), supports `--sample N` for large tables
+
 ## [0.4.0] - 2026-08-27
 
 ### Added
