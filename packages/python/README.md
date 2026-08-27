@@ -123,6 +123,18 @@ on GitHub for the full methodology.
   [benchmark results](https://github.com/KedarGhadyalji/ZeroBucket/blob/main/benchmarks/RESULTS.md)
   for why.
 
+## Transactions
+
+By default, `put()`/`get()`/`delete()` each use their own independent
+database connection -- **not** your application's own transaction, even
+against the same database. Pass your own open `psycopg` connection via
+`connection=` to make a write participate in your transaction (e.g. "user
+
+- avatar, atomically, or neither"). See the
+  [Transactions section](https://github.com/KedarGhadyalji/ZeroBucket#transactions)
+  on GitHub for a worked example -- this was verified by direct experiment
+  during development, not assumed.
+
 ## Limitations (read before using in production)
 
 - **Not built for large files or high-volume media.** Full images are

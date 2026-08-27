@@ -6,10 +6,16 @@ parameterized; nothing is ever built via string concatenation.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from typing import TYPE_CHECKING
+
 from psycopg_pool import ConnectionPool
 
 from ..exceptions import StorageError
 from .base import StorageBackend, StoredRecord, StoredRecordMetadata
+
+if TYPE_CHECKING:
+    import psycopg
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS zerobucket_images (
@@ -85,6 +91,26 @@ class PostgresBackend(StorageBackend):
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Migration failed: {exc}") from exc
 
+    @contextmanager
+    def _cursor(self, connection: psycopg.Connection | None):
+        """Yield a cursor, either on the caller's own connection or a
+        pooled one.
+
+        When `connection` is provided, we use it directly and do NOT
+        commit or roll it back -- that's the caller's responsibility,
+        and is precisely what lets a put()/delete() participate in the
+        caller's own transaction (see client.py). When `connection` is
+        None, we fall back to the internal pool exactly as before: each
+        call gets its own connection and commits independently on clean
+        exit.
+        """
+        if connection is not None:
+            with connection.cursor() as cur:
+                yield cur
+        else:
+            with self._pool.connection() as conn, conn.cursor() as cur:
+                yield cur
+
     def put(
         self,
         *,
@@ -95,9 +121,10 @@ class PostgresBackend(StorageBackend):
         width: int | None,
         height: int | None,
         checksum_sha256: str,
+        connection: psycopg.Connection | None = None,
     ) -> str:
         try:
-            with self._pool.connection() as conn, conn.cursor() as cur:
+            with self._cursor(connection) as cur:
                 params = (
                     data,
                     mime_type,
@@ -113,9 +140,11 @@ class PostgresBackend(StorageBackend):
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to store image: {exc}") from exc
 
-    def get(self, image_id: str) -> StoredRecord | None:
+    def get(
+        self, image_id: str, *, connection: psycopg.Connection | None = None
+    ) -> StoredRecord | None:
         try:
-            with self._pool.connection() as conn, conn.cursor() as cur:
+            with self._cursor(connection) as cur:
                 cur.execute(_SELECT_FULL, (image_id,))
                 row = cur.fetchone()
         except Exception as exc:  # noqa: BLE001
@@ -133,9 +162,11 @@ class PostgresBackend(StorageBackend):
             checksum_sha256=row[7],
         )
 
-    def get_metadata(self, image_id: str) -> StoredRecordMetadata | None:
+    def get_metadata(
+        self, image_id: str, *, connection: psycopg.Connection | None = None
+    ) -> StoredRecordMetadata | None:
         try:
-            with self._pool.connection() as conn, conn.cursor() as cur:
+            with self._cursor(connection) as cur:
                 cur.execute(_SELECT_METADATA, (image_id,))
                 row = cur.fetchone()
         except Exception as exc:  # noqa: BLE001
@@ -152,17 +183,21 @@ class PostgresBackend(StorageBackend):
             checksum_sha256=row[6],
         )
 
-    def delete(self, image_id: str) -> bool:
+    def delete(
+        self, image_id: str, *, connection: psycopg.Connection | None = None
+    ) -> bool:
         try:
-            with self._pool.connection() as conn, conn.cursor() as cur:
+            with self._cursor(connection) as cur:
                 cur.execute(_DELETE, (image_id,))
                 return cur.rowcount > 0
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image: {exc}") from exc
 
-    def exists(self, image_id: str) -> bool:
+    def exists(
+        self, image_id: str, *, connection: psycopg.Connection | None = None
+    ) -> bool:
         try:
-            with self._pool.connection() as conn, conn.cursor() as cur:
+            with self._cursor(connection) as cur:
                 cur.execute(_EXISTS, (image_id,))
                 return cur.fetchone() is not None
         except Exception as exc:  # noqa: BLE001

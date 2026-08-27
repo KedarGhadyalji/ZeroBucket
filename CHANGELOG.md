@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0] - 2026-08-27
+
+### Added
+
+- `connection=` parameter on `put()`, `get()`, `metadata()`, `exists()`,
+  and `delete()` -- pass your own open `psycopg` connection to make an
+  operation participate in your application's own transaction (commits
+  or rolls back together with the rest of your writes), instead of
+  ZeroBucket's default of committing independently on its own internal
+  connection pool.
+- `docs/OPERATIONS.md`: backup guidance (splitting `pg_dump` so routine
+  app backups don't slow down as image data grows) and autovacuum tuning
+  notes for the BYTEA-heavy table.
+
+### Important finding
+
+- **Verified by direct experiment, not assumed:** without `connection=`,
+  `put()` was shown to commit independently even when a concurrent
+  application transaction on a separate connection rolled back -- i.e.
+  the "atomic write, no orphaned uploads" guarantee some database-native
+  storage designs imply is NOT automatic here. It's real now, but only
+  when `connection=` is actually used. See the README's "Transactions"
+  section for the full explanation and a worked example.
+
 ## [0.3.0] - 2026-08-26
 
 ### Added

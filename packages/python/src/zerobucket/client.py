@@ -77,6 +77,7 @@ class ZeroBucket:
         max_width: int | None = None,
         format: str | None = None,
         quality: int | None = None,
+        connection: object | None = None,
     ) -> str:
         """Validate, optionally optimize, and store an image. Returns its id.
 
@@ -104,6 +105,17 @@ class ZeroBucket:
                 zerobucket.optimization for the reasoning and
                 tests/test_optimization.py for the SSIM regression test
                 that enforces it). Only applies when optimize=True.
+            connection: Advanced -- pass your own open psycopg connection
+                (one you're already using for other writes in the same
+                transaction) to make this put() commit or roll back
+                together with the rest of that transaction, instead of
+                committing independently on ZeroBucket's own internal
+                pool. Without this, put() ALWAYS commits on its own,
+                regardless of what your application does afterward --
+                see the README's "Transactions" section for a worked
+                example and why this matters (e.g. "create a user record
+                and store their avatar atomically" only works if you
+                pass connection= here).
         """
         data, resolved_filename = _read_image_input(image, filename)
 
@@ -148,11 +160,17 @@ class ZeroBucket:
             width=width,
             height=height,
             checksum_sha256=checksum,
+            connection=connection,
         )
 
-    def get(self, image_id: str) -> Image:
-        """Retrieve a full image, including bytes. Raises ImageNotFoundError if missing."""
-        record = self._backend.get(image_id)
+    def get(self, image_id: str, *, connection: object | None = None) -> Image:
+        """Retrieve a full image, including bytes. Raises ImageNotFoundError if missing.
+
+        connection: Advanced -- see put()'s docstring. Passing the same
+            open transaction lets you read back a row you just wrote in
+            that same transaction, before it's committed.
+        """
+        record = self._backend.get(image_id, connection=connection)
         if record is None:
             raise ImageNotFoundError(image_id)
         return Image(
@@ -165,9 +183,14 @@ class ZeroBucket:
             checksum_sha256=record.checksum_sha256,
         )
 
-    def metadata(self, image_id: str) -> ImageMetadata:
-        """Retrieve image metadata without pulling the (potentially large) bytes."""
-        record = self._backend.get_metadata(image_id)
+    def metadata(
+        self, image_id: str, *, connection: object | None = None
+    ) -> ImageMetadata:
+        """Retrieve image metadata without pulling the (potentially large) bytes.
+
+        connection: Advanced -- see put()'s docstring.
+        """
+        record = self._backend.get_metadata(image_id, connection=connection)
         if record is None:
             raise ImageNotFoundError(image_id)
         return ImageMetadata(
@@ -180,13 +203,22 @@ class ZeroBucket:
             checksum_sha256=record.checksum_sha256,
         )
 
-    def exists(self, image_id: str) -> bool:
-        """Return whether an image with this id exists."""
-        return self._backend.exists(image_id)
+    def exists(self, image_id: str, *, connection: object | None = None) -> bool:
+        """Return whether an image with this id exists.
 
-    def delete(self, image_id: str) -> bool:
-        """Delete an image. Returns True if it existed and was deleted, False otherwise."""
-        return self._backend.delete(image_id)
+        connection: Advanced -- see put()'s docstring.
+        """
+        return self._backend.exists(image_id, connection=connection)
+
+    def delete(self, image_id: str, *, connection: object | None = None) -> bool:
+        """Delete an image. Returns True if it existed and was deleted, False otherwise.
+
+        connection: Advanced -- see put()'s docstring. Passing the same
+            open transaction lets a delete() roll back together with the
+            rest of that transaction (e.g. "delete a user and their
+            avatar atomically").
+        """
+        return self._backend.delete(image_id, connection=connection)
 
     def close(self) -> None:
         """Release underlying database connections."""

@@ -175,6 +175,55 @@ WebP/PNG). Without `zerobucket[heic]` installed, uploading a HEIC file
 raises a clear error telling you to install the extra, rather than a
 confusing "corrupted image" message.
 
+## Transactions
+
+By default, every `put()`/`get()`/`delete()`/`exists()`/`metadata()` call
+uses its own separate, independently-committing database connection --
+**not** whatever transaction your application might currently be in, even
+if you're using the exact same database. This was verified directly
+during development, not assumed: an image `put()` was shown to survive
+even when a concurrent application transaction (on a different
+connection) rolled back. If you're relying on "my image write rolls back
+with the rest of my transaction" without doing anything extra, it
+currently does not.
+
+To make ZeroBucket participate in your own transaction -- so a `put()`
+rolls back if the rest of your write fails, avoiding an orphaned image
+row with no corresponding application record -- pass your own open
+`psycopg` connection via `connection=`:
+
+```python
+import psycopg
+
+conn = psycopg.connect(DATABASE_URL)
+conn.autocommit = False
+
+try:
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO users (email) VALUES (%s) RETURNING id", (email,))
+        user_id = cur.fetchone()[0]
+
+    # Same transaction as the INSERT above -- if anything below raises,
+    # neither the user row nor the image row will be committed.
+    image_id = images.put(avatar_file, connection=conn)
+
+    with conn.cursor() as cur:
+        cur.execute("UPDATE users SET avatar_id = %s WHERE id = %s", (image_id, user_id))
+
+    conn.commit()
+except Exception:
+    conn.rollback()
+    raise
+finally:
+    conn.close()
+```
+
+Without `connection=`, this is exactly the "orphaned upload, DB row never
+got created" class of bug that a separate object-storage service is also
+prone to -- the _possibility_ of avoiding it is one of the real
+advantages of storing images in your primary database, but only when you
+actually use `connection=` to get it. It isn't automatic.
+
 ## Size limits
 
 Default maximum: **8MB per image**, configurable via `max_bytes=`.
@@ -248,16 +297,28 @@ pytest                 # unit tests run standalone; integration tests need
 ruff check src/ tests/
 ```
 
+## Operations
+
+Running this with real, growing data? See
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) for backup strategy (your
+nightly `pg_dump` will include every image byte unless you split it out)
+and autovacuum tuning notes specific to a BYTEA-heavy table.
+
 ## Roadmap
 
 Not yet built, tracked honestly rather than implied:
 
 - [ ] TypeScript/npm package with an equivalent API
 - [x] Optional resize/format-conversion pipeline (`optimize=True, max_width=...`)
+- [x] Optional HEIC/HEIF support (`pip install zerobucket[heic]`)
+- [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)
 - [ ] Deduplication with reference counting
 - [ ] SQLite and MySQL adapters
 - [ ] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`)
 - [ ] Optional object-storage backend for files that outgrow the database tier
+- [ ] `asyncpg` / async client support
+- [ ] Batch operations (`put_many`/`get_many`/`delete_many`)
+- [ ] `before_get(image_id, context) -> bool` authorization hook
 
 ## License
 

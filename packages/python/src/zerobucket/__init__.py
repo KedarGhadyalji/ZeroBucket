@@ -19,7 +19,7 @@ from .exceptions import (
 from .optimization import OptimizationResult
 from .types import Image, ImageMetadata
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "ZeroBucket",
