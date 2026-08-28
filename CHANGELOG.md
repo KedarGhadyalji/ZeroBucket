@@ -2,6 +2,41 @@
 
 All notable changes to this project are documented here.
 
+## [0.7.0] - 2026-08-28
+
+### Added
+
+- Automatic retry with exponential backoff (+ jitter, capped at 2s) for
+  transient database errors -- connection drops, deadlocks,
+  serialization failures. Configurable via `max_retries` (default 3) and
+  `retry_base_delay` (default 0.1s) on `ZeroBucket(...)`. Set
+  `max_retries=0` to disable entirely.
+- Classification (`_is_retryable`) is SQLSTATE-based for server-returned
+  errors and `OperationalError`-based for connection-level failures --
+  verified against real psycopg exception attributes during development
+  (`exc.sqlstate`, confirmed empirically rather than assumed), not
+  guessed at.
+
+### Important safety rule
+
+- Automatic retry applies ONLY to ZeroBucket's own internally-pooled
+  connections. Calls that pass their own `connection=` (see the
+  Transactions feature from 0.4.0) are retried **zero** times,
+  regardless of `max_retries` -- retrying a statement on a connection
+  the caller is managing themselves could silently corrupt their
+  transaction's semantics. This interaction is tested directly, not
+  just documented.
+
+### Honest limitation
+
+- The retry loop's own logic (does it retry, how many times, does
+  connection= correctly bypass it) is tested via controlled failure
+  injection at the `_run()` level, not by triggering a genuine live
+  network partition or concurrent-transaction deadlock -- those are
+  inherently flaky to reproduce deterministically in CI. Classification
+  logic (`_is_retryable`) IS tested against real psycopg exception
+  instances.
+
 ## [0.6.0] - 2026-08-27
 
 ### Added

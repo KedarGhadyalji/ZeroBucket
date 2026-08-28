@@ -148,6 +148,15 @@ Best-effort, not all-or-nothing -- check `.success`/`.error` per item.
 the [full docs](https://github.com/KedarGhadyalji/ZeroBucket#batch-operations)
 on GitHub for what's actually batched vs. still per-item.
 
+## Retry behavior
+
+Transient errors (connection drops, deadlocks, serialization failures)
+are automatically retried with exponential backoff (`max_retries=3` by
+default). **Important:** passing your own `connection=` disables
+automatic retry for that call -- see the
+[full explanation](https://github.com/KedarGhadyalji/ZeroBucket#retry-behavior)
+on GitHub for why that's a deliberate safety rule, not an oversight.
+
 ## CLI
 
 ```bash

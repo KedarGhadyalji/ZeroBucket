@@ -247,6 +247,36 @@ prone to -- the _possibility_ of avoiding it is one of the real
 advantages of storing images in your primary database, but only when you
 actually use `connection=` to get it. It isn't automatic.
 
+## Retry behavior
+
+Transient database errors (connection drops, deadlocks, serialization
+failures) are automatically retried with exponential backoff -- up to 3
+times by default, configurable:
+
+```python
+images = ZeroBucket(
+    database_url=DATABASE_URL,
+    max_retries=5,          # default: 3. Set to 0 to disable entirely.
+    retry_base_delay=0.2,   # default: 0.1 seconds, doubles each retry, capped at 2s, plus jitter
+)
+```
+
+**Important interaction with `connection=`:** automatic retry only
+applies when ZeroBucket is using its own internal connection pool (the
+default). If you pass your own `connection=` to participate in your own
+transaction, that call is retried **zero** times, regardless of
+`max_retries` -- retrying a statement on a connection you're managing
+yourself could silently corrupt your transaction's semantics (a
+serialization failure normally means restarting the _whole_ transaction
+from your application's perspective, not replaying one statement inside
+it). That decision has to stay yours when you hold the connection.
+
+Not every database error is retried -- only ones verified to represent a
+genuinely transient condition (SQLSTATE-classified: serialization
+failures, deadlocks, connection-level failures, admin shutdown). A
+constraint violation or bad query is never retried, since it would fail
+identically every time.
+
 ## Size limits
 
 Default maximum: **8MB per image**, configurable via `max_bytes=`.
@@ -364,6 +394,7 @@ Not yet built, tracked honestly rather than implied:
 - [ ] Optional object-storage backend for files that outgrow the database tier
 - [ ] `asyncpg` / async client support
 - [x] Batch operations (`put_many`/`get_many`/`delete_many`)
+- [x] Retry/backoff policy for transient database errors
 - [ ] `before_get(image_id, context) -> bool` authorization hook
 
 ## License

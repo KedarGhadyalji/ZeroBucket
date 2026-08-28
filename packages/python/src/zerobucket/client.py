@@ -50,6 +50,15 @@ class ZeroBucket:
             bombs, independent of compressed file size.
         allowed_formats: Which image formats to accept. Defaults to
             JPEG/PNG/WebP.
+        max_retries: How many times to automatically retry a transient
+            database error (connection drop, deadlock, serialization
+            failure) before giving up. Defaults to 3. Set to 0 to
+            disable automatic retry entirely. Only applies to calls that
+            do NOT pass their own connection= -- see put()'s docstring
+            for why passing your own connection disables automatic retry.
+        retry_base_delay: Base delay in seconds for exponential backoff
+            between retries (actual delay grows per attempt, with
+            jitter, capped at 2 seconds). Defaults to 0.1.
         backend: Advanced -- inject a custom StorageBackend instead of
             constructing a PostgresBackend from database_url.
     """
@@ -61,12 +70,16 @@ class ZeroBucket:
         max_bytes: int = DEFAULT_MAX_BYTES,
         max_pixels: int = DEFAULT_MAX_PIXELS,
         allowed_formats: frozenset[str] = SUPPORTED_FORMATS,
+        max_retries: int = 3,
+        retry_base_delay: float = 0.1,
         backend: StorageBackend | None = None,
     ) -> None:
         if backend is not None:
             self._backend = backend
         elif database_url is not None:
-            self._backend = PostgresBackend(database_url)
+            self._backend = PostgresBackend(
+                database_url, max_retries=max_retries, retry_base_delay=retry_base_delay
+            )
         else:
             raise ValueError("Either database_url or backend must be provided")
 
@@ -178,7 +191,11 @@ class ZeroBucket:
                 see the README's "Transactions" section for a worked
                 example and why this matters (e.g. "create a user record
                 and store their avatar atomically" only works if you
-                pass connection= here).
+                pass connection= here). NOTE: passing connection= also
+                disables automatic retry for this call (see the
+                ZeroBucket constructor's max_retries docs) -- retrying a
+                statement on a connection you're managing yourself could
+                silently corrupt your transaction's semantics.
         """
         row = self._prepare_row(
             image,
