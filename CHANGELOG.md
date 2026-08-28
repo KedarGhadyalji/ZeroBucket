@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.0] - 2026-08-27
+
+### Added
+
+- `put_many()`, `get_many()`, `delete_many()` batch operations.
+  Best-effort semantics (one bad item doesn't abort the rest of the
+  batch) -- results carry per-item `.success`/`.error`, not a single
+  all-or-nothing outcome.
+- `get_many()`/`delete_many()` are genuine single-query batch operations
+  (`WHERE id = ANY(...)`), not a loop of individual calls.
+- `put_many()` still validates/optimizes each image individually in
+  Python (inherent per-image work), but batches the actual database
+  writes via `executemany(returning=True)` -- verified empirically that
+  this preserves input-to-output order correctly (architectural
+  guarantee, not an assumption), which is what makes it safe to
+  correlate results back to input positions.
+- `BatchPutResult`, `BatchGetResult`, `BatchDeleteResult` types,
+  exported from the package root.
+
 ## [0.5.0] - 2026-08-27
 
 ### Added

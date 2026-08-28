@@ -20,7 +20,13 @@ from .adapters.base import StorageBackend
 from .adapters.postgres import PostgresBackend
 from .exceptions import ImageNotFoundError
 from .optimization import optimize_image
-from .types import Image, ImageMetadata
+from .types import (
+    BatchDeleteResult,
+    BatchGetResult,
+    BatchPutResult,
+    Image,
+    ImageMetadata,
+)
 from .validation import DEFAULT_MAX_PIXELS, SUPPORTED_FORMATS, validate_image
 
 # What put() accepts. Framework upload objects (e.g. Flask's FileStorage,
@@ -67,6 +73,63 @@ class ZeroBucket:
         self._max_bytes = max_bytes
         self._max_pixels = max_pixels
         self._allowed_formats = allowed_formats
+
+    def _prepare_row(
+        self,
+        image: ImageInput,
+        *,
+        filename: str | None,
+        optimize: bool,
+        max_width: int | None,
+        format: str | None,
+        quality: int | None,
+    ) -> dict:
+        """Validate, optionally optimize, and checksum one image -- the
+        shared per-item work behind both put() and put_many(). This is
+        inherently per-item (Pillow decode/validate/re-encode can't be
+        batched), which is why put_many() still does this work in a
+        Python loop even though the actual DB insert is batched."""
+        data, resolved_filename = _read_image_input(image, filename)
+
+        validated = validate_image(
+            data,
+            max_bytes=self._max_bytes,
+            max_pixels=self._max_pixels,
+            allowed_formats=self._allowed_formats,
+        )
+
+        if optimize:
+            result = optimize_image(
+                data,
+                max_width=max_width,
+                target_format=format,
+                quality=quality,
+                max_bytes=self._max_bytes,
+                max_pixels=self._max_pixels,
+            )
+            final_data = result.data
+            mime_type = result.mime_type
+            width = result.width
+            height = result.height
+            size_bytes = result.size_bytes
+        else:
+            final_data = data
+            mime_type = validated.mime_type
+            width = validated.width
+            height = validated.height
+            size_bytes = validated.size_bytes
+
+        checksum = hashlib.sha256(final_data).hexdigest()
+
+        return {
+            "data": final_data,
+            "mime_type": mime_type,
+            "original_filename": resolved_filename,
+            "size_bytes": size_bytes,
+            "width": width,
+            "height": height,
+            "checksum_sha256": checksum,
+        }
 
     def put(
         self,
@@ -117,51 +180,86 @@ class ZeroBucket:
                 and store their avatar atomically" only works if you
                 pass connection= here).
         """
-        data, resolved_filename = _read_image_input(image, filename)
-
-        validated = validate_image(
-            data,
-            max_bytes=self._max_bytes,
-            max_pixels=self._max_pixels,
-            allowed_formats=self._allowed_formats,
+        row = self._prepare_row(
+            image,
+            filename=filename,
+            optimize=optimize,
+            max_width=max_width,
+            format=format,
+            quality=quality,
         )
+        return self._backend.put(**row, connection=connection)
 
-        if optimize:
-            result = optimize_image(
-                data,
-                max_width=max_width,
-                target_format=format,
-                quality=quality,
-                max_bytes=self._max_bytes,
-                max_pixels=self._max_pixels,
-            )
-            final_data = result.data
-            mime_type = result.mime_type
-            width = result.width
-            height = result.height
-            size_bytes = result.size_bytes
-        else:
-            final_data = data
-            mime_type = validated.mime_type
-            width = validated.width
-            height = validated.height
-            size_bytes = validated.size_bytes
+    def put_many(
+        self,
+        images: list[ImageInput],
+        *,
+        filenames: list[str | None] | None = None,
+        optimize: bool = False,
+        max_width: int | None = None,
+        format: str | None = None,
+        quality: int | None = None,
+        connection: object | None = None,
+    ) -> list[BatchPutResult]:
+        """Store multiple images. Best-effort, not all-or-nothing: one
+        bad image doesn't abort the rest of the batch -- check each
+        result's `.success`/`.error` rather than assuming the whole
+        batch succeeded.
 
-        # Checksum is of the FINAL stored bytes, not the original input --
-        # this matters once dedup is built, so two uploads that produce
-        # identical stored bytes are recognized as identical.
-        checksum = hashlib.sha256(final_data).hexdigest()
+        The same optimize/max_width/format/quality settings apply to
+        every image in the batch (no per-item overrides) -- call put()
+        individually if different images need different settings.
 
-        return self._backend.put(
-            data=final_data,
-            mime_type=mime_type,
-            original_filename=resolved_filename,
-            size_bytes=size_bytes,
-            width=width,
-            height=height,
-            checksum_sha256=checksum,
-            connection=connection,
-        )
+        Per-item validation/optimization still happens in a Python loop
+        (that work is inherently per-item), but the actual database
+        inserts for everything that validated successfully are batched
+        into one pipelined round trip via psycopg's executemany(), not
+        one round trip per image.
+
+        filenames, if given, must be the same length as images (use None
+        for individual entries to fall back to the input's own filename,
+        same as put()).
+        """
+        if filenames is not None and len(filenames) != len(images):
+            raise ValueError("filenames must be the same length as images if provided")
+
+        prepared_rows: list[dict] = []
+        prepared_indices: list[int] = []
+        results: list[BatchPutResult | None] = [None] * len(images)
+
+        for i, image in enumerate(images):
+            fname = filenames[i] if filenames is not None else None
+            try:
+                row = self._prepare_row(
+                    image,
+                    filename=fname,
+                    optimize=optimize,
+                    max_width=max_width,
+                    format=format,
+                    quality=quality,
+                )
+                prepared_rows.append(row)
+                prepared_indices.append(i)
+            except Exception as exc:  # noqa: BLE001
+                results[i] = BatchPutResult(index=i, image_id=None, error=str(exc))
+
+        if prepared_rows:
+            try:
+                ids = self._backend.put_many(prepared_rows, connection=connection)
+                for idx, image_id in zip(prepared_indices, ids, strict=True):
+                    results[idx] = BatchPutResult(
+                        index=idx, image_id=image_id, error=None
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # The whole DB batch failed (e.g. connection error) --
+                # every successfully-validated item in this batch failed
+                # too, since they shared one executemany() call.
+                for idx in prepared_indices:
+                    results[idx] = BatchPutResult(
+                        index=idx, image_id=None, error=str(exc)
+                    )
+
+        return results  # type: ignore[return-value]
 
     def get(self, image_id: str, *, connection: object | None = None) -> Image:
         """Retrieve a full image, including bytes. Raises ImageNotFoundError if missing.
@@ -182,6 +280,47 @@ class ZeroBucket:
             height=record.height,
             checksum_sha256=record.checksum_sha256,
         )
+
+    def get_many(
+        self, image_ids: list[str], *, connection: object | None = None
+    ) -> list[BatchGetResult]:
+        """Retrieve multiple images in a single query.
+
+        A missing id is NOT an error here (unlike get(), which raises
+        ImageNotFoundError) -- it's a normal, expected outcome for a
+        batch of ids where some may not exist; check `.success` per
+        result. Results are returned in the same order as `image_ids`,
+        including entries for ids that weren't found.
+        """
+        if not image_ids:
+            return []
+        records = self._backend.get_many(image_ids, connection=connection)
+        records_by_id = {record.id: record for record in records}
+
+        results = []
+        for image_id in image_ids:
+            record = records_by_id.get(image_id)
+            if record is None:
+                results.append(
+                    BatchGetResult(image_id=image_id, image=None, error="not found")
+                )
+            else:
+                results.append(
+                    BatchGetResult(
+                        image_id=image_id,
+                        image=Image(
+                            data=record.data,
+                            mime_type=record.mime_type,
+                            filename=record.original_filename,
+                            size_bytes=record.size_bytes,
+                            width=record.width,
+                            height=record.height,
+                            checksum_sha256=record.checksum_sha256,
+                        ),
+                        error=None,
+                    )
+                )
+        return results
 
     def metadata(
         self, image_id: str, *, connection: object | None = None
@@ -219,6 +358,23 @@ class ZeroBucket:
             avatar atomically").
         """
         return self._backend.delete(image_id, connection=connection)
+
+    def delete_many(
+        self, image_ids: list[str], *, connection: object | None = None
+    ) -> list[BatchDeleteResult]:
+        """Delete multiple images in a single query. Results are returned
+        in the same order as `image_ids`; a missing id gets
+        `deleted=False`, not an error -- same semantics as delete()
+        returning False for one missing id."""
+        if not image_ids:
+            return []
+        deleted_ids = set(self._backend.delete_many(image_ids, connection=connection))
+        return [
+            BatchDeleteResult(
+                image_id=image_id, deleted=image_id in deleted_ids, error=None
+            )
+            for image_id in image_ids
+        ]
 
     def close(self) -> None:
         """Release underlying database connections."""

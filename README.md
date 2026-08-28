@@ -112,6 +112,29 @@ except ImageValidationError:
     ...
 ```
 
+### Batch operations
+
+```python
+results = images.put_many([open("a.jpg", "rb"), open("b.jpg", "rb"), "bad.txt"])
+for r in results:
+    if r.success:
+        print(r.index, "->", r.image_id)
+    else:
+        print(r.index, "failed:", r.error)
+
+fetched = images.get_many([id1, id2, "some-id-that-does-not-exist"])
+deleted = images.delete_many([id1, id2])
+```
+
+Best-effort, not all-or-nothing: one bad image in a batch of 1000 doesn't
+abort the other 999 -- check `.success`/`.error` per item. `put_many()`
+still validates/optimizes each image individually in Python (that work
+is inherently per-image), but batches the actual database writes into
+one pipelined round trip via `executemany()` rather than one round trip
+per image. `get_many()`/`delete_many()` are genuine single-query batch
+operations (`WHERE id = ANY(...)`). All three accept the same
+`connection=` parameter as their single-item counterparts.
+
 ### Serving from a web API
 
 ```python
@@ -340,7 +363,7 @@ Not yet built, tracked honestly rather than implied:
 - [x] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`, `zerobucket verify`)
 - [ ] Optional object-storage backend for files that outgrow the database tier
 - [ ] `asyncpg` / async client support
-- [ ] Batch operations (`put_many`/`get_many`/`delete_many`)
+- [x] Batch operations (`put_many`/`get_many`/`delete_many`)
 - [ ] `before_get(image_id, context) -> bool` authorization hook
 
 ## License

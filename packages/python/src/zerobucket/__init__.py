@@ -17,15 +17,24 @@ from .exceptions import (
     ZeroBucketError,
 )
 from .optimization import OptimizationResult
-from .types import Image, ImageMetadata
+from .types import (
+    BatchDeleteResult,
+    BatchGetResult,
+    BatchPutResult,
+    Image,
+    ImageMetadata,
+)
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "ZeroBucket",
     "Image",
     "ImageMetadata",
     "OptimizationResult",
+    "BatchPutResult",
+    "BatchGetResult",
+    "BatchDeleteResult",
     "ZeroBucketError",
     "ImageValidationError",
     "ImageTooLargeError",

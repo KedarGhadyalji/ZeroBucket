@@ -140,6 +140,60 @@ class PostgresBackend(StorageBackend):
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to store image: {exc}") from exc
 
+    def put_many(
+        self,
+        rows: list[dict],
+        *,
+        connection: psycopg.Connection | None = None,
+    ) -> list[str]:
+        """Insert multiple already-prepared rows in one pipelined batch.
+
+        `rows` must be dicts with the same keys as put()'s kwargs (data,
+        mime_type, original_filename, size_bytes, width, height,
+        checksum_sha256) -- validation/optimization happens in client.py
+        before this is called, since that work is inherently per-item and
+        can't be batched at the SQL level.
+
+        Uses psycopg's executemany(returning=True), which pipelines each
+        row as its own statement execution (fewer network round trips
+        than a naive loop) while GUARANTEEING result order matches input
+        order -- verified empirically during development, not assumed;
+        this is architectural (each row is a distinct statement
+        execution under the hood), not an incidental implementation
+        detail that could silently change. A hand-rolled multi-row
+        `INSERT ... VALUES (...), (...) RETURNING id` was deliberately
+        NOT used here, since Postgres does not formally guarantee
+        RETURNING order matches VALUES order for that form.
+
+        Returns ids in the same order as `rows`. Raises StorageError if
+        any row fails -- callers wanting partial-success semantics
+        should catch per-row validation errors before calling this (see
+        client.py's put_many(), which does exactly that).
+        """
+        if not rows:
+            return []
+        try:
+            with self._cursor(connection) as cur:
+                params_seq = [
+                    (
+                        row["data"],
+                        row["mime_type"],
+                        row["original_filename"],
+                        row["size_bytes"],
+                        row["width"],
+                        row["height"],
+                        row["checksum_sha256"],
+                    )
+                    for row in rows
+                ]
+                cur.executemany(_INSERT, params_seq, returning=True)
+                ids = [str(cur.fetchone()[0])]
+                while cur.nextset():
+                    ids.append(str(cur.fetchone()[0]))
+                return ids
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to store image batch: {exc}") from exc
+
     def get(
         self, image_id: str, *, connection: psycopg.Connection | None = None
     ) -> StoredRecord | None:
@@ -161,6 +215,40 @@ class PostgresBackend(StorageBackend):
             height=row[6],
             checksum_sha256=row[7],
         )
+
+    def get_many(
+        self, image_ids: list[str], *, connection: psycopg.Connection | None = None
+    ) -> list[StoredRecord]:
+        """Fetch multiple records in a single query. Missing ids are
+        simply absent from the result -- not an error, not a placeholder.
+        Order of results is NOT guaranteed to match `image_ids` (a single
+        WHERE id = ANY(...) query has no defined row order) -- client.py
+        re-correlates by id, don't rely on this method's return order.
+        """
+        if not image_ids:
+            return []
+        try:
+            with self._cursor(connection) as cur:
+                cur.execute(
+                    _SELECT_FULL.replace("WHERE id = %s", "WHERE id = ANY(%s)"),
+                    (image_ids,),
+                )
+                rows = cur.fetchall()
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to retrieve image batch: {exc}") from exc
+        return [
+            StoredRecord(
+                id=str(row[0]),
+                data=bytes(row[1]),
+                mime_type=row[2],
+                original_filename=row[3],
+                size_bytes=row[4],
+                width=row[5],
+                height=row[6],
+                checksum_sha256=row[7],
+            )
+            for row in rows
+        ]
 
     def get_metadata(
         self, image_id: str, *, connection: psycopg.Connection | None = None
@@ -192,6 +280,25 @@ class PostgresBackend(StorageBackend):
                 return cur.rowcount > 0
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image: {exc}") from exc
+
+    def delete_many(
+        self, image_ids: list[str], *, connection: psycopg.Connection | None = None
+    ) -> list[str]:
+        """Delete multiple records in a single query. Returns the ids
+        that were ACTUALLY deleted (a subset of the input if some ids
+        didn't exist) -- not an error for missing ids, same semantics as
+        delete() returning False for a missing id."""
+        if not image_ids:
+            return []
+        try:
+            with self._cursor(connection) as cur:
+                cur.execute(
+                    "DELETE FROM zerobucket_images WHERE id = ANY(%s) RETURNING id;",
+                    (image_ids,),
+                )
+                return [str(row[0]) for row in cur.fetchall()]
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to delete image batch: {exc}") from exc
 
     def exists(
         self, image_id: str, *, connection: psycopg.Connection | None = None

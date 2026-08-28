@@ -135,6 +135,19 @@ against the same database. Pass your own open `psycopg` connection via
   on GitHub for a worked example -- this was verified by direct experiment
   during development, not assumed.
 
+## Batch operations
+
+```python
+results = images.put_many([open("a.jpg", "rb"), open("b.jpg", "rb")])
+fetched = images.get_many([id1, id2])
+deleted = images.delete_many([id1, id2])
+```
+
+Best-effort, not all-or-nothing -- check `.success`/`.error` per item.
+`get_many`/`delete_many` are genuine single-query batch operations; see
+the [full docs](https://github.com/KedarGhadyalji/ZeroBucket#batch-operations)
+on GitHub for what's actually batched vs. still per-item.
+
 ## CLI
 
 ```bash

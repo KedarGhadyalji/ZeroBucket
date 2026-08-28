@@ -72,10 +72,22 @@ class StorageBackend(ABC):
         """Persist a record and return its generated id."""
 
     @abstractmethod
+    def put_many(
+        self, rows: list[dict], *, connection: object | None = None
+    ) -> list[str]:
+        """Insert multiple already-prepared rows; returns ids in the same order as `rows`."""
+
+    @abstractmethod
     def get(
         self, image_id: str, *, connection: object | None = None
     ) -> StoredRecord | None:
         """Fetch a full record including bytes, or None if it doesn't exist."""
+
+    @abstractmethod
+    def get_many(
+        self, image_ids: list[str], *, connection: object | None = None
+    ) -> list[StoredRecord]:
+        """Fetch multiple records; missing ids are simply absent, not an error."""
 
     @abstractmethod
     def get_metadata(
@@ -86,6 +98,12 @@ class StorageBackend(ABC):
     @abstractmethod
     def delete(self, image_id: str, *, connection: object | None = None) -> bool:
         """Delete a record. Returns True if a record was deleted, False if it didn't exist."""
+
+    @abstractmethod
+    def delete_many(
+        self, image_ids: list[str], *, connection: object | None = None
+    ) -> list[str]:
+        """Delete multiple records; returns the ids that were actually deleted."""
 
     @abstractmethod
     def exists(self, image_id: str, *, connection: object | None = None) -> bool:
