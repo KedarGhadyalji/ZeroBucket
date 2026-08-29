@@ -11,8 +11,25 @@ class ZeroBucketError(Exception):
     """Base class for all ZeroBucket exceptions."""
 
 
-class ImageValidationError(ZeroBucketError):
-    """Raised when an image fails validation (bad format, too large, corrupted, etc.)."""
+class ContentValidationError(ZeroBucketError):
+    """Raised when any content (image or custom-validated) fails
+    validation. Base class for ImageValidationError and for whatever a
+    custom ContentValidator chooses to raise -- catch this to handle
+    validation failures uniformly across built-in images and custom
+    content types without needing to know which validator produced the
+    failure.
+    """
+
+
+class ImageValidationError(ContentValidationError):
+    """Raised when an image fails validation (bad format, too large, corrupted, etc.).
+
+    Subclasses ContentValidationError (added when custom validators were
+    introduced) rather than ZeroBucketError directly -- fully backward
+    compatible, since ContentValidationError itself subclasses
+    ZeroBucketError: any existing `except ZeroBucketError` or
+    `except ImageValidationError` still catches exactly what it always did.
+    """
 
 
 class ImageTooLargeError(ImageValidationError):

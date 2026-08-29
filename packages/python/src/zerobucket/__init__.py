@@ -7,7 +7,9 @@ image = images.get(image_id)
 """
 
 from .client import ZeroBucket
+from .content_types import ContentValidator, ValidatedContent
 from .exceptions import (
+    ContentValidationError,
     CorruptedImageError,
     ImageNotFoundError,
     ImageTooLargeError,
@@ -25,7 +27,7 @@ from .types import (
     ImageMetadata,
 )
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "ZeroBucket",
@@ -35,7 +37,10 @@ __all__ = [
     "BatchPutResult",
     "BatchGetResult",
     "BatchDeleteResult",
+    "ContentValidator",
+    "ValidatedContent",
     "ZeroBucketError",
+    "ContentValidationError",
     "ImageValidationError",
     "ImageTooLargeError",
     "UnsupportedFormatError",

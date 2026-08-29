@@ -18,7 +18,8 @@ from typing import BinaryIO, Union
 
 from .adapters.base import StorageBackend
 from .adapters.postgres import PostgresBackend
-from .exceptions import ImageNotFoundError
+from .content_types import ContentValidator
+from .exceptions import ImageNotFoundError, ImageValidationError
 from .optimization import optimize_image
 from .types import (
     BatchDeleteResult,
@@ -96,6 +97,7 @@ class ZeroBucket:
         max_width: int | None,
         format: str | None,
         quality: int | None,
+        validator: ContentValidator | None = None,
     ) -> dict:
         """Validate, optionally optimize, and checksum one image -- the
         shared per-item work behind both put() and put_many(). This is
@@ -104,33 +106,49 @@ class ZeroBucket:
         Python loop even though the actual DB insert is batched."""
         data, resolved_filename = _read_image_input(image, filename)
 
-        validated = validate_image(
-            data,
-            max_bytes=self._max_bytes,
-            max_pixels=self._max_pixels,
-            allowed_formats=self._allowed_formats,
-        )
-
-        if optimize:
-            result = optimize_image(
+        if validator is not None:
+            if optimize:
+                raise ImageValidationError(
+                    "optimize=True is not supported together with a custom "
+                    "validator= -- the optimize pipeline (resize/re-encode) "
+                    "is image-specific (Pillow-based) and assumes the "
+                    "built-in image validator's output. Validate/transform "
+                    "custom content types yourself before calling put()."
+                )
+            validated_content = validator.validate(data, max_bytes=self._max_bytes)
+            final_data = data
+            mime_type = validated_content.mime_type
+            width = validated_content.width
+            height = validated_content.height
+            size_bytes = validated_content.size_bytes
+        else:
+            validated = validate_image(
                 data,
-                max_width=max_width,
-                target_format=format,
-                quality=quality,
                 max_bytes=self._max_bytes,
                 max_pixels=self._max_pixels,
+                allowed_formats=self._allowed_formats,
             )
-            final_data = result.data
-            mime_type = result.mime_type
-            width = result.width
-            height = result.height
-            size_bytes = result.size_bytes
-        else:
-            final_data = data
-            mime_type = validated.mime_type
-            width = validated.width
-            height = validated.height
-            size_bytes = validated.size_bytes
+
+            if optimize:
+                result = optimize_image(
+                    data,
+                    max_width=max_width,
+                    target_format=format,
+                    quality=quality,
+                    max_bytes=self._max_bytes,
+                    max_pixels=self._max_pixels,
+                )
+                final_data = result.data
+                mime_type = result.mime_type
+                width = result.width
+                height = result.height
+                size_bytes = result.size_bytes
+            else:
+                final_data = data
+                mime_type = validated.mime_type
+                width = validated.width
+                height = validated.height
+                size_bytes = validated.size_bytes
 
         checksum = hashlib.sha256(final_data).hexdigest()
 
@@ -154,6 +172,7 @@ class ZeroBucket:
         format: str | None = None,
         quality: int | None = None,
         connection: object | None = None,
+        validator: ContentValidator | None = None,
     ) -> str:
         """Validate, optionally optimize, and store an image. Returns its id.
 
@@ -196,6 +215,16 @@ class ZeroBucket:
                 ZeroBucket constructor's max_retries docs) -- retrying a
                 statement on a connection you're managing yourself could
                 silently corrupt your transaction's semantics.
+            validator: Advanced -- pass a ContentValidator (e.g.
+                zerobucket.validators.pdf.PDFValidator()) to store a
+                content type ZeroBucket doesn't natively validate as an
+                image. When given, the built-in image validation is
+                skipped entirely in favor of validator.validate(); every
+                other feature (connection=, retry, batch, get/delete/
+                exists) works identically regardless of which validator
+                produced the row. Incompatible with optimize=True (raises
+                immediately if both are given) -- see ContentValidator's
+                docstring for why.
         """
         row = self._prepare_row(
             image,
@@ -204,6 +233,7 @@ class ZeroBucket:
             max_width=max_width,
             format=format,
             quality=quality,
+            validator=validator,
         )
         return self._backend.put(**row, connection=connection)
 
@@ -217,15 +247,16 @@ class ZeroBucket:
         format: str | None = None,
         quality: int | None = None,
         connection: object | None = None,
+        validator: ContentValidator | None = None,
     ) -> list[BatchPutResult]:
         """Store multiple images. Best-effort, not all-or-nothing: one
         bad image doesn't abort the rest of the batch -- check each
         result's `.success`/`.error` rather than assuming the whole
         batch succeeded.
 
-        The same optimize/max_width/format/quality settings apply to
-        every image in the batch (no per-item overrides) -- call put()
-        individually if different images need different settings.
+        The same optimize/max_width/format/quality/validator settings
+        apply to every item in the batch (no per-item overrides) -- call
+        put() individually if different items need different settings.
 
         Per-item validation/optimization still happens in a Python loop
         (that work is inherently per-item), but the actual database
@@ -254,6 +285,7 @@ class ZeroBucket:
                     max_width=max_width,
                     format=format,
                     quality=quality,
+                    validator=validator,
                 )
                 prepared_rows.append(row)
                 prepared_indices.append(i)

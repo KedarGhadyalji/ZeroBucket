@@ -277,6 +277,62 @@ failures, deadlocks, connection-level failures, admin shutdown). A
 constraint violation or bad query is never retried, since it would fail
 identically every time.
 
+## Custom content types (PDFs and beyond)
+
+ZeroBucket validates everything as an image by default -- unchanged, and
+that stays true for every existing caller. For content ZeroBucket
+doesn't natively understand, pass your own validator to `put()`:
+
+```python
+from zerobucket import ZeroBucket
+from zerobucket.validators.pdf import PDFValidator
+
+images = ZeroBucket(database_url=DATABASE_URL)
+pdf_validator = PDFValidator()
+
+doc_id = images.put(pdf_bytes, validator=pdf_validator)
+doc = images.get(doc_id)  # get() needs zero special-casing -- always has
+print(doc.mime_type)  # "application/pdf"
+```
+
+Everything else works identically regardless of which validator produced
+a row: `connection=` (transactional atomicity), automatic retry,
+`put_many()`/`get_many()`/`delete_many()`, `exists()`, `delete()`. This
+isn't incidental -- `width`/`height` were already nullable in the schema
+and the `Image` type before this feature existed (only images have
+natural dimensions), so the entire read path needed zero changes to
+support non-image content; only `put()`/`put_many()` needed the hook.
+
+**Why this instead of native PDF support?** A PDF is a categorically
+richer, more dangerous format to fully secure than a raster image
+(embeddable JavaScript, forms, launch actions) -- absorbing that
+directly into ZeroBucket's core would mean either quietly under-securing
+it or meaningfully expanding what "database-native image storage"
+promises to guarantee. The pluggable hook lets you opt into that
+tradeoff explicitly, for the content type you actually need, without
+ZeroBucket claiming to have solved PDF security for you.
+
+**Write your own validator** by implementing `ContentValidator`:
+
+```python
+from zerobucket import ContentValidator, ValidatedContent
+
+class MyValidator(ContentValidator):
+    def validate(self, data: bytes, *, max_bytes: int) -> ValidatedContent:
+        if len(data) > max_bytes:
+            raise MyValidationError("too big")
+        # ... your own content-sniffed checks here ...
+        return ValidatedContent(mime_type="application/x-my-format", size_bytes=len(data))
+```
+
+`optimize=True` is incompatible with `validator=` and raises immediately
+if both are given -- the resize/re-encode pipeline is Pillow-based and
+image-specific.
+
+See [`zerobucket/validators/pdf.py`](https://github.com/KedarGhadyalji/ZeroBucket/blob/main/packages/python/src/zerobucket/validators/pdf.py)
+for a complete reference implementation, including an explicit note on
+what it does and doesn't protect against.
+
 ## Size limits
 
 Default maximum: **8MB per image**, configurable via `max_bytes=`.
@@ -396,6 +452,9 @@ Not yet built, tracked honestly rather than implied:
 - [x] Batch operations (`put_many`/`get_many`/`delete_many`)
 - [x] Retry/backoff policy for transient database errors
 - [ ] `before_get(image_id, context) -> bool` authorization hook
+- [x] Pluggable content validators (`put(validator=...)`) -- includes a PDF reference implementation
+- [ ] Streaming reads/writes for large files
+- [ ] Django integration package
 
 ## License
 

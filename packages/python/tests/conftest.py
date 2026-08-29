@@ -73,3 +73,14 @@ def webp_bytes() -> bytes:
 def make_image_bytes():
     """Factory fixture for tests that need custom size/color/format."""
     return _make_image_bytes
+
+
+@pytest.fixture
+def db_connection_factory(_db_available):
+    """Factory for a raw psycopg connection to the test database --
+    used by tests that need their OWN connection (transaction tests,
+    connection= tests) separate from anything ZeroBucket's `images`
+    fixture manages internally."""
+    import psycopg
+
+    return lambda: psycopg.connect(TEST_DATABASE_URL)

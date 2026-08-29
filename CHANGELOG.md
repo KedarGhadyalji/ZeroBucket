@@ -2,6 +2,48 @@
 
 All notable changes to this project are documented here.
 
+## [0.8.0] - 2026-08-29
+
+### Added
+
+- Pluggable content validators: `put(validator=...)` and
+  `put_many(validator=...)` accept a `ContentValidator` to store content
+  types ZeroBucket doesn't natively validate as an image (PDFs, or
+  anything else you write a validator for).
+- `zerobucket.validators.pdf.PDFValidator`: a complete, real reference
+  implementation -- content-sniffed (`%PDF-` magic bytes), configurable
+  size ceiling, with an explicit security-scope note (it does not parse
+  PDF internals or detect embedded JavaScript/forms -- stated plainly,
+  not glossed over).
+- `ContentValidator` (ABC) and `ValidatedContent` (result type), exported
+  from the package root for writing your own validators.
+- `ContentValidationError`, a new base exception. `ImageValidationError`
+  now subclasses it instead of `ZeroBucketError` directly -- fully
+  backward compatible (verified by a dedicated test): any existing
+  `except ImageValidationError` or `except ZeroBucketError` still catches
+  exactly what it always did.
+
+### Why a pluggable hook instead of native PDF support
+
+- A PDF is a categorically richer, more dangerous format to fully secure
+  than a raster image (embeddable JavaScript, forms, launch actions).
+  Absorbing that directly into ZeroBucket's core would mean either
+  under-securing it or expanding what "database-native image storage"
+  promises to guarantee. The pluggable hook lets adopters opt into that
+  tradeoff explicitly, for the specific content type they need.
+
+### Design notes (verified before building, not assumed)
+
+- `width`/`height` were already nullable in both the database schema and
+  the `Image`/`ImageMetadata` types before this feature existed --
+  confirmed by inspection, not assumed. This meant the entire read path
+  (`get`, `get_many`, `exists`, `delete`, `metadata`) needed ZERO changes
+  to support non-image content; only the write path (`put`, `put_many`)
+  needed the new hook.
+- `optimize=True` is incompatible with `validator=` and raises
+  immediately with a clear message, rather than letting Pillow fail
+  confusingly against bytes that were never claimed to be an image.
+
 ## [0.7.0] - 2026-08-28
 
 ### Added

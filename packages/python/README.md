@@ -157,6 +157,21 @@ automatic retry for that call -- see the
 [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#retry-behavior)
 on GitHub for why that's a deliberate safety rule, not an oversight.
 
+## Custom content types (PDFs and beyond)
+
+```python
+from zerobucket.validators.pdf import PDFValidator
+
+doc_id = images.put(pdf_bytes, validator=PDFValidator())
+doc = images.get(doc_id)  # no special handling needed -- ever
+```
+
+Everything (transactions, retry, batch ops) works identically regardless
+of which validator produced a row. See the
+[full explanation](https://github.com/KedarGhadyalji/ZeroBucket#custom-content-types-pdfs-and-beyond)
+on GitHub for why this is a pluggable hook rather than native PDF
+support built into the core.
+
 ## CLI
 
 ```bash
