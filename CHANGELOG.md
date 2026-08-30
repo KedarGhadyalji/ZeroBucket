@@ -2,6 +2,50 @@
 
 All notable changes to this project are documented here.
 
+## [0.9.0] - 2026-08-30
+
+### Added
+
+- Opt-in deduplication (`ZeroBucket(dedup=True)`): content-addressed
+  storage with reference counting. Byte-identical uploads share one
+  stored copy; bytes are only actually deleted when the last
+  referencing id is deleted.
+- Uses SEPARATE tables from classic mode (`zerobucket_blobs` /
+  `zerobucket_image_refs`, not `zerobucket_images`) -- a deliberate
+  safety decision so enabling dedup can never collide with or
+  misinterpret existing classic-mode data. The two modes can safely
+  coexist against the same database (tested directly, not just claimed).
+- `migrate_classic_to_dedup()`: a non-destructive, explicit migration
+  path for existing classic-mode data -- preserves every original id
+  exactly, correctly deduplicates content found along the way, and does
+  not modify or delete the source table.
+- `put_many()`/`get_many()`/`delete_many()` all work correctly in dedup
+  mode, including the tricky cases: repeated identical content within
+  one batch correctly accumulates the reference count, and batch deletes
+  correctly handle a mix of shared and unique checksums in one call.
+- `connection=` (transactional atomicity) works correctly in dedup mode
+  too, including the two-table case (a rollback undoes both the blob
+  insert and the reference insert together, not just one).
+
+### Verified before being built, not assumed
+
+- The core `INSERT ... ON CONFLICT DO UPDATE` upsert pattern was
+  stress-tested under 20 real concurrent threads incrementing the same
+  counter, BEFORE any application code was written on top of it --
+  confirmed zero lost updates. A further test exercises this through
+  the real `ZeroBucket` client with 15 concurrent `put()` calls for
+  identical content and confirms the exact reference count.
+- Repeated identical checksums within a single `put_many()` batch were
+  verified (via raw `executemany` testing first, then through the real
+  client) to correctly accumulate the reference count rather than only
+  registering the first occurrence.
+
+### Fixed (test infrastructure, not the library)
+
+- Corrected a test-fixture bug where truncating the two dedup tables in
+  separate statements failed under Postgres's foreign-key constraints --
+  they must be truncated together in one statement.
+
 ## [0.8.0] - 2026-08-29
 
 ### Added

@@ -6,6 +6,7 @@ image_id = images.put("avatar.jpg")
 image = images.get(image_id)
 """
 
+from .adapters.postgres import migrate_classic_to_dedup
 from .client import ZeroBucket
 from .content_types import ContentValidator, ValidatedContent
 from .exceptions import (
@@ -27,7 +28,7 @@ from .types import (
     ImageMetadata,
 )
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     "ZeroBucket",
@@ -39,6 +40,7 @@ __all__ = [
     "BatchDeleteResult",
     "ContentValidator",
     "ValidatedContent",
+    "migrate_classic_to_dedup",
     "ZeroBucketError",
     "ContentValidationError",
     "ImageValidationError",

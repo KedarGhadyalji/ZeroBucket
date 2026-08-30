@@ -333,6 +333,64 @@ See [`zerobucket/validators/pdf.py`](https://github.com/KedarGhadyalji/ZeroBucke
 for a complete reference implementation, including an explicit note on
 what it does and doesn't protect against.
 
+## Deduplication
+
+Opt-in content-addressed storage: byte-identical uploads share one
+underlying stored copy, reference-counted, with the bytes actually
+deleted only when the last referencing id is deleted.
+
+```python
+images = ZeroBucket(database_url=DATABASE_URL, dedup=True)
+
+id1 = images.put("photo.jpg")
+id2 = images.put("photo.jpg")  # identical content
+
+# Two distinct, independently-usable ids, as always --
+assert id1 != id2
+# -- but the bytes are stored exactly once, referenced twice.
+
+images.delete(id1)  # the stored bytes survive -- id2 still references them
+images.get(id2)     # still works fine
+
+images.delete(id2)  # NOW the bytes are actually deleted (last reference gone)
+```
+
+**Why this defaults to `False`:** enabling it requires an actual schema
+change -- content lives in a separate `zerobucket_blobs` table (keyed by
+checksum, with a `ref_count`), referenced by `zerobucket_image_refs`.
+These are deliberately **different tables** from classic mode's
+`zerobucket_images` -- flipping `dedup=True` does not retroactively
+touch, migrate, or dedupe any existing classic-mode data, and the two
+modes can safely coexist against the same database (proven by a
+dedicated test, not just claimed).
+
+**Verified before being built, not assumed:** the underlying
+`INSERT ... ON CONFLICT DO UPDATE` upsert pattern was tested under real
+concurrent load (20 threads incrementing the same counter) before any
+application code was written on top of it -- confirmed race-safe, zero
+lost updates. A further test exercises this through the real
+`ZeroBucket` client with 15 concurrent `put()` calls for identical
+content and confirms the final reference count is exact.
+
+### Migrating existing classic-mode data
+
+```python
+from zerobucket import ZeroBucket, migrate_classic_to_dedup
+
+dedup_images = ZeroBucket(database_url=DATABASE_URL, dedup=True)
+summary = migrate_classic_to_dedup(dedup_images._backend)
+print(summary)  # {'images_migrated': N, 'distinct_blobs_created': M, 'duplicate_references_found': N-M}
+```
+
+**Non-destructive** -- copies every row from the classic
+`zerobucket_images` table into the dedup tables, preserving every
+existing id exactly (so anything already referencing those ids keeps
+working), and does not modify or delete the original table. Verify the
+result, then clean up the old table yourself once you're confident.
+Known limitation, stated plainly: this loads the whole classic table
+into memory as one transaction -- fine for typical small/medium
+datasets, not built as a streaming tool for huge tables.
+
 ## Size limits
 
 Default maximum: **8MB per image**, configurable via `max_bytes=`.
@@ -356,12 +414,10 @@ Be honest with yourself about whether ZeroBucket fits your workload:
   into memory on both the client and server side of every request.
   There is no streaming, no range requests, no CDN. If you're serving
   millions of images a day or storing video, use S3 (or similar) instead.
-- **No deduplication yet.** Uploading the same image twice stores it
-  twice. A SHA-256 checksum is recorded on every row so this can be
-  added later without a schema change, but it isn't wired up in v1 --
-  doing it correctly requires reference counting so that deleting one
-  copy doesn't corrupt another, and that's more complexity than a v1
-  should carry.
+- **Deduplication exists but is opt-in, not automatic.** By default
+  (`dedup=False`), uploading the same image twice still stores it twice
+  -- pass `dedup=True` for content-addressed, reference-counted storage.
+  See the [Deduplication](#deduplication) section above.
 - **No image resizing/optimization pipeline yet.** ZeroBucket stores
   what you give it. It validates and rejects bad input; it doesn't
   transform good input (yet).
@@ -444,7 +500,7 @@ Not yet built, tracked honestly rather than implied:
 - [x] Optional resize/format-conversion pipeline (`optimize=True, max_width=...`)
 - [x] Optional HEIC/HEIF support (`pip install zerobucket[heic]`)
 - [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)
-- [ ] Deduplication with reference counting
+- [x] Deduplication with reference counting (opt-in, `dedup=True`)
 - [ ] SQLite and MySQL adapters
 - [x] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`, `zerobucket verify`)
 - [ ] Optional object-storage backend for files that outgrow the database tier

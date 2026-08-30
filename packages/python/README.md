@@ -186,13 +186,27 @@ cron/CI. See the
 [full CLI docs](https://github.com/KedarGhadyalji/ZeroBucket#cli) on
 GitHub.
 
+## Deduplication
+
+```python
+images = ZeroBucket(database_url=DATABASE_URL, dedup=True)
+id1 = images.put("photo.jpg")
+id2 = images.put("photo.jpg")  # identical content -- stored exactly once, referenced twice
+```
+
+Opt-in (`dedup=True`), uses separate tables from classic mode, so it's
+safe to add later without touching existing data. See the
+[full explanation](https://github.com/KedarGhadyalji/ZeroBucket#deduplication)
+on GitHub, including the migration path for existing classic-mode data.
+
 ## Limitations (read before using in production)
 
 - **Not built for large files or high-volume media.** Full images are
   read into memory on both ends of every request -- no streaming, no
   range requests, no CDN.
-- **No deduplication yet.** A SHA-256 checksum is stored on every row,
-  but duplicate uploads currently create duplicate rows.
+- **Deduplication is opt-in, not automatic.** Default `dedup=False`
+  stores every upload as a separate row; pass `dedup=True` for
+  content-addressed, reference-counted storage (see above).
 - **PostgreSQL only, for now.** The storage layer is abstracted for
   future adapters, but only Postgres exists today.
 

@@ -84,3 +84,22 @@ def db_connection_factory(_db_available):
     import psycopg
 
     return lambda: psycopg.connect(TEST_DATABASE_URL)
+
+
+@pytest.fixture
+def dedup_images(_db_available):
+    """A ZeroBucket instance with dedup=True, backed by clean dedup
+    tables (zerobucket_blobs / zerobucket_image_refs) for each test.
+    Separate tables from the `images` fixture's classic-mode table --
+    see postgres.py's module docstring for why that's a deliberate
+    design choice."""
+    zb = ZeroBucket(database_url=TEST_DATABASE_URL, dedup=True)
+    with zb._backend._pool.connection() as conn, conn.cursor() as cur:  # noqa: SLF001
+        # Must truncate both together in one statement -- Postgres
+        # refuses to truncate a referenced table alone (even if empty)
+        # while a foreign key constraint against it exists, unless done
+        # jointly or with CASCADE. Discovered by running this for real,
+        # not assumed.
+        cur.execute("TRUNCATE TABLE zerobucket_image_refs, zerobucket_blobs;")
+    yield zb
+    zb.close()

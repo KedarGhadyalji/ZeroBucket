@@ -60,6 +60,17 @@ class ZeroBucket:
         retry_base_delay: Base delay in seconds for exponential backoff
             between retries (actual delay grows per attempt, with
             jitter, capped at 2 seconds). Defaults to 0.1.
+        dedup: If True, use content-addressed storage: byte-identical
+            uploads share one underlying stored copy, reference-counted,
+            with the bytes actually deleted only when the last
+            referencing id is deleted. Defaults to False (classic
+            single-table behavior, unchanged since v0.1.0). Uses
+            DIFFERENT database tables from classic mode (zerobucket_blobs
+            / zerobucket_image_refs, not zerobucket_images) -- flipping
+            this on does NOT retroactively deduplicate or migrate
+            existing classic-mode data; see
+            zerobucket.adapters.postgres.migrate_classic_to_dedup for
+            that (a separate, explicit, non-destructive operation).
         backend: Advanced -- inject a custom StorageBackend instead of
             constructing a PostgresBackend from database_url.
     """
@@ -73,13 +84,17 @@ class ZeroBucket:
         allowed_formats: frozenset[str] = SUPPORTED_FORMATS,
         max_retries: int = 3,
         retry_base_delay: float = 0.1,
+        dedup: bool = False,
         backend: StorageBackend | None = None,
     ) -> None:
         if backend is not None:
             self._backend = backend
         elif database_url is not None:
             self._backend = PostgresBackend(
-                database_url, max_retries=max_retries, retry_base_delay=retry_base_delay
+                database_url,
+                max_retries=max_retries,
+                retry_base_delay=retry_base_delay,
+                dedup=dedup,
             )
         else:
             raise ValueError("Either database_url or backend must be provided")
