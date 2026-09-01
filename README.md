@@ -184,8 +184,9 @@ Two honest limitations, worth knowing before you reach for this:
 - **It's not HTTP range/partial-content support.** The full image is
   still transferred every time, just paced out in pieces instead of
   handed over all at once -- there's no way to ask for "just bytes
-  200-400" of a stored image. `before_get`/range-request support is a
-  separate, not-yet-built roadmap item.
+  200-400" of a stored image. Range-request support is a separate,
+  not-yet-built roadmap item (it was blocked on this streaming work
+  landing first; it's unblocked now, just not built).
 
 On the write side, `put()` reads a file-like input (an open file, a
 framework upload object) in bounded chunks and rejects an oversized
@@ -205,6 +206,62 @@ chunk fetch raises `StorageError` rather than silently handing back a
 short/truncated stream -- pass your own open `connection=` (see
 [Transactions](#transactions)) if you need a guaranteed-consistent read
 across the whole stream despite concurrent writers.
+
+### Access control
+
+By default, anything with a `database_url` and an id can read or write
+any image -- there's no notion of ownership or permissions built in.
+`before_get`/`before_put` hooks let you plug in your own authorization
+check without ZeroBucket needing to know anything about your users,
+sessions, or auth system:
+
+```python
+def before_get(image_id: str, context: dict | None) -> bool:
+    return context is not None and owns(context["user_id"], image_id)
+
+def before_put(context: dict | None) -> bool:
+    return context is not None and context.get("user_id") is not None
+
+images = ZeroBucket(
+    database_url=DATABASE_URL,
+    before_get=before_get,
+    before_put=before_put,
+)
+
+images.get(image_id, context={"user_id": current_user.id})  # -> AccessDeniedError if denied
+images.put(file, context={"user_id": current_user.id})
+```
+
+`context` is whatever you pass at the call site -- ZeroBucket never
+looks inside it, it's purely yours to define. Denied calls raise
+`AccessDeniedError` and never reach the database (no wasted validation
+work for `put()`, no wasted round trip for `get()`).
+
+What's gated and what isn't:
+
+- **`before_get`** gates `get()`, `get_many()` (evaluated once per id,
+  independently -- different ids in one batch can belong to different
+  owners), `get_stream()`/`stream_to()` (evaluated once per call, not
+  once per chunk), and `metadata()`.
+- **`before_put`** gates `put()` and `put_many()` (evaluated ONCE for
+  the whole batch, not once per item -- `context` represents who's
+  making the call, not per-item data, so a denial rejects the entire
+  batch rather than partially processing it).
+- **`exists()` is deliberately NOT gated.** A bare existence check
+  returns no image data or metadata, which was judged low-sensitivity
+  enough not to need authorization by default. Gate it yourself at the
+  call site if your use case needs that.
+
+The one behavior worth calling out explicitly: **if your hook raises an
+exception instead of returning `True`/`False`, that exception propagates
+(or is captured per-item for `get_many()`/reported for the whole batch
+for `put_many()`) -- it is never caught and treated as an implicit
+allow.** A hook that's broken or can't reach your auth backend fails
+_closed_, not open. This is different from the `on_operation` hook (see
+[Tuning and observability](#tuning-and-observability)), which is
+fire-and-forget metrics where swallowing exceptions is the right, safe
+default -- `before_get`/`before_put` are security decisions, where doing
+that would be a real hole.
 
 ### Optimizing images (compression)
 
@@ -620,7 +677,7 @@ Not yet built, tracked honestly rather than implied:
 - [ ] `asyncpg` / async client support
 - [x] Batch operations (`put_many`/`get_many`/`delete_many`)
 - [x] Retry/backoff policy for transient database errors
-- [ ] `before_get(image_id, context) -> bool` authorization hook
+- [x] `before_get(image_id, context) -> bool` / `before_put(context) -> bool` authorization hooks
 - [x] Pluggable content validators (`put(validator=...)`) -- includes a PDF reference implementation
 - [x] Streaming reads/writes for large files (`get_stream()`/`stream_to()`; bounded-read writes)
 - [ ] Django integration package

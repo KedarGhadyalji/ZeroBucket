@@ -2,6 +2,72 @@
 
 All notable changes to this project are documented here.
 
+## [0.12.0] - 2026-09-02
+
+### Added
+
+- `before_get(image_id, context) -> bool` and `before_put(context) -> bool`
+  authorization hooks, passed to the `ZeroBucket` constructor. Denying a
+  call raises the new `AccessDeniedError` (exported from the package
+  root) and never reaches the database.
+- `AccessDeniedError(ZeroBucketError)`, with `.operation` and
+  `.image_id` (the latter `None` for `before_put` denials).
+- `context: dict | None = None` parameter added to `get()`, `get_many()`,
+  `get_stream()`, `stream_to()`, `metadata()`, `put()`, and `put_many()`
+  -- passed straight through to whichever hook is configured, unused if
+  neither is. `ZeroBucket` never inspects `context` itself.
+
+### Scope decisions, stated directly rather than left implicit
+
+- **`before_get` gates**: `get()`, `get_many()` (evaluated once per id,
+  independently -- a batch can mix ids from different owners),
+  `get_stream()`/`stream_to()` (evaluated once per call, not once per
+  chunk -- chunks are an implementation detail of one already-authorized
+  read, not separate reads), and `metadata()` (still per-image
+  information tied to a specific id).
+- **`before_get` does NOT gate `exists()`.** A bare existence check
+  returns no image data or metadata; gating it wasn't part of the
+  original ask and would double the round-trip cost of what's meant to
+  be a cheap check. Callers who need that can gate it themselves at the
+  call site -- documented as a stated limitation, not a silent gap.
+- **`before_put` gates `put()` and `put_many()`, but `put_many()`
+  evaluates it exactly ONCE for the whole call**, not once per item.
+  `context` represents who's making the call, not per-item data, so one
+  evaluation covers the batch; a denial marks every item's result as
+  `error="access denied"` without touching any of them, rather than
+  partially processing the batch. Verified with a call-counting test,
+  not just asserted in a docstring.
+- **A hook that raises fails closed, not open.** If `before_get`/
+  `before_put` raise instead of returning a bool, that exception
+  propagates directly (single-item calls) or is captured per-item /
+  reported for the whole batch (`get_many()`/`put_many()`) -- it is
+  NEVER caught and treated as an implicit allow. This is the opposite of
+  `on_operation`'s existing behavior (fire-and-forget metrics, where
+  swallowing exceptions is the safe default) -- these are security
+  decisions, where swallowing would be a real hole. Covered by dedicated
+  tests using a hook that deliberately raises, for both single-item and
+  batch call shapes.
+- **Denied calls never reach the database.** The hook runs before any
+  backend/DB call is made (for `get_many()`, denied ids are filtered out
+  before the underlying batched query is even issued), so a denial
+  produces no `on_operation` event and, for `put()`, does no wasted
+  validation/checksum work. Verified directly: one test swaps in a
+  backend method that raises `AssertionError` if called, to prove a
+  denied `get()` never reaches it, not just that the right exception
+  came back.
+
+### Files delivered
+
+- Changed: `exceptions.py` (`AccessDeniedError`), `client.py`
+  (`before_get`/`before_put` constructor params, `_check_before_get`/
+  `_check_before_put` helpers, `context=` on all seven gated methods),
+  `__init__.py` (export `AccessDeniedError`), `pyproject.toml` (version
+  only), both READMEs (new "Access control" section, quick-reference
+  table, roadmap checkbox)
+- New: `tests/test_access_control.py` (27 new tests)
+
+178/178 tests pass (27 new), lint clean.
+
 ## [0.11.0] - 2026-09-01
 
 ### Added

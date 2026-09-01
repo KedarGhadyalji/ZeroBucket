@@ -38,16 +38,16 @@ in since Postgres 13).
 
 ## Quick reference
 
-| Method                                                                                        | What it does                                                                                                                                                                               |
-| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `images.put(image, filename=None, optimize=False, max_width=None, format=None, quality=None)` | Validates, optionally optimizes, checksums, and stores an image. Accepts a file path, raw `bytes`, or a file-like object (including framework upload objects). Returns the new image's id. |
-| `images.get(image_id)`                                                                        | Returns an `Image` (data, mime_type, filename, width, height, size_bytes, checksum_sha256). Raises `ImageNotFoundError` if missing.                                                        |
-| `images.get_stream(image_id, chunk_size=1MB)`                                                 | Like `get()`, but returns an iterator of chunks instead of one `bytes` object -- avoids holding the full image in Python memory at once. Raises `ImageNotFoundError` if missing.           |
-| `images.stream_to(image_id, destination, chunk_size=1MB)`                                     | Writes an image's bytes directly to `destination` (anything with `.write(bytes)`), chunk by chunk. Returns total bytes written.                                                            |
-| `images.metadata(image_id)`                                                                   | Same fields as `get()` but without the raw bytes -- cheap existence/info check.                                                                                                            |
-| `images.exists(image_id)`                                                                     | Returns `True`/`False`.                                                                                                                                                                    |
-| `images.delete(image_id)`                                                                     | Deletes the image. Returns `True` if it existed.                                                                                                                                           |
-| `images.close()`                                                                              | Releases database connections. `ZeroBucket` also works as a context manager.                                                                                                               |
+| Method                                                                                        | What it does                                                                                                                                                                                 |
+| --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `images.put(image, filename=None, optimize=False, max_width=None, format=None, quality=None)` | Validates, optionally optimizes, checksums, and stores an image. Accepts a file path, raw `bytes`, or a file-like object (including framework upload objects). Returns the new image's id.   |
+| `images.get(image_id, context=None)`                                                          | Returns an `Image` (data, mime_type, filename, width, height, size_bytes, checksum_sha256). Raises `ImageNotFoundError` if missing, or `AccessDeniedError` if a `before_get` hook denies it. |
+| `images.get_stream(image_id, chunk_size=1MB)`                                                 | Like `get()`, but returns an iterator of chunks instead of one `bytes` object -- avoids holding the full image in Python memory at once. Raises `ImageNotFoundError` if missing.             |
+| `images.stream_to(image_id, destination, chunk_size=1MB)`                                     | Writes an image's bytes directly to `destination` (anything with `.write(bytes)`), chunk by chunk. Returns total bytes written.                                                              |
+| `images.metadata(image_id)`                                                                   | Same fields as `get()` but without the raw bytes -- cheap existence/info check.                                                                                                              |
+| `images.exists(image_id)`                                                                     | Returns `True`/`False`.                                                                                                                                                                      |
+| `images.delete(image_id)`                                                                     | Deletes the image. Returns `True` if it existed.                                                                                                                                             |
+| `images.close()`                                                                              | Releases database connections. `ZeroBucket` also works as a context manager.                                                                                                                 |
 
 ```python
 from zerobucket import ZeroBucket, ImageNotFoundError, ImageValidationError
@@ -106,6 +106,33 @@ the way it always has, and this isn't HTTP range/partial-content
 support. See the [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#streaming-readswrites-for-large-files)
 on GitHub, including the mid-stream-delete safety behavior and how
 `put()` bounds memory for rejected oversized file-like uploads.
+
+### Access control
+
+```python
+def before_get(image_id: str, context: dict | None) -> bool:
+    return context is not None and owns(context["user_id"], image_id)
+
+def before_put(context: dict | None) -> bool:
+    return context is not None and context.get("user_id") is not None
+
+images = ZeroBucket(
+    database_url=DATABASE_URL,
+    before_get=before_get,
+    before_put=before_put,
+)
+
+images.get(image_id, context={"user_id": current_user.id})  # -> AccessDeniedError if denied
+```
+
+No built-in ownership/permissions model by default -- these hooks let
+you plug in your own check. Denied calls raise `AccessDeniedError` and
+never reach the database. A hook that raises fails _closed_ (the
+exception propagates, never treated as an implicit allow) -- see the
+[full explanation](https://github.com/KedarGhadyalji/ZeroBucket#access-control)
+on GitHub for exactly what's gated (`get`/`get_many`/`get_stream`/
+`stream_to`/`metadata`, NOT `exists`) and the `put_many`/`get_many`
+batch evaluation semantics.
 
 ### Optimizing images (compression)
 
