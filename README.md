@@ -391,6 +391,57 @@ Known limitation, stated plainly: this loads the whole classic table
 into memory as one transaction -- fine for typical small/medium
 datasets, not built as a streaming tool for huge tables.
 
+## Tuning and observability
+
+Two things worth knowing before you try to optimize anything: how to
+tune the connection pool, and how to actually measure what's happening.
+
+**Pool sizing** was previously hardcoded; now configurable:
+
+```python
+images = ZeroBucket(
+    database_url=DATABASE_URL,
+    pool_min_size=2,    # default: 1
+    pool_max_size=10,   # default: 5 -- raise this under real concurrent load
+    pool_timeout=15,    # default: 10 -- seconds to wait for a pooled connection
+)
+```
+
+**`on_operation`** is a callback fired after every storage operation
+completes (success or failure), with timing, retry count, and error
+info -- wire it to whatever metrics backend you actually use (Prometheus,
+StatsD, plain logging). ZeroBucket doesn't ship a specific integration,
+deliberately, to keep the core dependency footprint small:
+
+```python
+from zerobucket import ZeroBucket, OperationEvent
+
+def on_operation(event: OperationEvent) -> None:
+    print(f"{event.operation}: {event.duration_seconds:.3f}s "
+          f"success={event.success} retries={event.retry_count}")
+    # or: my_metrics_client.histogram(f"zerobucket.{event.operation}.duration", event.duration_seconds)
+
+images = ZeroBucket(database_url=DATABASE_URL, on_operation=on_operation)
+```
+
+`operation` is one of `"put"`, `"put_many"`, `"get"`, `"get_many"`,
+`"get_metadata"`, `"delete"`, `"delete_many"`, `"exists"`, `"migrate"` --
+dedup-mode operations report the same names as their classic-mode
+counterparts, since from a metrics perspective it's still logically the
+same operation regardless of storage mode underneath.
+
+A subtle but important point, worth being explicit about: `get()` on a
+missing id reports `success=True` in the event (the _database query_
+succeeded -- it correctly found no matching row) even though `get()`
+itself then raises `ImageNotFoundError` to the caller. The event
+measures the storage operation, not your application-level outcome.
+
+**Safety guarantee, tested directly:** an exception raised inside your
+`on_operation` callback is caught and silently ignored -- a bug in your
+metrics code can never break a real image operation. This also means
+such bugs won't be visible to you unless you test the callback itself
+separately.
+
 ## Size limits
 
 Default maximum: **8MB per image**, configurable via `max_bytes=`.
@@ -511,6 +562,8 @@ Not yet built, tracked honestly rather than implied:
 - [x] Pluggable content validators (`put(validator=...)`) -- includes a PDF reference implementation
 - [ ] Streaming reads/writes for large files
 - [ ] Django integration package
+- [x] Configurable connection pool sizing (`pool_min_size`/`pool_max_size`/`pool_timeout`)
+- [x] `on_operation` observability hook (per-operation timing, retry count, success/failure)
 
 ## License
 

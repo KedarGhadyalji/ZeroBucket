@@ -2,6 +2,39 @@
 
 All notable changes to this project are documented here.
 
+## [0.10.0] - 2026-08-31
+
+### Added
+
+- `pool_min_size`/`pool_max_size`/`pool_timeout` on `ZeroBucket(...)` --
+  previously hardcoded (1/5/10) connection pool settings are now
+  configurable. Defaults unchanged, so this is purely additive.
+- `on_operation` callback: fires after every storage operation (`put`,
+  `put_many`, `get`, `get_many`, `get_metadata`, `delete`,
+  `delete_many`, `exists`, `migrate`) with an `OperationEvent` (timing,
+  success/failure, error, retry count). Wire it to your own metrics
+  backend -- ZeroBucket does not ship a specific integration.
+- `OperationEvent`, exported from the package root.
+
+### Design notes
+
+- Dedup-mode operations report the SAME operation names as their
+  classic-mode counterparts -- logically the same operation from a
+  metrics perspective, regardless of storage mode underneath.
+- `get()` on a missing id reports `success=True` in its event (the
+  database query correctly found no row) even though `get()` itself
+  then raises `ImageNotFoundError` to the caller -- the event measures
+  the storage operation, not the application-level outcome. Documented
+  explicitly and covered by a dedicated test, since this boundary is
+  easy to get wrong or leave ambiguous.
+- Exceptions raised inside `on_operation` are caught and silently
+  ignored -- verified by a dedicated test that a deliberately broken
+  callback cannot prevent a real `put()`/`get()`/`delete()` from
+  succeeding.
+- `connection=` calls always report `retry_count=0` in their event,
+  consistent with the existing rule that automatic retry never applies
+  on that path (see v0.7.0).
+
 ## [0.9.0] - 2026-08-30
 
 ### Added

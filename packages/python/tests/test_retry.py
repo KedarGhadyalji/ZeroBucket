@@ -112,7 +112,7 @@ def test_run_retries_transient_failure_then_succeeds(fast_backend):
             raise psycopg.OperationalError("simulated transient failure")
         return "success"
 
-    result = fast_backend._run(None, flaky_work)
+    result = fast_backend._run(None, flaky_work, operation="test")
     assert result == "success"
     assert attempts["count"] == 3  # failed twice, succeeded on the 3rd
 
@@ -125,7 +125,7 @@ def test_run_does_not_retry_non_transient_error(fast_backend):
         raise psycopg.errors.SyntaxError("simulated bad SQL, will never succeed")
 
     with pytest.raises(psycopg.errors.SyntaxError):
-        fast_backend._run(None, always_bad_sql)
+        fast_backend._run(None, always_bad_sql, operation="test")
     assert attempts["count"] == 1  # no retry attempted
 
 
@@ -137,7 +137,7 @@ def test_run_gives_up_after_max_retries(fast_backend):
         raise psycopg.OperationalError("simulated, always fails")
 
     with pytest.raises(psycopg.OperationalError):
-        fast_backend._run(None, always_transient)
+        fast_backend._run(None, always_transient, operation="test")
     # max_retries=3 means up to 4 total attempts (1 initial + 3 retries).
     assert attempts["count"] == 4
 
@@ -158,7 +158,7 @@ def test_run_with_connection_never_retries_even_transient_error(fast_backend):
     )
     try:
         with pytest.raises(psycopg.OperationalError):
-            fast_backend._run(conn, always_transient)
+            fast_backend._run(conn, always_transient, operation="test")
         assert attempts["count"] == 1  # exactly one attempt, no retry
     finally:
         conn.close()
@@ -178,7 +178,7 @@ def test_max_retries_zero_disables_retry_entirely(_db_available, monkeypatch):
             raise psycopg.OperationalError("simulated")
 
         with pytest.raises(psycopg.OperationalError):
-            backend._run(None, always_transient)
+            backend._run(None, always_transient, operation="test")
         assert attempts["count"] == 1
     finally:
         backend.close()
@@ -196,7 +196,7 @@ def test_retry_is_transparent_to_public_methods_wrapping_in_storage_error(fast_b
 
     with pytest.raises(StorageError):
         try:
-            fast_backend._run(None, always_transient)
+            fast_backend._run(None, always_transient, operation="test")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed: {exc}") from exc
     assert attempts["count"] == 4

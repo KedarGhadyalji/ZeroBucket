@@ -199,6 +199,23 @@ safe to add later without touching existing data. See the
 [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#deduplication)
 on GitHub, including the migration path for existing classic-mode data.
 
+## Tuning and observability
+
+```python
+images = ZeroBucket(
+    database_url=DATABASE_URL,
+    pool_max_size=10,       # default: 5
+    on_operation=lambda e: print(e.operation, e.duration_seconds, e.success),
+)
+```
+
+Pool sizing (`pool_min_size`/`pool_max_size`/`pool_timeout`) was
+previously hardcoded, now configurable. `on_operation` fires after every
+storage operation with timing, retry count, and success/failure --
+callback exceptions are caught and never break a real operation. See the
+[full explanation](https://github.com/KedarGhadyalji/ZeroBucket#tuning-and-observability)
+on GitHub.
+
 ## Limitations (read before using in production)
 
 - **Not built for large files or high-volume media.** Full images are

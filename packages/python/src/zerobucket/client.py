@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO, Union
 
 from .adapters.base import StorageBackend
-from .adapters.postgres import PostgresBackend
+from .adapters.postgres import OperationEvent, PostgresBackend
 from .content_types import ContentValidator
 from .exceptions import ImageNotFoundError, ImageValidationError
 from .optimization import optimize_image
@@ -71,6 +72,26 @@ class ZeroBucket:
             existing classic-mode data; see
             zerobucket.adapters.postgres.migrate_classic_to_dedup for
             that (a separate, explicit, non-destructive operation).
+        pool_min_size: Minimum connections kept open in the internal
+            pool. Defaults to 1, unchanged from every prior version --
+            this makes a previously-hardcoded value configurable, not a
+            new default.
+        pool_max_size: Maximum connections the internal pool can open.
+            Defaults to 5, unchanged from every prior version. Raise
+            this if you're seeing pool-timeout errors under real
+            concurrent load; see docs/OPERATIONS.md.
+        pool_timeout: Seconds to wait for a pooled connection to become
+            available before giving up. Defaults to 10, unchanged from
+            every prior version.
+        on_operation: Optional callback, called with a
+            zerobucket.adapters.postgres.OperationEvent (operation name,
+            duration, success/failure, retry count) after every storage
+            operation completes. Wire this to your own metrics backend
+            (Prometheus, StatsD, logging -- whatever you use); ZeroBucket
+            does not ship a specific integration. Exceptions raised
+            inside your callback are caught and silently ignored, so a
+            bug in your metrics code can never break a real image
+            operation.
         backend: Advanced -- inject a custom StorageBackend instead of
             constructing a PostgresBackend from database_url.
     """
@@ -85,6 +106,10 @@ class ZeroBucket:
         max_retries: int = 3,
         retry_base_delay: float = 0.1,
         dedup: bool = False,
+        pool_min_size: int = 1,
+        pool_max_size: int = 5,
+        pool_timeout: float = 10,
+        on_operation: Callable[[OperationEvent], None] | None = None,
         backend: StorageBackend | None = None,
     ) -> None:
         if backend is not None:
@@ -95,6 +120,10 @@ class ZeroBucket:
                 max_retries=max_retries,
                 retry_base_delay=retry_base_delay,
                 dedup=dedup,
+                pool_min_size=pool_min_size,
+                pool_max_size=pool_max_size,
+                pool_timeout=pool_timeout,
+                on_operation=on_operation,
             )
         else:
             raise ValueError("Either database_url or backend must be provided")

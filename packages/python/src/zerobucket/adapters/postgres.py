@@ -28,6 +28,10 @@ dedup=True/False)) and never mixed within one instance:
   misinterpret classic-mode data. See migrate_classic_to_dedup() for the
   (non-destructive, opt-in, separately tested) path to move existing
   classic-mode data into dedup tables.
+
+Pool sizing (pool_min_size/pool_max_size/pool_timeout) and an optional
+on_operation observability callback are both exposed here -- see
+OperationEvent and PostgresBackend's docstring below.
 """
 
 from __future__ import annotations
@@ -35,6 +39,8 @@ from __future__ import annotations
 import random
 import time
 from collections import Counter
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import psycopg
 from psycopg_pool import ConnectionPool
@@ -142,7 +148,9 @@ WHERE r.id = %s;
 
 _DEDUP_EXISTS = "SELECT 1 FROM zerobucket_image_refs WHERE id = %s;"
 
-_DEDUP_DELETE_REF = "DELETE FROM zerobucket_image_refs WHERE id = %s RETURNING checksum_sha256;"
+_DEDUP_DELETE_REF = (
+    "DELETE FROM zerobucket_image_refs WHERE id = %s RETURNING checksum_sha256;"
+)
 
 _DEDUP_DECREMENT_BLOB = """
 UPDATE zerobucket_blobs SET ref_count = ref_count - %s
@@ -205,6 +213,37 @@ def _backoff_delay(attempt: int, base_delay: float) -> float:
     return min(exponential + jitter, _MAX_BACKOFF_SECONDS)
 
 
+@dataclass(frozen=True, slots=True)
+class OperationEvent:
+    """Emitted to an on_operation callback after every storage operation
+    completes (success or failure) -- the "measure" half of "you can't
+    optimize what you can't measure."
+
+    operation: one of "put", "put_many", "get", "get_many",
+        "get_metadata", "delete", "delete_many", "exists", "migrate".
+        Dedup-mode operations report the SAME operation name as their
+        classic-mode counterpart (e.g. a dedup put() reports "put", not
+        some dedup-specific name) -- from a metrics/tuning perspective,
+        it's still logically the same operation regardless of storage
+        mode underneath.
+    duration_seconds: wall-clock time for the WHOLE call, including any
+        retries and their backoff delays -- this is what actually
+        matters for understanding real-world latency your application
+        experiences, not just the final successful attempt in isolation.
+    success: whether the operation ultimately succeeded.
+    error: str(exception) if it failed, else None.
+    retry_count: how many retries were attempted (0 if none, or if this
+        call used connection= -- automatic retry never applies there,
+        see PostgresBackend's docstring).
+    """
+
+    operation: str
+    duration_seconds: float
+    success: bool
+    error: str | None
+    retry_count: int
+
+
 class PostgresBackend(StorageBackend):
     """Storage backend for PostgreSQL using BYTEA columns.
 
@@ -226,6 +265,21 @@ class PostgresBackend(StorageBackend):
     unchanged single-table behavior; True switches to content-addressed
     storage in separate tables. Not retroactive -- see
     migrate_classic_to_dedup() for moving existing classic-mode data.
+
+    pool_min_size/pool_max_size/pool_timeout: tune the internal
+    connection pool. Defaults (1/5/10) are unchanged from every prior
+    version -- this is purely making previously-hardcoded values
+    configurable, not changing any default behavior.
+
+    on_operation: optional callback, called with an OperationEvent after
+    every operation completes. Exceptions raised inside your callback
+    are caught and silently ignored -- a bug in your metrics code can
+    never break a real image operation, but this also means such bugs
+    won't be visible to you unless you test the callback separately.
+    Wire this to whatever you actually use (Prometheus client, StatsD,
+    plain logging) -- ZeroBucket does not ship a specific metrics
+    backend integration, deliberately, consistent with keeping the core
+    library's dependency footprint small.
     """
 
     def __init__(
@@ -236,10 +290,18 @@ class PostgresBackend(StorageBackend):
         max_retries: int = 3,
         retry_base_delay: float = 0.1,
         dedup: bool = False,
+        pool_min_size: int = 1,
+        pool_max_size: int = 5,
+        pool_timeout: float = 10,
+        on_operation: Callable[[OperationEvent], None] | None = None,
     ) -> None:
         try:
             self._pool = ConnectionPool(
-                database_url, min_size=1, max_size=5, open=True, timeout=10
+                database_url,
+                min_size=pool_min_size,
+                max_size=pool_max_size,
+                open=True,
+                timeout=pool_timeout,
             )
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Could not connect to PostgreSQL: {exc}") from exc
@@ -247,6 +309,7 @@ class PostgresBackend(StorageBackend):
         self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
         self._dedup = dedup
+        self._on_operation = on_operation
 
         if auto_migrate:
             try:
@@ -268,34 +331,70 @@ class PostgresBackend(StorageBackend):
         """
         schema = _DEDUP_SCHEMA if self._dedup else _SCHEMA
         try:
-            self._run(None, lambda cur: cur.execute(schema))
+            self._run(None, lambda cur: cur.execute(schema), operation="migrate")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Migration failed: {exc}") from exc
 
-    def _run(self, connection: psycopg.Connection | None, work):
+    def _emit(
+        self,
+        operation: str,
+        start_time: float,
+        success: bool,
+        error: str | None,
+        retry_count: int,
+    ) -> None:
+        if self._on_operation is None:
+            return
+        event = OperationEvent(
+            operation=operation,
+            duration_seconds=time.monotonic() - start_time,
+            success=success,
+            error=error,
+            retry_count=retry_count,
+        )
+        try:
+            self._on_operation(event)
+        except Exception:  # noqa: BLE001
+            pass  # never let a metrics callback break a real operation
+
+    def _run(self, connection: psycopg.Connection | None, work, *, operation: str):
         """Run `work(cursor)` and return its result.
 
         connection provided -> run once, on that exact connection, no
-        retry (see class docstring for why).
+        retry (see class docstring for why). Still emits an
+        OperationEvent (retry_count always 0 on this path).
 
         connection is None -> use the internal pool; retry transient
         failures (see _is_retryable) up to max_retries times with
         exponential backoff + jitter. Non-transient errors propagate
         immediately on the first attempt, same as before this feature
-        existed.
+        existed. Emits exactly one OperationEvent per call, after the
+        final attempt (success or exhausted retries) -- duration_seconds
+        covers the whole call including any backoff delays.
         """
+        start_time = time.monotonic()
+
         if connection is not None:
-            with connection.cursor() as cur:
-                return work(cur)
+            try:
+                with connection.cursor() as cur:
+                    result = work(cur)
+                self._emit(operation, start_time, True, None, 0)
+                return result
+            except Exception as exc:  # noqa: BLE001
+                self._emit(operation, start_time, False, str(exc), 0)
+                raise
 
         attempt = 0
         while True:
             try:
                 with self._pool.connection() as conn, conn.cursor() as cur:
-                    return work(cur)
+                    result = work(cur)
+                self._emit(operation, start_time, True, None, attempt)
+                return result
             except Exception as exc:  # noqa: BLE001
                 attempt += 1
                 if attempt > self._max_retries or not _is_retryable(exc):
+                    self._emit(operation, start_time, False, str(exc), attempt - 1)
                     raise
                 time.sleep(_backoff_delay(attempt, self._retry_base_delay))
 
@@ -340,7 +439,7 @@ class PostgresBackend(StorageBackend):
             return str(row[0])
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="put")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to store image: {exc}") from exc
 
@@ -366,7 +465,7 @@ class PostgresBackend(StorageBackend):
             return str(row[0])
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="put")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to store image: {exc}") from exc
 
@@ -439,7 +538,7 @@ class PostgresBackend(StorageBackend):
             return ids
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="put_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to store image batch: {exc}") from exc
 
@@ -460,7 +559,9 @@ class PostgresBackend(StorageBackend):
             ]
             cur.executemany(_DEDUP_UPSERT_BLOB, blob_params)
 
-            ref_params = [(row["checksum_sha256"], row["original_filename"]) for row in rows]
+            ref_params = [
+                (row["checksum_sha256"], row["original_filename"]) for row in rows
+            ]
             cur.executemany(_DEDUP_INSERT_REF, ref_params, returning=True)
             ids = [str(cur.fetchone()[0])]
             while cur.nextset():
@@ -468,7 +569,7 @@ class PostgresBackend(StorageBackend):
             return ids
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="put_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to store image batch: {exc}") from exc
 
@@ -484,7 +585,7 @@ class PostgresBackend(StorageBackend):
             return cur.fetchone()
 
         try:
-            row = self._run(connection, work)
+            row = self._run(connection, work, operation="get")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image: {exc}") from exc
         if row is None:
@@ -513,16 +614,20 @@ class PostgresBackend(StorageBackend):
             return []
 
         if self._dedup:
-            select_many_sql = _DEDUP_SELECT_FULL.replace("WHERE r.id = %s", "WHERE r.id = ANY(%s)")
+            select_many_sql = _DEDUP_SELECT_FULL.replace(
+                "WHERE r.id = %s", "WHERE r.id = ANY(%s)"
+            )
         else:
-            select_many_sql = _SELECT_FULL.replace("WHERE id = %s", "WHERE id = ANY(%s)")
+            select_many_sql = _SELECT_FULL.replace(
+                "WHERE id = %s", "WHERE id = ANY(%s)"
+            )
 
         def work(cur):
             cur.execute(select_many_sql, (image_ids,))
             return cur.fetchall()
 
         try:
-            rows = self._run(connection, work)
+            rows = self._run(connection, work, operation="get_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image batch: {exc}") from exc
         return [
@@ -549,7 +654,7 @@ class PostgresBackend(StorageBackend):
             return cur.fetchone()
 
         try:
-            row = self._run(connection, work)
+            row = self._run(connection, work, operation="get_metadata")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
         if row is None:
@@ -577,11 +682,13 @@ class PostgresBackend(StorageBackend):
             return cur.rowcount > 0
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="delete")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image: {exc}") from exc
 
-    def _delete_dedup(self, image_id: str, *, connection: psycopg.Connection | None) -> bool:
+    def _delete_dedup(
+        self, image_id: str, *, connection: psycopg.Connection | None
+    ) -> bool:
         def work(cur):
             cur.execute(_DEDUP_DELETE_REF, (image_id,))
             row = cur.fetchone()
@@ -595,7 +702,7 @@ class PostgresBackend(StorageBackend):
             return True
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="delete")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image: {exc}") from exc
 
@@ -620,7 +727,7 @@ class PostgresBackend(StorageBackend):
             return [str(row[0]) for row in cur.fetchall()]
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="delete_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image batch: {exc}") from exc
 
@@ -653,12 +760,14 @@ class PostgresBackend(StorageBackend):
                     checksums_to_check_for_deletion.append(checksum)
 
             if checksums_to_check_for_deletion:
-                cur.execute(_DEDUP_DELETE_EMPTY_BLOBS, (checksums_to_check_for_deletion,))
+                cur.execute(
+                    _DEDUP_DELETE_EMPTY_BLOBS, (checksums_to_check_for_deletion,)
+                )
 
             return deleted_ids
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="delete_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image batch: {exc}") from exc
 
@@ -674,7 +783,7 @@ class PostgresBackend(StorageBackend):
             return cur.fetchone() is not None
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="exists")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to check image existence: {exc}") from exc
 
@@ -749,7 +858,10 @@ def migrate_classic_to_dedup(dedup_backend: PostgresBackend) -> dict:
                 created_at,
             ) = row
 
-            cur.execute(_DEDUP_UPSERT_BLOB, (checksum, data, mime_type, size_bytes, width, height))
+            cur.execute(
+                _DEDUP_UPSERT_BLOB,
+                (checksum, data, mime_type, size_bytes, width, height),
+            )
             seen_checksums.add(checksum)
 
             # Preserve the ORIGINAL id and created_at exactly -- this is
