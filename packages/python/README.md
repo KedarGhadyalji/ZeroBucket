@@ -42,6 +42,8 @@ in since Postgres 13).
 | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `images.put(image, filename=None, optimize=False, max_width=None, format=None, quality=None)` | Validates, optionally optimizes, checksums, and stores an image. Accepts a file path, raw `bytes`, or a file-like object (including framework upload objects). Returns the new image's id. |
 | `images.get(image_id)`                                                                        | Returns an `Image` (data, mime_type, filename, width, height, size_bytes, checksum_sha256). Raises `ImageNotFoundError` if missing.                                                        |
+| `images.get_stream(image_id, chunk_size=1MB)`                                                 | Like `get()`, but returns an iterator of chunks instead of one `bytes` object -- avoids holding the full image in Python memory at once. Raises `ImageNotFoundError` if missing.           |
+| `images.stream_to(image_id, destination, chunk_size=1MB)`                                     | Writes an image's bytes directly to `destination` (anything with `.write(bytes)`), chunk by chunk. Returns total bytes written.                                                            |
 | `images.metadata(image_id)`                                                                   | Same fields as `get()` but without the raw bytes -- cheap existence/info check.                                                                                                            |
 | `images.exists(image_id)`                                                                     | Returns `True`/`False`.                                                                                                                                                                    |
 | `images.delete(image_id)`                                                                     | Deletes the image. Returns `True` if it existed.                                                                                                                                           |
@@ -86,6 +88,24 @@ def serve_image(image_id):
     image = images.get(image_id)
     return Response(image.data, mimetype=image.mime_type)
 ```
+
+### Streaming reads for large files
+
+```python
+for chunk in images.get_stream(image_id, chunk_size=1024 * 1024):
+    response.write(chunk)
+
+# or:
+total_bytes = images.stream_to(image_id, response, chunk_size=1024 * 1024)
+```
+
+Avoids holding the full image in Python memory at once (one chunk at a
+time instead), via ranged `substring()` queries. This is a Python-side
+memory optimization only -- Postgres still handles the full stored value
+the way it always has, and this isn't HTTP range/partial-content
+support. See the [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#streaming-readswrites-for-large-files)
+on GitHub, including the mid-stream-delete safety behavior and how
+`put()` bounds memory for rejected oversized file-like uploads.
 
 ### Optimizing images (compression)
 
@@ -218,9 +238,11 @@ on GitHub.
 
 ## Limitations (read before using in production)
 
-- **Not built for large files or high-volume media.** Full images are
-  read into memory on both ends of every request -- no streaming, no
-  range requests, no CDN.
+- **Not built for large files or high-volume media.** `get_stream()`
+  avoids holding a full image in Python memory during a read (see
+  above), but Postgres itself still handles the full stored value the
+  same way it always has -- no true server-side memory reduction, no
+  HTTP range requests, no CDN.
 - **Deduplication is opt-in, not automatic.** Default `dedup=False`
   stores every upload as a separate row; pass `dedup=True` for
   content-addressed, reference-counted storage (see above).

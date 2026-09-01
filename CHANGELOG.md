@@ -2,6 +2,86 @@
 
 All notable changes to this project are documented here.
 
+## [0.11.0] - 2026-09-01
+
+### Added
+
+- `get_stream(image_id, chunk_size=1MB, connection=None)`: retrieve an
+  image as an iterator of chunks instead of one complete `bytes` object.
+  Implemented via repeated `substring(data FROM offset FOR length)`
+  queries -- never materializes the full value in Python memory at once.
+  Works identically in classic and dedup mode.
+- `stream_to(image_id, destination, chunk_size=1MB, connection=None)`:
+  convenience wrapper that loops over `get_stream()` and writes each
+  chunk to `destination` (an open file, an HTTP response object,
+  anything with `.write(bytes)`), returning the total byte count.
+- `DEFAULT_STREAM_CHUNK_SIZE` (1 MiB), exported from the package root.
+- `put()`/`put_many()` now read file-like input (an open file, a
+  framework upload object) in bounded chunks and reject an oversized
+  upload as soon as they've read one byte past `max_bytes`, instead of
+  first buffering the entire stream into memory and only then checking
+  the size. Peak memory for a rejected oversized upload is now bounded
+  by `max_bytes`, not by the (potentially much larger, even unbounded)
+  size of the input stream.
+
+### Why this is "streaming reads/writes," specifically, and not more than that
+
+- This does NOT make BYTEA-in-Postgres support arbitrary-size streaming
+  ingestion. Checksum computation and image validation (Pillow decode)
+  both require the complete byte content -- there is no way to validate
+  "is this an undamaged JPEG" from a prefix of the bytes, so a `put()`
+  of anything under `max_bytes` still ends up fully in memory here, same
+  as before. What changed is bounded, fail-fast rejection of oversized
+  input -- a real, if narrower, improvement, not the "streaming writes of
+  arbitrarily large files" a bucket-store name might suggest.
+- `get_stream()` reduces PYTHON-side memory pressure per read. It does
+  NOT reduce POSTGRES-side memory/IO cost -- the server still handles
+  the full stored value the same way it always has for a BYTEA column
+  (TOAST detoast, etc). It is also not an HTTP range/partial-content
+  feature: the full image is still transferred, just paced out in
+  pieces, not a subset of it. Both limitations are stated directly in
+  `get_stream()`'s docstring and the README, not glossed over.
+- Without `connection=` spanning the whole read, each chunk of
+  `get_stream()` is its own round trip with no snapshot isolation across
+  chunks. A concurrent `delete()` between chunks raises `StorageError`
+  rather than silently returning a short/truncated stream -- a truncated
+  image passed off as complete would be a much worse failure mode than
+  a loud one. Covered by a dedicated test that deletes the row mid-
+  stream via a separate connection and confirms the raise, not just
+  documented as a claim.
+
+### Verified before being built, not assumed
+
+- `substring()` is 1-indexed and clamps `length` at the value's actual
+  end in Postgres, so the final chunk of a stream naturally comes back
+  shorter with no special-casing needed -- exercised directly by a test
+  using a chunk_size that doesn't evenly divide the image size.
+- The bounded-read write path was verified with a counting file-like
+  wrapper that a 5MB oversized upload against a 200-byte cap is rejected
+  having read only a small, bounded amount -- not the full 5MB -- rather
+  than just asserting the exception type.
+- `bytes`/path input (already fully in memory, or a single
+  `read_bytes()` call) is unaffected: `ImageTooLargeError.size_bytes`
+  stays the true exact size there. Only file-like input's reported
+  `size_bytes`, when rejected, is a lower bound (wherever reading
+  stopped) rather than the stream's true total size -- finding the true
+  size would mean reading all of it, which is exactly the cost this
+  feature avoids. Both behaviors are covered by dedicated tests.
+
+### Files delivered
+
+- Changed: `adapters/base.py` (new `get_stream` abstract method),
+  `adapters/postgres.py` (`get_stream` implementation, chunk-select
+  queries, `DEFAULT_STREAM_CHUNK_SIZE`), `client.py` (`get_stream`,
+  `stream_to`, bounded `_read_image_input` for file-like input),
+  `__init__.py` (export `DEFAULT_STREAM_CHUNK_SIZE`), `pyproject.toml`
+  (version only), both READMEs (new streaming section, updated
+  Limitations/quick-reference/`on_operation` operation list), root
+  `README.md`'s roadmap checkbox
+- New: `tests/test_streaming.py` (15 new tests)
+
+151/151 tests pass (15 new), lint clean.
+
 ## [0.10.0] - 2026-08-31
 
 ### Added

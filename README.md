@@ -152,6 +152,60 @@ def serve_image(image_id):
 No manual decoding, no Base64, no internal transformation. `image.data`
 is the same bytes you'd get from `open(path, "rb").read()`.
 
+### Streaming reads/writes for large files
+
+`get()` always returns the complete image as one `bytes` object -- fine
+for typical avatar/photo-sized uploads, but it means the full image sits
+in Python memory (and gets copied around) even if all you're doing is
+piping it straight back out to an HTTP response. `get_stream()` avoids
+that:
+
+```python
+for chunk in images.get_stream(image_id, chunk_size=1024 * 1024):
+    response.write(chunk)
+
+# or, equivalently, let ZeroBucket do the loop:
+total_bytes = images.stream_to(image_id, response, chunk_size=1024 * 1024)
+```
+
+Implemented via repeated `substring(data FROM offset FOR length)` range
+queries -- only one chunk is ever held in Python memory at a time, and it
+works identically in classic and dedup mode. `stream_to()` writes
+straight to anything with a `.write(bytes)` method (an open file, a
+FastAPI/Flask response, a socket) and returns the total byte count.
+
+Two honest limitations, worth knowing before you reach for this:
+
+- **This is a Python-side memory optimization, not a Postgres-side one.**
+  The server still handles the full stored value the way it always has
+  for a BYTEA column (TOAST detoast, etc.) -- `get_stream()` doesn't
+  change what Postgres does, only what your application process holds
+  onto while consuming the result.
+- **It's not HTTP range/partial-content support.** The full image is
+  still transferred every time, just paced out in pieces instead of
+  handed over all at once -- there's no way to ask for "just bytes
+  200-400" of a stored image. `before_get`/range-request support is a
+  separate, not-yet-built roadmap item.
+
+On the write side, `put()` reads a file-like input (an open file, a
+framework upload object) in bounded chunks and rejects an oversized
+upload as soon as it's read one byte past `max_bytes`, instead of first
+buffering the whole thing into memory. This bounds peak memory for a
+_rejected_ oversized upload -- it does not turn `put()` into unbounded-
+size streaming ingestion, since checksum computation and image
+validation (Pillow decode) both require the complete bytes for anything
+that's actually within the cap. `bytes`/path input is unaffected --
+those are already fully in memory (or a single `read_bytes()` call)
+before `put()` sees them.
+
+Concurrency note: without `connection=` spanning the whole `get_stream()`
+call, each chunk is its own round trip with no snapshot isolation across
+chunks. If the row is deleted mid-stream by something else, the next
+chunk fetch raises `StorageError` rather than silently handing back a
+short/truncated stream -- pass your own open `connection=` (see
+[Transactions](#transactions)) if you need a guaranteed-consistent read
+across the whole stream despite concurrent writers.
+
 ### Optimizing images (compression)
 
 `optimize=True` unlocks metadata stripping, resizing, and quality-based
@@ -424,11 +478,16 @@ def on_operation(event: OperationEvent) -> None:
 images = ZeroBucket(database_url=DATABASE_URL, on_operation=on_operation)
 ```
 
-`operation` is one of `"put"`, `"put_many"`, `"get"`, `"get_many"`,
-`"get_metadata"`, `"delete"`, `"delete_many"`, `"exists"`, `"migrate"` --
-dedup-mode operations report the same names as their classic-mode
-counterparts, since from a metrics perspective it's still logically the
-same operation regardless of storage mode underneath.
+`operation` is one of `"put"`, `"put_many"`, `"get"`, `"get_stream"`,
+`"get_many"`, `"get_metadata"`, `"delete"`, `"delete_many"`, `"exists"`,
+`"migrate"` -- dedup-mode operations report the same names as their
+classic-mode counterparts, since from a metrics perspective it's still
+logically the same operation regardless of storage mode underneath. Note
+that a single `get_stream()` call emits one `get_metadata` event (the
+initial size/not-found lookup) followed by one `get_stream` event _per
+chunk fetched_, not one event for the whole call -- each is a genuinely
+separate round trip, consistent with every other operation being
+measured per round trip rather than per logical method call.
 
 A subtle but important point, worth being explicit about: `get()` on a
 missing id reports `success=True` in the event (the _database query_
@@ -461,10 +520,13 @@ memory cost across image sizes. In short:
 
 Be honest with yourself about whether ZeroBucket fits your workload:
 
-- **Not for large files or high-volume media.** Full images are read
-  into memory on both the client and server side of every request.
-  There is no streaming, no range requests, no CDN. If you're serving
-  millions of images a day or storing video, use S3 (or similar) instead.
+- **Not for large files or high-volume media.** `get_stream()`/
+  `stream_to()` avoid holding a full image in _Python_ memory during a
+  read, but Postgres itself still handles the full stored value the same
+  way it always has for a BYTEA column -- there is no true reduction in
+  server-side memory/IO cost, no HTTP range/partial-content support, and
+  no CDN. If you're serving millions of images a day or storing video,
+  use S3 (or similar) instead.
 - **Deduplication exists but is opt-in, not automatic.** By default
   (`dedup=False`), uploading the same image twice still stores it twice
   -- pass `dedup=True` for content-addressed, reference-counted storage.
@@ -560,7 +622,7 @@ Not yet built, tracked honestly rather than implied:
 - [x] Retry/backoff policy for transient database errors
 - [ ] `before_get(image_id, context) -> bool` authorization hook
 - [x] Pluggable content validators (`put(validator=...)`) -- includes a PDF reference implementation
-- [ ] Streaming reads/writes for large files
+- [x] Streaming reads/writes for large files (`get_stream()`/`stream_to()`; bounded-read writes)
 - [ ] Django integration package
 - [x] Configurable connection pool sizing (`pool_min_size`/`pool_max_size`/`pool_timeout`)
 - [x] `on_operation` observability hook (per-operation timing, retry count, success/failure)
