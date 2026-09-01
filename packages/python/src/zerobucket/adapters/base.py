@@ -23,6 +23,7 @@ type in their own implementation.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 
@@ -94,6 +95,36 @@ class StorageBackend(ABC):
         self, image_id: str, *, connection: object | None = None
     ) -> StoredRecordMetadata | None:
         """Fetch metadata only (no bytes), or None if it doesn't exist."""
+
+    @abstractmethod
+    def get_stream(
+        self,
+        image_id: str,
+        *,
+        chunk_size: int,
+        connection: object | None = None,
+    ) -> Iterator[bytes] | None:
+        """Fetch a record's bytes as an iterator of chunks, or None if the
+        id doesn't exist.
+
+        Unlike get(), this never materializes the full value in Python
+        memory at once -- only one chunk is held at a time, which is the
+        point (piping a large stored value straight to a socket/file
+        without ever holding the whole thing). It does NOT reduce memory
+        pressure inside Postgres itself -- the server still handles the
+        full stored value per chunk request the same way it always does
+        for a BYTEA column (see docs/OPERATIONS.md). This is a Python-side
+        memory optimization, not a storage-engine one.
+
+        Without a `connection=` spanning the whole read, each chunk is
+        fetched in its own round trip and there is no snapshot isolation
+        across chunks -- a concurrent delete() between chunks will raise
+        rather than silently return a truncated stream (implementations
+        must not swallow a "row no longer exists" mid-stream into an
+        early, silent stop). Pass your own open `connection=` if you need
+        a consistent read across the whole stream despite concurrent
+        writers.
+        """
 
     @abstractmethod
     def delete(self, image_id: str, *, connection: object | None = None) -> bool:

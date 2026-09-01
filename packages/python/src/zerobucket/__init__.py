@@ -6,7 +6,11 @@ image_id = images.put("avatar.jpg")
 image = images.get(image_id)
 """
 
-from .adapters.postgres import OperationEvent, migrate_classic_to_dedup
+from .adapters.postgres import (
+    DEFAULT_STREAM_CHUNK_SIZE,
+    OperationEvent,
+    migrate_classic_to_dedup,
+)
 from .client import ZeroBucket
 from .content_types import ContentValidator, ValidatedContent
 from .exceptions import (
@@ -28,7 +32,7 @@ from .types import (
     ImageMetadata,
 )
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 __all__ = [
     "ZeroBucket",
@@ -41,6 +45,7 @@ __all__ = [
     "ContentValidator",
     "ValidatedContent",
     "OperationEvent",
+    "DEFAULT_STREAM_CHUNK_SIZE",
     "migrate_classic_to_dedup",
     "ZeroBucketError",
     "ContentValidationError",

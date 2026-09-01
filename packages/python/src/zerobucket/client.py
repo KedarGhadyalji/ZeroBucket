@@ -13,14 +13,18 @@ from __future__ import annotations
 
 import hashlib
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import BinaryIO, Union
 
 from .adapters.base import StorageBackend
-from .adapters.postgres import OperationEvent, PostgresBackend
+from .adapters.postgres import (
+    DEFAULT_STREAM_CHUNK_SIZE,
+    OperationEvent,
+    PostgresBackend,
+)
 from .content_types import ContentValidator
-from .exceptions import ImageNotFoundError, ImageValidationError
+from .exceptions import ImageNotFoundError, ImageTooLargeError, ImageValidationError
 from .optimization import optimize_image
 from .types import (
     BatchDeleteResult,
@@ -38,6 +42,13 @@ ImageInput = Union[str, "os.PathLike[str]", bytes, BinaryIO]
 # 8 MiB. Chosen as a practical ceiling for "small app" images (see README
 # for rationale); pass max_bytes= to override per-instance.
 DEFAULT_MAX_BYTES = 8 * 1024 * 1024
+
+# 64 KiB. Chunk size used when reading a file-like put() input, so an
+# oversized upload is rejected after reading a bounded amount past the
+# cap rather than being fully buffered into memory first. See
+# _read_image_input's docstring for why this doesn't extend to true
+# unbounded-size streaming ingestion.
+_WRITE_READ_CHUNK_SIZE = 64 * 1024
 
 
 class ZeroBucket:
@@ -148,7 +159,9 @@ class ZeroBucket:
         inherently per-item (Pillow decode/validate/re-encode can't be
         batched), which is why put_many() still does this work in a
         Python loop even though the actual DB insert is batched."""
-        data, resolved_filename = _read_image_input(image, filename)
+        data, resolved_filename = _read_image_input(
+            image, filename, max_bytes=self._max_bytes
+        )
 
         if validator is not None:
             if optimize:
@@ -415,6 +428,79 @@ class ZeroBucket:
                 )
         return results
 
+    def get_stream(
+        self,
+        image_id: str,
+        *,
+        chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
+        connection: object | None = None,
+    ) -> Iterator[bytes]:
+        """Retrieve an image's bytes as an iterator of chunks, instead of
+        one complete `bytes` object. Raises ImageNotFoundError if missing
+        (checked eagerly, before any chunk is yielded -- you don't have
+        to start iterating to find out the id doesn't exist).
+
+        Use this instead of get() when you want to pipe a stored image
+        straight to a socket/file/HTTP response without ever holding the
+        whole thing in Python memory at once -- e.g. FastAPI's
+        StreamingResponse, or writing directly to an open file:
+
+            for chunk in images.get_stream(image_id):
+                response.write(chunk)
+
+        Or use stream_to() below, which does exactly that loop for you.
+
+        chunk_size: bytes per chunk. Defaults to 1 MiB. Larger values
+            mean fewer round trips but higher peak memory; smaller values
+            are the opposite.
+        connection: Advanced -- see put()'s docstring. Without this, each
+            chunk is fetched in its own round trip with no snapshot
+            isolation across chunks -- a concurrent delete() between
+            chunks raises StorageError rather than silently truncating
+            the stream. Pass your own open transaction here if you need
+            a consistent read across the whole stream.
+
+        Honest limitation: this reduces PYTHON-side memory pressure per
+        read, not Postgres-side -- the server still handles the full
+        stored value the way it always does for a BYTEA column (TOAST
+        detoast, etc). It also doesn't reduce network bytes transferred
+        (still the full image, just paced out in pieces) -- it's not an
+        HTTP range/partial-content feature. See the README's streaming
+        section for what this does and doesn't buy you.
+        """
+        stream = self._backend.get_stream(
+            image_id, chunk_size=chunk_size, connection=connection
+        )
+        if stream is None:
+            raise ImageNotFoundError(image_id)
+        return stream
+
+    def stream_to(
+        self,
+        image_id: str,
+        destination: BinaryIO,
+        *,
+        chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
+        connection: object | None = None,
+    ) -> int:
+        """Write an image's bytes directly to `destination` (anything
+        with a .write(bytes) method -- an open file, an HTTP response
+        object, etc.), chunk by chunk, without holding the full image in
+        Python memory at once. Returns the total number of bytes written.
+
+        Equivalent to (and implemented as) looping over get_stream() and
+        calling destination.write() yourself -- provided because it's the
+        common case and there's no reason to make every caller write the
+        loop. Raises ImageNotFoundError if missing, same as get_stream().
+        """
+        total = 0
+        for chunk in self.get_stream(
+            image_id, chunk_size=chunk_size, connection=connection
+        ):
+            destination.write(chunk)
+            total += len(chunk)
+        return total
+
     def metadata(
         self, image_id: str, *, connection: object | None = None
     ) -> ImageMetadata:
@@ -481,9 +567,38 @@ class ZeroBucket:
 
 
 def _read_image_input(
-    image: ImageInput, filename: str | None
+    image: ImageInput, filename: str | None, *, max_bytes: int
 ) -> tuple[bytes, str | None]:
-    """Normalize any accepted input type into (bytes, filename)."""
+    """Normalize any accepted input type into (bytes, filename).
+
+    For a file-like input specifically, this reads in bounded
+    _WRITE_READ_CHUNK_SIZE chunks and stops as soon as it has read one
+    byte past max_bytes, rather than calling .read() with no limit and
+    buffering the entire stream before validate_image()'s own max_bytes
+    check gets a chance to reject it. This bounds peak memory for an
+    oversized upload to roughly max_bytes (not the stream's full,
+    possibly much larger, size) -- the same "fail fast, don't pay for
+    work you're about to reject" principle behind checking Content-
+    Length before accepting a request body, applied here since put()
+    can't always rely on the caller having done that upstream.
+
+    This is NOT unbounded-size streaming ingestion: for input that IS
+    within max_bytes, the full bytes still end up in memory here,
+    because checksum computation and image validation (Pillow decode)
+    both need the complete content -- there is no way to validate "is
+    this a real, undamaged JPEG" from a prefix of the bytes. See
+    get_stream()/stream_to() for the read-side streaming story, which
+    has no equivalent requirement and is the more complete feature.
+
+    Raises ImageTooLargeError itself, before validate_image() gets a
+    chance to, when the input is a file-like object -- in that case the
+    reported size_bytes is a LOWER BOUND (max_bytes + 1, or wherever
+    reading stopped), not the stream's true total size, since finding
+    the true size would mean reading all of it, which is exactly the
+    cost this is avoiding. For bytes/path inputs (already fully in
+    memory or a single read_bytes() call), the exact size is known and
+    reported as before -- this only changes file-like input.
+    """
     if isinstance(image, bytes):
         return image, filename
     if isinstance(image, (str, os.PathLike)):
@@ -491,9 +606,20 @@ def _read_image_input(
         data = path.read_bytes()
         return data, filename or path.name
     if hasattr(image, "read"):
-        data = image.read()
-        if isinstance(data, str):
-            raise TypeError("File-like object must be opened in binary mode")
+        limit = max_bytes + 1
+        chunks: list[bytes] = []
+        total = 0
+        while total <= max_bytes:
+            piece = image.read(min(_WRITE_READ_CHUNK_SIZE, limit - total))
+            if not piece:
+                break
+            if isinstance(piece, str):
+                raise TypeError("File-like object must be opened in binary mode")
+            chunks.append(piece)
+            total += len(piece)
+        data = b"".join(chunks)
+        if len(data) > max_bytes:
+            raise ImageTooLargeError(len(data), max_bytes)
         raw_name = getattr(image, "filename", None) or getattr(image, "name", None)
         resolved_filename = filename or (
             os.path.basename(raw_name) if raw_name else None

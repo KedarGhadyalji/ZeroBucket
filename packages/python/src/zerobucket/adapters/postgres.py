@@ -39,7 +39,7 @@ from __future__ import annotations
 import random
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import psycopg
@@ -47,6 +47,11 @@ from psycopg_pool import ConnectionPool
 
 from ..exceptions import StorageError
 from .base import StorageBackend, StoredRecord, StoredRecordMetadata
+
+# 1 MiB. Default chunk size for get_stream() -- small enough to keep
+# Python-side peak memory low, large enough to keep the per-chunk
+# round-trip count reasonable for typical (few-MB) stored images.
+DEFAULT_STREAM_CHUNK_SIZE = 1024 * 1024
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS zerobucket_images (
@@ -80,6 +85,15 @@ WHERE id = %s;
 
 _SELECT_METADATA = """
 SELECT id, mime_type, original_filename, size_bytes, width, height, checksum_sha256
+FROM zerobucket_images
+WHERE id = %s;
+"""
+
+# substring() is 1-indexed and clamps `length` at the value's actual end,
+# so the last chunk of a stream naturally comes back shorter without any
+# special-casing here.
+_SELECT_CHUNK = """
+SELECT substring(data FROM %s FOR %s)
 FROM zerobucket_images
 WHERE id = %s;
 """
@@ -141,6 +155,13 @@ WHERE r.id = %s;
 
 _DEDUP_SELECT_METADATA = """
 SELECT r.id, b.mime_type, r.original_filename, b.size_bytes, b.width, b.height, r.checksum_sha256
+FROM zerobucket_image_refs r
+JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256
+WHERE r.id = %s;
+"""
+
+_DEDUP_SELECT_CHUNK = """
+SELECT substring(b.data FROM %s FOR %s)
 FROM zerobucket_image_refs r
 JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256
 WHERE r.id = %s;
@@ -219,9 +240,14 @@ class OperationEvent:
     completes (success or failure) -- the "measure" half of "you can't
     optimize what you can't measure."
 
-    operation: one of "put", "put_many", "get", "get_many",
-        "get_metadata", "delete", "delete_many", "exists", "migrate".
-        Dedup-mode operations report the SAME operation name as their
+    operation: one of "put", "put_many", "get", "get_stream",
+        "get_many", "get_metadata", "delete", "delete_many", "exists",
+        "migrate". A single get_stream() call reports one event per
+        chunk fetched (plus one for the initial metadata lookup used to
+        learn the total size), not one event for the whole stream --
+        each is a genuinely separate round trip, so this is consistent
+        with every other operation being measured per round trip, not
+        per logical call. Dedup-mode operations report the SAME operation name as their
         classic-mode counterpart (e.g. a dedup put() reports "put", not
         some dedup-specific name) -- from a metrics/tuning perspective,
         it's still logically the same operation regardless of storage
@@ -668,6 +694,70 @@ class PostgresBackend(StorageBackend):
             height=row[5],
             checksum_sha256=row[6],
         )
+
+    # ---- get_stream -----------------------------------------------------
+
+    def get_stream(
+        self,
+        image_id: str,
+        *,
+        chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
+        connection: psycopg.Connection | None = None,
+    ) -> Iterator[bytes] | None:
+        """See StorageBackend.get_stream for the contract.
+
+        Implementation: one metadata lookup to learn size_bytes (reused
+        as the not-found check -- same semantics as get()/metadata()),
+        then repeated `substring(data FROM offset FOR length)` queries
+        walking forward through the value. Each chunk is its own `_run`
+        call (its own OperationEvent, its own retry behavior if
+        connection=None), exactly like every other operation here.
+
+        If the row disappears between chunks (concurrent delete, no
+        connection= holding a snapshot), the next chunk query returns no
+        row and this raises StorageError rather than silently yielding a
+        short read -- a truncated image passed off as complete would be
+        a much worse failure mode than a loud one.
+        """
+        metadata = self.get_metadata(image_id, connection=connection)
+        if metadata is None:
+            return None
+
+        select_chunk_sql = _DEDUP_SELECT_CHUNK if self._dedup else _SELECT_CHUNK
+        total_size = metadata.size_bytes
+
+        def generator() -> Iterator[bytes]:
+            offset = 1  # substring() is 1-indexed
+            remaining = total_size
+            delivered = 0
+            while remaining > 0:
+                length = min(chunk_size, remaining)
+
+                def work(cur, offset=offset, length=length):
+                    cur.execute(select_chunk_sql, (offset, length, image_id))
+                    return cur.fetchone()
+
+                try:
+                    row = self._run(connection, work, operation="get_stream")
+                except Exception as exc:  # noqa: BLE001
+                    raise StorageError(f"Failed to stream image: {exc}") from exc
+
+                if row is None:
+                    raise StorageError(
+                        f"Image {image_id!r} was deleted while streaming "
+                        f"(delivered {delivered} of {total_size} bytes). "
+                        "Pass connection= with your own open transaction "
+                        "if you need a consistent read across concurrent "
+                        "writers."
+                    )
+
+                chunk = bytes(row[0])
+                yield chunk
+                offset += len(chunk)
+                remaining -= len(chunk)
+                delivered += len(chunk)
+
+        return generator()
 
     # ---- delete -------------------------------------------------------------
 
