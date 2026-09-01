@@ -24,7 +24,12 @@ from .adapters.postgres import (
     PostgresBackend,
 )
 from .content_types import ContentValidator
-from .exceptions import ImageNotFoundError, ImageTooLargeError, ImageValidationError
+from .exceptions import (
+    AccessDeniedError,
+    ImageNotFoundError,
+    ImageTooLargeError,
+    ImageValidationError,
+)
 from .optimization import optimize_image
 from .types import (
     BatchDeleteResult,
@@ -102,7 +107,41 @@ class ZeroBucket:
             does not ship a specific integration. Exceptions raised
             inside your callback are caught and silently ignored, so a
             bug in your metrics code can never break a real image
-            operation.
+            operation. NOTE the difference from before_get/before_put
+            below: on_operation is fire-and-forget observability, so
+            swallowing its exceptions is safe; before_get/before_put are
+            security decisions, so their exceptions are deliberately
+            NOT swallowed.
+        before_get: Optional authorization hook, called as
+            before_get(image_id, context) -> bool before get(),
+            get_many() (once per id), get_stream(), stream_to(), and
+            metadata() -- anything that returns bytes or per-image
+            metadata for a specific id. Return False to deny; the call
+            then raises AccessDeniedError (or, for get_many(), that id's
+            result gets error="access denied" instead of aborting the
+            whole batch, same as any other per-item batch failure).
+            `context` is whatever you pass as context= to the call being
+            checked (e.g. the requesting user/tenant) -- ZeroBucket never
+            inspects it itself, it's purely yours to define and use.
+            NOT called for exists() -- a bare existence check was
+            considered out of scope for this hook; gate it yourself at
+            the call site if that matters for your use case. If the hook
+            raises instead of returning a bool, that exception propagates
+            (or is captured per-item for get_many()) rather than being
+            treated as an implicit allow -- see AccessDeniedError's
+            docstring for why. Denied/erroring calls never reach the
+            database, so they do NOT produce an on_operation event.
+        before_put: Optional authorization hook, called as
+            before_put(context) -> bool before put() and put_many().
+            There's no image_id yet at this point (nothing has been
+            validated or assigned an id), so the signature is
+            deliberately narrower than before_get's -- context is the
+            only input. For put_many(), the hook is evaluated ONCE for
+            the whole batch (not once per item) since context represents
+            the caller's identity for the call, not per-item data; a
+            denial marks every item in that batch as
+            error="access denied" rather than aborting only some.
+            Same fail-closed exception behavior as before_get.
         backend: Advanced -- inject a custom StorageBackend instead of
             constructing a PostgresBackend from database_url.
     """
@@ -121,6 +160,8 @@ class ZeroBucket:
         pool_max_size: int = 5,
         pool_timeout: float = 10,
         on_operation: Callable[[OperationEvent], None] | None = None,
+        before_get: Callable[[str, dict | None], bool] | None = None,
+        before_put: Callable[[dict | None], bool] | None = None,
         backend: StorageBackend | None = None,
     ) -> None:
         if backend is not None:
@@ -142,6 +183,26 @@ class ZeroBucket:
         self._max_bytes = max_bytes
         self._max_pixels = max_pixels
         self._allowed_formats = allowed_formats
+        self._before_get = before_get
+        self._before_put = before_put
+
+    def _check_before_get(self, image_id: str, context: dict | None) -> None:
+        """Raise AccessDeniedError if a before_get hook is configured and
+        denies this image_id. No-op if no hook is configured. Does NOT
+        catch exceptions raised by the hook itself -- see
+        AccessDeniedError's docstring for why."""
+        if self._before_get is None:
+            return
+        if not self._before_get(image_id, context):
+            raise AccessDeniedError("get", image_id)
+
+    def _check_before_put(self, context: dict | None) -> None:
+        """Raise AccessDeniedError if a before_put hook is configured and
+        denies this call. No-op if no hook is configured."""
+        if self._before_put is None:
+            return
+        if not self._before_put(context):
+            raise AccessDeniedError("put")
 
     def _prepare_row(
         self,
@@ -230,6 +291,7 @@ class ZeroBucket:
         quality: int | None = None,
         connection: object | None = None,
         validator: ContentValidator | None = None,
+        context: dict | None = None,
     ) -> str:
         """Validate, optionally optimize, and store an image. Returns its id.
 
@@ -282,7 +344,13 @@ class ZeroBucket:
                 produced the row. Incompatible with optimize=True (raises
                 immediately if both are given) -- see ContentValidator's
                 docstring for why.
+            context: Passed through to the before_put hook, if one is
+                configured (see the constructor's docstring). Ignored
+                entirely if no before_put hook is set. Raises
+                AccessDeniedError before any validation/storage work
+                happens if the hook denies the call.
         """
+        self._check_before_put(context)
         row = self._prepare_row(
             image,
             filename=filename,
@@ -305,6 +373,7 @@ class ZeroBucket:
         quality: int | None = None,
         connection: object | None = None,
         validator: ContentValidator | None = None,
+        context: dict | None = None,
     ) -> list[BatchPutResult]:
         """Store multiple images. Best-effort, not all-or-nothing: one
         bad image doesn't abort the rest of the batch -- check each
@@ -324,9 +393,31 @@ class ZeroBucket:
         filenames, if given, must be the same length as images (use None
         for individual entries to fall back to the input's own filename,
         same as put()).
+
+        context: Passed through to the before_put hook, if one is
+            configured, EVALUATED ONCE for the whole call (not once per
+            item) -- context represents who's making this batch call,
+            not per-item data, so one evaluation covers the whole batch.
+            A denial marks every item's result as error="access denied"
+            without touching any of them, rather than partially
+            processing the batch.
         """
         if filenames is not None and len(filenames) != len(images):
             raise ValueError("filenames must be the same length as images if provided")
+
+        if self._before_put is not None:
+            try:
+                allowed = self._before_put(context)
+            except Exception as exc:  # noqa: BLE001
+                return [
+                    BatchPutResult(index=i, image_id=None, error=str(exc))
+                    for i in range(len(images))
+                ]
+            if not allowed:
+                return [
+                    BatchPutResult(index=i, image_id=None, error="access denied")
+                    for i in range(len(images))
+                ]
 
         prepared_rows: list[dict] = []
         prepared_indices: list[int] = []
@@ -367,13 +458,24 @@ class ZeroBucket:
 
         return results  # type: ignore[return-value]
 
-    def get(self, image_id: str, *, connection: object | None = None) -> Image:
+    def get(
+        self,
+        image_id: str,
+        *,
+        connection: object | None = None,
+        context: dict | None = None,
+    ) -> Image:
         """Retrieve a full image, including bytes. Raises ImageNotFoundError if missing.
 
         connection: Advanced -- see put()'s docstring. Passing the same
             open transaction lets you read back a row you just wrote in
             that same transaction, before it's committed.
+        context: Passed through to the before_get hook, if one is
+            configured (see the constructor's docstring). Raises
+            AccessDeniedError before any database round trip if the hook
+            denies the call.
         """
+        self._check_before_get(image_id, context)
         record = self._backend.get(image_id, connection=connection)
         if record is None:
             raise ImageNotFoundError(image_id)
@@ -388,7 +490,11 @@ class ZeroBucket:
         )
 
     def get_many(
-        self, image_ids: list[str], *, connection: object | None = None
+        self,
+        image_ids: list[str],
+        *,
+        connection: object | None = None,
+        context: dict | None = None,
     ) -> list[BatchGetResult]:
         """Retrieve multiple images in a single query.
 
@@ -397,22 +503,55 @@ class ZeroBucket:
         batch of ids where some may not exist; check `.success` per
         result. Results are returned in the same order as `image_ids`,
         including entries for ids that weren't found.
+
+        context: Passed through to the before_get hook, if one is
+            configured, evaluated ONCE PER ID (unlike put_many's
+            before_put, which is evaluated once for the whole call) --
+            authorization for a read is naturally per-item, since
+            different ids in the same batch may belong to different
+            owners. Ids the hook denies (or errors on) are excluded from
+            the underlying database query entirely -- ZeroBucket doesn't
+            fetch bytes for something it's about to refuse to return --
+            and come back with error="access denied" (or the hook's own
+            error message), same as any other per-item batch failure.
         """
         if not image_ids:
             return []
-        records = self._backend.get_many(image_ids, connection=connection)
-        records_by_id = {record.id: record for record in records}
 
-        results = []
-        for image_id in image_ids:
-            record = records_by_id.get(image_id)
-            if record is None:
-                results.append(
-                    BatchGetResult(image_id=image_id, image=None, error="not found")
-                )
-            else:
-                results.append(
-                    BatchGetResult(
+        results: list[BatchGetResult | None] = [None] * len(image_ids)
+        allowed_indices: list[int] = []
+
+        if self._before_get is not None:
+            for i, image_id in enumerate(image_ids):
+                try:
+                    allowed = self._before_get(image_id, context)
+                except Exception as exc:  # noqa: BLE001
+                    results[i] = BatchGetResult(
+                        image_id=image_id, image=None, error=str(exc)
+                    )
+                    continue
+                if not allowed:
+                    results[i] = BatchGetResult(
+                        image_id=image_id, image=None, error="access denied"
+                    )
+                    continue
+                allowed_indices.append(i)
+        else:
+            allowed_indices = list(range(len(image_ids)))
+
+        allowed_ids = [image_ids[i] for i in allowed_indices]
+        if allowed_ids:
+            records = self._backend.get_many(allowed_ids, connection=connection)
+            records_by_id = {record.id: record for record in records}
+            for i in allowed_indices:
+                image_id = image_ids[i]
+                record = records_by_id.get(image_id)
+                if record is None:
+                    results[i] = BatchGetResult(
+                        image_id=image_id, image=None, error="not found"
+                    )
+                else:
+                    results[i] = BatchGetResult(
                         image_id=image_id,
                         image=Image(
                             data=record.data,
@@ -425,8 +564,7 @@ class ZeroBucket:
                         ),
                         error=None,
                     )
-                )
-        return results
+        return results  # type: ignore[return-value]
 
     def get_stream(
         self,
@@ -434,6 +572,7 @@ class ZeroBucket:
         *,
         chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
         connection: object | None = None,
+        context: dict | None = None,
     ) -> Iterator[bytes]:
         """Retrieve an image's bytes as an iterator of chunks, instead of
         one complete `bytes` object. Raises ImageNotFoundError if missing
@@ -467,7 +606,13 @@ class ZeroBucket:
         (still the full image, just paced out in pieces) -- it's not an
         HTTP range/partial-content feature. See the README's streaming
         section for what this does and doesn't buy you.
+
+        context: Passed through to the before_get hook, if one is
+            configured, checked ONCE up front (not once per chunk) --
+            raises AccessDeniedError immediately, before even the
+            metadata lookup used to check existence/size, if denied.
         """
+        self._check_before_get(image_id, context)
         stream = self._backend.get_stream(
             image_id, chunk_size=chunk_size, connection=connection
         )
@@ -482,6 +627,7 @@ class ZeroBucket:
         *,
         chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
         connection: object | None = None,
+        context: dict | None = None,
     ) -> int:
         """Write an image's bytes directly to `destination` (anything
         with a .write(bytes) method -- an open file, an HTTP response
@@ -492,22 +638,33 @@ class ZeroBucket:
         calling destination.write() yourself -- provided because it's the
         common case and there's no reason to make every caller write the
         loop. Raises ImageNotFoundError if missing, same as get_stream().
+
+        context: Passed straight through to get_stream() -- see its
+            docstring.
         """
         total = 0
         for chunk in self.get_stream(
-            image_id, chunk_size=chunk_size, connection=connection
+            image_id, chunk_size=chunk_size, connection=connection, context=context
         ):
             destination.write(chunk)
             total += len(chunk)
         return total
 
     def metadata(
-        self, image_id: str, *, connection: object | None = None
+        self,
+        image_id: str,
+        *,
+        connection: object | None = None,
+        context: dict | None = None,
     ) -> ImageMetadata:
         """Retrieve image metadata without pulling the (potentially large) bytes.
 
         connection: Advanced -- see put()'s docstring.
+        context: Passed through to the before_get hook, if one is
+            configured -- metadata() is gated by the same hook as get(),
+            since it's still per-image information tied to a specific id.
         """
+        self._check_before_get(image_id, context)
         record = self._backend.get_metadata(image_id, connection=connection)
         if record is None:
             raise ImageNotFoundError(image_id)
@@ -525,6 +682,13 @@ class ZeroBucket:
         """Return whether an image with this id exists.
 
         connection: Advanced -- see put()'s docstring.
+
+        NOT gated by a before_get hook, even if one is configured --
+        deliberately out of scope for this hook (see the constructor's
+        before_get docs). A bare existence check returns no image data
+        or metadata, so it was judged low-sensitivity enough not to
+        require authorization by default; gate it yourself at the call
+        site if your use case needs that.
         """
         return self._backend.exists(image_id, connection=connection)
 

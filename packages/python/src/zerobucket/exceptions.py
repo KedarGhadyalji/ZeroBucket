@@ -69,3 +69,27 @@ class ImageNotFoundError(ZeroBucketError):
 
 class StorageError(ZeroBucketError):
     """Raised for underlying storage/database failures not covered above."""
+
+
+class AccessDeniedError(ZeroBucketError):
+    """Raised when a before_get or before_put hook denies an operation
+    by returning False.
+
+    If the hook itself raises an exception instead of returning False,
+    that original exception propagates directly -- it is NOT wrapped in
+    AccessDeniedError, and it is NOT caught and treated as an implicit
+    allow. A hook that errors must fail closed, not open: silently
+    catching a broken authorization check and proceeding as if it had
+    said "yes" would turn a bug in the hook into a security hole. See
+    the ZeroBucket constructor's before_get/before_put docs.
+    """
+
+    def __init__(self, operation: str, image_id: str | None = None) -> None:
+        self.operation = operation
+        self.image_id = image_id
+        if image_id is not None:
+            super().__init__(
+                f"{operation} denied for image {image_id!r} by the before_get hook"
+            )
+        else:
+            super().__init__(f"{operation} denied by the before_put hook")

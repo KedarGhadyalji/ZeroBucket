@@ -14,6 +14,7 @@ from .adapters.postgres import (
 from .client import ZeroBucket
 from .content_types import ContentValidator, ValidatedContent
 from .exceptions import (
+    AccessDeniedError,
     ContentValidationError,
     CorruptedImageError,
     ImageNotFoundError,
@@ -32,7 +33,7 @@ from .types import (
     ImageMetadata,
 )
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 __all__ = [
     "ZeroBucket",
@@ -55,4 +56,5 @@ __all__ = [
     "CorruptedImageError",
     "ImageNotFoundError",
     "StorageError",
+    "AccessDeniedError",
 ]
