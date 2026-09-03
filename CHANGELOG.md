@@ -2,6 +2,148 @@
 
 All notable changes to this project are documented here.
 
+## [0.13.0] - 2026-09-02
+
+### Added
+
+- `AsyncZeroBucket`, an async client for the first item on Stage 5's
+  remaining roadmap ("async client support"). Built on **psycopg3's own
+  native async mode** (`AsyncConnection`/`AsyncConnectionPool`) -- NOT
+  the third-party `asyncpg` package the roadmap had named. Verified
+  directly from a fresh venv install: `pip freeze` shows no `asyncpg`
+  dependency. See "Technical correction" below for why.
+- `AsyncPostgresBackend` (`adapters/postgres_async.py`) and
+  `AsyncStorageBackend` (`adapters/base_async.py`), the async
+  counterparts to `PostgresBackend`/`StorageBackend`. Reuse the exact
+  same SQL query strings and schema DDL as the sync adapter (imported,
+  not copy-pasted) -- one schema, two ways of executing the same
+  queries.
+- `AsyncZeroBucket` methods: `put`, `put_many`, `get`, `get_many`,
+  `get_stream`, `stream_to`, `metadata`, `exists`, `delete`,
+  `delete_many`, `close`, plus `async with` support (`__aenter__`/
+  `__aexit__`).
+
+### Technical correction, stated directly rather than silently substituted
+
+- The roadmap said `asyncpg`. This library is built on psycopg3, which
+  already ships a real async driver mode using the exact same SQL,
+  schema, and connection string as the sync adapter. Adding the literal
+  `asyncpg` package on top would have meant maintaining two SQL layers
+  against two different drivers for the same feature, for zero benefit
+  to an async FastAPI/Django-async caller -- they get the same
+  `await zb.get(id)` either way. This was caught and corrected before
+  writing any code, not discovered partway through.
+
+### Scope: first pass, not full parity -- stated plainly, not implied
+
+`AsyncZeroBucket` covers core operations + streaming reads, classic mode
+only. Deliberately NOT included in this pass (all present on the sync
+`ZeroBucket`, none architecturally blocked from reaching async later):
+
+- `dedup=True` (content-addressed storage).
+- `before_get`/`before_put` access-control hooks.
+- `on_operation` observability hook.
+- `optimize=True` (resize/re-encode pipeline) and custom `validator=`.
+- `connection=` transaction participation.
+- Automatic retry/backoff on transient errors.
+
+This was a scope decision confirmed with the requester up front (options
+ranged from "core only" to "full parity with the sync client"), not a
+default that emerged from running out of time partway through.
+
+### Two implementation decisions worth being explicit about
+
+- **Image validation and file reading run via `asyncio.to_thread()`.**
+  Pillow has no async API; offloading this work to a thread keeps the
+  event loop responsive while it runs, at the cost of consuming a
+  thread from Python's default executor. A direct, verified benefit:
+  `put_many()`'s per-item validation now runs CONCURRENTLY via
+  `asyncio.gather`, not serially in a Python loop like the sync
+  client's does -- confirmed with a timing test (5 items with an
+  artificial 0.2s validation delay each complete well under the ~1.0s a
+  serial implementation would take), not just asserted as a property.
+- **`get_stream()` is a coroutine that RETURNS an async iterator, not an
+  async generator function itself.** `stream = await
+images.get_stream(id)` raises `ImageNotFoundError` immediately on
+  await, matching the sync client's eager-raise behavior; if this were
+  an async generator instead, Python would defer running any of its
+  code -- including the not-found check -- until the first `async for`
+  iteration, which would silently change when the error surfaces
+  compared to every other method in this library. Verified directly: a
+  test asserts `get_stream(id)`'s return value from calling it is a
+  bare coroutine object before being awaited.
+
+### Bug caught during development, not assumed away
+
+- **Windows: the async test suite failed outright on first real-world
+  testing** (24 failures/errors, all one root cause) -- psycopg3's
+  async mode cannot run under Windows' default `ProactorEventLoop`,
+  only a `SelectorEventLoop`. Confirmed directly against psycopg's own
+  installed source (`connection_async.py`): psycopg itself DOES raise a
+  clear, specific `InterfaceError` for this -- but `psycopg_pool.
+AsyncConnectionPool`'s background connect worker catches that error,
+  logs a WARNING per retry attempt, and keeps retrying silently until
+  the whole pool times out ~10+ seconds later with a generic
+  `PoolTimeout` that buries the real, actionable cause underneath.
+  Fixed two ways: (1) `AsyncPostgresBackend._ensure_ready()` now checks
+  for this exact condition itself, before calling `pool.open()`, and
+  raises a clear, immediate `StorageError` with version-appropriate fix
+  guidance instead of waiting through the masked timeout; (2)
+  `tests/conftest.py` now sets `WindowsSelectorEventLoopPolicy` at
+  import time on `win32`, so the test suite itself actually runs on
+  Windows dev machines rather than every async test failing at fixture
+  setup. Documented in both READMEs' Async support sections, including
+  the exact `asyncio.run()` incantation for Python 3.12+ vs earlier.
+  Caught by the person testing this on a real Windows machine before
+  deploying -- not found in this sandbox, which is Linux-only and could
+  not have surfaced it.
+- `psycopg.AsyncCursor.nextset()` and `.rowcount` are NOT awaitable,
+  even on the async cursor class -- verified by actually running
+  `put_many()` against real Postgres and hitting
+  `TypeError: object bool can't be used in 'await' expression`, not
+  discovered by reading documentation alone. Fixed before this was
+  committed; covered by `put_many`'s existing round-trip tests, which
+  would fail immediately if this regressed.
+
+### Lazy initialization, and why
+
+- `AsyncPostgresBackend.__init__` cannot be a coroutine (Python has no
+  `async __init__`), so the connection pool is constructed unopened and
+  opened -- along with running the schema migration, if
+  `auto_migrate=True` -- on the FIRST actual async call, guarded by an
+  `asyncio.Lock` so concurrent first-callers can't race to open/migrate
+  twice. Verified with a dedicated test: 20 concurrent `exists()` calls
+  as the very first thing done with a fresh instance all succeed and
+  return consistent results.
+
+### Files delivered
+
+- New: `adapters/base_async.py`, `adapters/postgres_async.py`,
+  `async_client.py`, `tests/test_async_client.py` (27 new tests)
+- Changed: `__init__.py` (export `AsyncZeroBucket`,
+  `AsyncPostgresBackend`), `pyproject.toml` (version, new
+  `pytest-asyncio` dev dependency, `asyncio_mode = "auto"`),
+  `tests/conftest.py` (new `async_images` fixture), both READMEs (new
+  "Async support" section), root `README.md`'s roadmap checkbox
+
+207/207 tests pass (29 new), lint clean, mypy shows only the same
+pre-existing categories of findings the sync codebase already carries
+(no new categories introduced). Built, `twine check`ed, and functionally
+verified end-to-end (put/get, streaming, batch ops, not-found,
+concurrent first-call init, context manager) from a genuinely fresh venv
+install of the built wheel, not just the source tree -- and confirmed
+`pip freeze` on that fresh install shows no `asyncpg` dependency.
+
+Stated honestly: all of the above verification, including the Windows
+fix's effect on the test suite, was run in this project's Linux sandbox
+-- there is no Windows machine available here. The Windows fix was
+derived from reading psycopg's actual installed source directly (not
+guessed), and the Linux/macOS suite passing confirms the `sys.platform
+== "win32"` guards don't affect non-Windows behavior at all, but the
+Windows-specific code paths themselves (both the conftest.py policy
+fix and the fast-fail error) still need confirmation on a real Windows
+run before this is considered fully verified there.
+
 ## [0.12.0] - 2026-09-02
 
 ### Added

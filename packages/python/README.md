@@ -156,6 +156,35 @@ logos) -- it can make them larger, not smaller. See
 [`COMPRESSION_RESULTS.md`](https://github.com/KedarGhadyalji/ZeroBucket/blob/main/benchmarks/COMPRESSION_RESULTS.md)
 on GitHub for the full methodology.
 
+### Async support
+
+```python
+from zerobucket import AsyncZeroBucket
+
+images = AsyncZeroBucket(database_url="postgresql://user:pass@localhost/mydb")
+image_id = await images.put("photo.jpg")
+image = await images.get(image_id)
+
+stream = await images.get_stream(image_id)  # note the await
+async for chunk in stream:
+    ...
+
+await images.close()  # or: async with AsyncZeroBucket(...) as images:
+```
+
+Built on psycopg3's own native async mode -- not the third-party
+`asyncpg` package, despite that name having sat on the roadmap for a
+while. Zero new dependencies. First-pass scope: core operations +
+streaming reads, classic mode only (no `dedup=`, hooks, `on_operation`,
+`optimize=`/`validator=`, `connection=`, or retry yet -- tracked
+honestly, not silently missing). See the
+[full explanation](https://github.com/KedarGhadyalji/ZeroBucket#async-support)
+on GitHub, including why `get_stream()` needs an `await` before you can
+iterate it, and a **Windows note**: psycopg3's async mode needs a
+`SelectorEventLoop`, not the default `ProactorEventLoop` --
+`AsyncZeroBucket` raises a clear error telling you how to fix this if
+you hit it, instead of a confusing timeout.
+
 ## What it validates
 
 - **Format**: JPEG, PNG, WebP built in, plus HEIC/HEIF (iPhone photos) via

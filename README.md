@@ -135,6 +135,100 @@ per image. `get_many()`/`delete_many()` are genuine single-query batch
 operations (`WHERE id = ANY(...)`). All three accept the same
 `connection=` parameter as their single-item counterparts.
 
+### Async support
+
+```python
+from zerobucket import AsyncZeroBucket
+
+images = AsyncZeroBucket(database_url="postgresql://user:pass@localhost/mydb")
+
+image_id = await images.put("photo.jpg")
+image = await images.get(image_id)
+
+stream = await images.get_stream(image_id)  # note the await -- see below
+async for chunk in stream:
+    ...
+
+await images.close()
+# or: async with AsyncZeroBucket(database_url=...) as images: ...
+```
+
+Built on **psycopg3's own native async mode** (`AsyncConnection`,
+`AsyncConnectionPool`) -- not the third-party `asyncpg` package, despite
+that being the name that sat on this roadmap for a while. This library
+is built on psycopg3, which already ships a real async driver using the
+exact same SQL, schema, and connection string as the sync client; adding
+`asyncpg` on top would mean maintaining two SQL layers against two
+different drivers for the same feature, for no benefit to an async
+FastAPI/Django-async caller. **Zero new dependencies** were needed --
+`psycopg[binary]` and `psycopg_pool` were already required.
+
+This first pass is scoped to core operations + streaming reads, not full
+parity with the sync client yet. Deliberately NOT in `AsyncZeroBucket`
+today, tracked honestly rather than implied:
+
+- `dedup=True` (content-addressed storage) -- classic mode only for now.
+- `before_get`/`before_put` access-control hooks.
+- `on_operation` observability hook.
+- `optimize=True` (resize/re-encode pipeline) and custom `validator=`.
+- `connection=` transaction participation.
+- Automatic retry/backoff on transient errors.
+
+Every one of these exists on the sync `ZeroBucket` today and isn't
+architecturally blocked from reaching the async client later -- they
+were left out of this pass specifically to ship the actually-blocking
+gap (a real non-blocking driver for FastAPI/async-Django users) without
+a much larger, slower single change.
+
+Two implementation details worth knowing:
+
+- **Image validation and file reading run via `asyncio.to_thread()`.**
+  Pillow has no async API, so decode/validate/checksum work is offloaded
+  to a thread rather than blocking the event loop -- only the actual
+  database round trips get a genuinely non-blocking driver underneath.
+  A nice side effect: `put_many()`'s per-item validation runs
+  _concurrently_ across a thread pool via `asyncio.gather`, not
+  serially in a Python loop the way the sync client's does.
+- **`get_stream()` must be `await`ed before you iterate it** -- it's a
+  coroutine that _returns_ an async iterator, not an async generator
+  itself:
+
+  ```python
+  stream = await images.get_stream(image_id)  # raises ImageNotFoundError here
+  async for chunk in stream:
+      ...
+  ```
+
+  This is deliberate, not an oversight: if `get_stream()` were itself an
+  async generator function, Python wouldn't run any of its code --
+  including the not-found check -- until the first `async for`
+  iteration, which would be a confusing surprise (calling the method
+  looks like it should fail immediately for a bad id, the way the sync
+  version does). Awaiting first makes the not-found check happen exactly
+  when you call it, same as everywhere else in this library.
+
+**Windows:** psycopg3's async mode cannot run under Windows' default
+`ProactorEventLoop` -- it needs a `SelectorEventLoop` instead. This is a
+documented psycopg3 limitation, not something specific to this library.
+`AsyncZeroBucket` detects the wrong loop up front and raises a clear,
+immediate `StorageError` telling you how to fix it, rather than letting
+the connection pool retry silently and time out ~10+ seconds later with
+a generic, unhelpful error. Fix it once, before calling `asyncio.run()`:
+
+```python
+import asyncio
+
+# Python 3.12+:
+asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop)
+
+# Python < 3.12:
+asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+asyncio.run(main())
+```
+
+Linux and macOS are unaffected -- their default event loop is already
+compatible.
+
 ### Serving from a web API
 
 ```python
@@ -674,7 +768,7 @@ Not yet built, tracked honestly rather than implied:
 - [ ] SQLite and MySQL adapters
 - [x] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`, `zerobucket verify`)
 - [ ] Optional object-storage backend for files that outgrow the database tier
-- [ ] `asyncpg` / async client support
+- [x] Async client support (`AsyncZeroBucket`, via psycopg3's native async mode -- see [Async support](#async-support) for why this isn't literally the `asyncpg` package despite the name here historically)
 - [x] Batch operations (`put_many`/`get_many`/`delete_many`)
 - [x] Retry/backoff policy for transient database errors
 - [x] `before_get(image_id, context) -> bool` / `before_put(context) -> bool` authorization hooks
