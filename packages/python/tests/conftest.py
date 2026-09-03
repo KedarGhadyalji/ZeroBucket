@@ -7,17 +7,35 @@ ZEROBUCKET_TEST_DATABASE_URL to point at a throwaway database, e.g.:
 
 Tests truncate the zerobucket_images table between runs rather than
 dropping the database, so they're safe to run repeatedly.
+
+WINDOWS: psycopg3's async mode cannot run under the default
+ProactorEventLoop, only a SelectorEventLoop -- a documented psycopg3
+limitation (verified directly against psycopg's own source, not
+assumed), not something specific to this project. Without the policy
+set below, every async test would fail with a confusing ~10-second
+PoolTimeout that buries the real cause (see
+adapters/postgres_async.py's _windows_proactor_loop_error() for the
+full story of how that masking happens). This has to be set at import
+time, before pytest-asyncio creates its event loop for the session --
+setting it inside a fixture would be too late.
 """
 
 from __future__ import annotations
 
 import io
 import os
+import sys
 
 import pytest
+import pytest_asyncio
 from PIL import Image as PILImage
 
-from zerobucket import ZeroBucket
+if sys.platform == "win32":
+    import asyncio
+
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+from zerobucket import AsyncZeroBucket, ZeroBucket
 from zerobucket.adapters.postgres import PostgresBackend
 
 TEST_DATABASE_URL = os.environ.get(
@@ -103,3 +121,24 @@ def dedup_images(_db_available):
         cur.execute("TRUNCATE TABLE zerobucket_image_refs, zerobucket_blobs;")
     yield zb
     zb.close()
+
+
+@pytest_asyncio.fixture
+async def async_images(_db_available):
+    """An AsyncZeroBucket instance backed by a clean test table for each
+    test. Truncation itself uses a plain SYNC psycopg connection (not
+    async) -- there's no async-specific behavior being tested by the
+    truncate step itself, and it's simpler to reuse the same sync
+    connect-and-truncate pattern the `images` fixture already uses than
+    to open a second async connection just for setup."""
+    import psycopg
+
+    zb = AsyncZeroBucket(database_url=TEST_DATABASE_URL)
+    # Trigger lazy pool-open + migration before the test body runs, so
+    # every test starts from a known-ready state rather than each test
+    # separately paying (and potentially racing on) first-call setup.
+    await zb.exists("00000000-0000-0000-0000-000000000000")
+    with psycopg.connect(TEST_DATABASE_URL) as conn, conn.cursor() as cur:
+        cur.execute("TRUNCATE TABLE zerobucket_images;")
+    yield zb
+    await zb.close()

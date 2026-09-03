@@ -11,6 +11,8 @@ from .adapters.postgres import (
     OperationEvent,
     migrate_classic_to_dedup,
 )
+from .adapters.postgres_async import AsyncPostgresBackend
+from .async_client import AsyncZeroBucket
 from .client import ZeroBucket
 from .content_types import ContentValidator, ValidatedContent
 from .exceptions import (
@@ -33,10 +35,12 @@ from .types import (
     ImageMetadata,
 )
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 __all__ = [
     "ZeroBucket",
+    "AsyncZeroBucket",
+    "AsyncPostgresBackend",
     "Image",
     "ImageMetadata",
     "OptimizationResult",
