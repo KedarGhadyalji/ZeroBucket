@@ -26,6 +26,7 @@ from .exceptions import (
     UnsupportedFormatError,
     ZeroBucketError,
 )
+from .object_storage import ObjectStorage
 from .optimization import OptimizationResult
 from .types import (
     BatchDeleteResult,
@@ -35,12 +36,13 @@ from .types import (
     ImageMetadata,
 )
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 __all__ = [
     "ZeroBucket",
     "AsyncZeroBucket",
     "AsyncPostgresBackend",
+    "ObjectStorage",
     "Image",
     "ImageMetadata",
     "OptimizationResult",

@@ -30,6 +30,7 @@ from .exceptions import (
     ImageTooLargeError,
     ImageValidationError,
 )
+from .object_storage import ObjectStorage
 from .optimization import optimize_image
 from .types import (
     BatchDeleteResult,
@@ -142,6 +143,16 @@ class ZeroBucket:
             denial marks every item in that batch as
             error="access denied" rather than aborting only some.
             Same fail-closed exception behavior as before_get.
+        object_storage: Optional ObjectStorage instance (see
+            object_storage.py) enabling tiering large/old images out of
+            Postgres -- see tier_to_object_storage()'s docstring for what
+            this actually does and doesn't change. None (default, and
+            true for the vast majority of ZeroBucket users) means
+            tiering is simply unavailable; everything behaves exactly as
+            it always has. Requires `pip install zerobucket[s3]` for the
+            boto3 dependency this pulls in -- not installed by default.
+            Incompatible with dedup=True in this first pass (raises
+            ValueError immediately if both are given).
         backend: Advanced -- inject a custom StorageBackend instead of
             constructing a PostgresBackend from database_url.
     """
@@ -162,6 +173,7 @@ class ZeroBucket:
         on_operation: Callable[[OperationEvent], None] | None = None,
         before_get: Callable[[str, dict | None], bool] | None = None,
         before_put: Callable[[dict | None], bool] | None = None,
+        object_storage: ObjectStorage | None = None,
         backend: StorageBackend | None = None,
     ) -> None:
         if backend is not None:
@@ -176,6 +188,7 @@ class ZeroBucket:
                 pool_max_size=pool_max_size,
                 pool_timeout=pool_timeout,
                 on_operation=on_operation,
+                object_storage=object_storage,
             )
         else:
             raise ValueError("Either database_url or backend must be provided")
@@ -718,6 +731,55 @@ class ZeroBucket:
             )
             for image_id in image_ids
         ]
+
+    def tier_to_object_storage(
+        self, image_id: str, *, connection: object | None = None
+    ) -> bool:
+        """Move an image's bytes out of Postgres and into object storage
+        (see the constructor's object_storage= parameter). Returns True
+        if it was actually tiered by this call, False if it was already
+        tiered (a safe no-op -- re-running a backfill script over the
+        same ids doesn't error on rows it already handled). Raises
+        ImageNotFoundError if the id doesn't exist, same convention as
+        get()/metadata().
+
+        Requires this ZeroBucket to have been constructed with
+        object_storage=... -- raises StorageError immediately, before
+        touching the database, if it wasn't.
+
+        This is the explicit-trigger design this project settled on for
+        tiering's first pass (as opposed to e.g. put() automatically
+        tiering anything over a size threshold): nothing moves out of
+        Postgres unless you call this, or a script that calls this,
+        deliberately. See the module-level object_storage.py and
+        PostgresBackend.tier_to_object_storage()'s docstrings for the
+        full transactional-safety story (the upload happens inside the
+        same DB transaction as the row update, so a failed upload leaves
+        the row completely untouched) and the row-lock-during-upload
+        tradeoff.
+
+        After this call, get()/get_many()/get_stream()/stream_to() on
+        this image_id keep working exactly the same from the caller's
+        side -- the whole point of transparent tiering. delete() also
+        keeps working, and additionally cleans up the object-storage
+        copy (best-effort, after the Postgres row is already gone -- see
+        PostgresBackend.delete()'s docstring for why that ordering was
+        chosen).
+        """
+        # tier_to_object_storage() is deliberately NOT part of the
+        # generic StorageBackend interface (base.py) -- it's specific to
+        # PostgresBackend, not something every current/future backend
+        # (a hypothetical SQLite/MySQL adapter, a custom injected
+        # backend=) is expected to support. A backend that doesn't have
+        # it raises a plain AttributeError here, which is an accurate,
+        # honest error for "this backend doesn't support tiering" --
+        # not silently ignored.
+        result = self._backend.tier_to_object_storage(  # type: ignore[attr-defined]
+            image_id, connection=connection
+        )
+        if result is None:
+            raise ImageNotFoundError(image_id)
+        return result
 
     def close(self) -> None:
         """Release underlying database connections."""

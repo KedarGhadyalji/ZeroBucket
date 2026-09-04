@@ -73,6 +73,54 @@ def images(_db_available):
 
 
 @pytest.fixture
+def s3_bucket():
+    """A moto-mocked S3 bucket, in-process. Uses moto's `mock_aws()`
+    context manager (patches botocore's HTTP layer directly), NOT a
+    standalone `moto_server` subprocess -- a standalone server was tried
+    first and proved unreliable to background/tear down cleanly in this
+    project's sandbox (backgrounded processes didn't reliably survive
+    between tool invocations during development); `mock_aws()` is also
+    simply the standard, widely-used way most projects test boto3-based
+    code, not a compromise made only for this environment. Yields the
+    bucket name; the bucket is created (moto doesn't require this
+    up-front the way real S3 workflows do, but ObjectStorage's own
+    docstring is explicit that it does NOT create buckets itself, so
+    tests shouldn't rely on that either)."""
+    from moto import mock_aws
+
+    with mock_aws():
+        import boto3
+
+        bucket = "zerobucket-test-tier"
+        boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=bucket)
+        yield bucket
+
+
+@pytest.fixture
+def object_store(s3_bucket):
+    """A real ObjectStorage instance pointed at the moto-mocked bucket."""
+    from zerobucket.object_storage import ObjectStorage
+
+    return ObjectStorage(s3_bucket, region_name="us-east-1")
+
+
+@pytest.fixture
+def tiered_images(_db_available, object_store):
+    """A ZeroBucket instance constructed WITH object_storage=... --
+    tiering is actually usable from this instance, unlike the plain
+    `images` fixture. Independently truncates the shared
+    zerobucket_images table (same table classic mode always uses) rather
+    than assuming `images`' truncate already ran -- keeps this fixture
+    correct standalone, regardless of fixture ordering in any given
+    test."""
+    zb = ZeroBucket(database_url=TEST_DATABASE_URL, object_storage=object_store)
+    with zb._backend._pool.connection() as conn, conn.cursor() as cur:  # noqa: SLF001
+        cur.execute("TRUNCATE TABLE zerobucket_images;")
+    yield zb
+    zb.close()
+
+
+@pytest.fixture
 def jpeg_bytes() -> bytes:
     return _make_image_bytes(fmt="JPEG")
 

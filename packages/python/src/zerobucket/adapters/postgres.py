@@ -46,6 +46,7 @@ import psycopg
 from psycopg_pool import ConnectionPool
 
 from ..exceptions import StorageError
+from ..object_storage import ObjectStorage
 from .base import StorageBackend, StoredRecord, StoredRecordMetadata
 
 # 1 MiB. Default chunk size for get_stream() -- small enough to keep
@@ -68,6 +69,44 @@ CREATE TABLE IF NOT EXISTS zerobucket_images (
 );
 CREATE INDEX IF NOT EXISTS idx_zerobucket_checksum ON zerobucket_images (checksum_sha256);
 CREATE INDEX IF NOT EXISTS idx_zerobucket_created_at ON zerobucket_images (created_at);
+
+-- Object-storage tiering (Stage 5). Additive to the schema above, safe
+-- to run against a database that already has rows in it -- every
+-- existing row gets storage_backend='postgres' via the column default,
+-- object_storage_key/object_storage_bucket NULL, and the CHECK
+-- constraint below is satisfied by every one of them without needing to
+-- touch a single existing row. `data` has to become nullable because a
+-- tiered row's bytes live in object storage, not in this column -- the
+-- CHECK constraint is what keeps that from silently becoming "NULL data
+-- and nobody notices": exactly one of "postgres row with data" or
+-- "tiered row with a pointer" is allowed to be true, never both, never
+-- neither.
+ALTER TABLE zerobucket_images ALTER COLUMN data DROP NOT NULL;
+ALTER TABLE zerobucket_images
+    ADD COLUMN IF NOT EXISTS storage_backend TEXT NOT NULL DEFAULT 'postgres';
+ALTER TABLE zerobucket_images ADD COLUMN IF NOT EXISTS object_storage_bucket TEXT;
+ALTER TABLE zerobucket_images ADD COLUMN IF NOT EXISTS object_storage_key TEXT;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'zerobucket_storage_location_check'
+    ) THEN
+        ALTER TABLE zerobucket_images ADD CONSTRAINT zerobucket_storage_location_check
+        CHECK (
+            (storage_backend = 'postgres'
+                AND data IS NOT NULL
+                AND object_storage_key IS NULL
+                AND object_storage_bucket IS NULL)
+            OR
+            (storage_backend = 'object_storage'
+                AND data IS NULL
+                AND object_storage_key IS NOT NULL
+                AND object_storage_bucket IS NOT NULL)
+        );
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_zerobucket_storage_backend
+    ON zerobucket_images (storage_backend) WHERE storage_backend != 'postgres';
 """
 
 _INSERT = """
@@ -78,7 +117,8 @@ RETURNING id;
 """
 
 _SELECT_FULL = """
-SELECT id, data, mime_type, original_filename, size_bytes, width, height, checksum_sha256
+SELECT id, data, mime_type, original_filename, size_bytes, width, height,
+       checksum_sha256, storage_backend, object_storage_bucket, object_storage_key
 FROM zerobucket_images
 WHERE id = %s;
 """
@@ -86,6 +126,26 @@ WHERE id = %s;
 _SELECT_METADATA = """
 SELECT id, mime_type, original_filename, size_bytes, width, height, checksum_sha256
 FROM zerobucket_images
+WHERE id = %s;
+"""
+
+# Everything tier_to_object_storage() needs to perform the move: the raw
+# bytes (to upload) plus mime_type (for the object's Content-Type) and
+# size_bytes (to sanity-check the upload). Separate from _SELECT_FULL
+# rather than reusing it -- this one is only ever called on a row already
+# confirmed to be storage_backend='postgres' (see tier_to_object_storage's
+# docstring), so it doesn't need the tiering columns back.
+_SELECT_FOR_TIERING = """
+SELECT data, mime_type, size_bytes, storage_backend
+FROM zerobucket_images
+WHERE id = %s
+FOR UPDATE;
+"""
+
+_UPDATE_AFTER_TIERING = """
+UPDATE zerobucket_images
+SET data = NULL, storage_backend = 'object_storage',
+    object_storage_bucket = %s, object_storage_key = %s, updated_at = now()
 WHERE id = %s;
 """
 
@@ -98,7 +158,18 @@ FROM zerobucket_images
 WHERE id = %s;
 """
 
+_SELECT_STREAM_INFO = """
+SELECT size_bytes, storage_backend, object_storage_key
+FROM zerobucket_images
+WHERE id = %s;
+"""
+
 _DELETE = "DELETE FROM zerobucket_images WHERE id = %s;"
+
+_DELETE_RETURNING = """
+DELETE FROM zerobucket_images WHERE id = %s
+RETURNING storage_backend, object_storage_key;
+"""
 
 _EXISTS = "SELECT 1 FROM zerobucket_images WHERE id = %s;"
 
@@ -242,7 +313,7 @@ class OperationEvent:
 
     operation: one of "put", "put_many", "get", "get_stream",
         "get_many", "get_metadata", "delete", "delete_many", "exists",
-        "migrate". A single get_stream() call reports one event per
+        "migrate", "tier_to_object_storage". A single get_stream() call reports one event per
         chunk fetched (plus one for the initial metadata lookup used to
         learn the total size), not one event for the whole stream --
         each is a genuinely separate round trip, so this is consistent
@@ -292,6 +363,22 @@ class PostgresBackend(StorageBackend):
     storage in separate tables. Not retroactive -- see
     migrate_classic_to_dedup() for moving existing classic-mode data.
 
+    object_storage: optional ObjectStorage instance (see
+    object_storage.py), enabling tiering -- see tier_to_object_storage().
+    None (default) means tiering is unavailable: rows can never be
+    tiered from this instance, and if this instance ever encounters an
+    already-tiered row (tiered by a DIFFERENT, object_storage-configured
+    instance pointed at the same database), get()/get_many()/
+    get_stream() raise a clear StorageError rather than silently
+    returning nothing or corrupted data. NOT available in dedup mode in
+    this first pass -- combining content-addressed storage (where one
+    blob can be referenced by many ids) with tiering (where a specific
+    blob's bytes might live in Postgres or in object storage) was judged
+    a meaningfully bigger, riskier design problem than tiering classic-
+    mode rows, and out of scope for this pass. Passing object_storage=
+    together with dedup=True raises ValueError immediately at
+    construction, rather than failing confusingly later.
+
     pool_min_size/pool_max_size/pool_timeout: tune the internal
     connection pool. Defaults (1/5/10) are unchanged from every prior
     version -- this is purely making previously-hardcoded values
@@ -320,7 +407,13 @@ class PostgresBackend(StorageBackend):
         pool_max_size: int = 5,
         pool_timeout: float = 10,
         on_operation: Callable[[OperationEvent], None] | None = None,
+        object_storage: ObjectStorage | None = None,
     ) -> None:
+        if object_storage is not None and dedup:
+            raise ValueError(
+                "object_storage= is not supported together with dedup=True "
+                "in this first pass -- see PostgresBackend's docstring."
+            )
         try:
             self._pool = ConnectionPool(
                 database_url,
@@ -336,6 +429,7 @@ class PostgresBackend(StorageBackend):
         self._retry_base_delay = retry_base_delay
         self._dedup = dedup
         self._on_operation = on_operation
+        self._object_storage = object_storage
 
         if auto_migrate:
             try:
@@ -616,9 +710,12 @@ class PostgresBackend(StorageBackend):
             raise StorageError(f"Failed to retrieve image: {exc}") from exc
         if row is None:
             return None
+        data = row[1]
+        if not self._dedup and row[8] == "object_storage":
+            data = self._fetch_tiered_bytes(row[10], image_id=image_id)
         return StoredRecord(
             id=str(row[0]),
-            data=bytes(row[1]),
+            data=bytes(data),
             mime_type=row[2],
             original_filename=row[3],
             size_bytes=row[4],
@@ -626,6 +723,24 @@ class PostgresBackend(StorageBackend):
             height=row[6],
             checksum_sha256=row[7],
         )
+
+    def _fetch_tiered_bytes(self, object_storage_key: str, *, image_id: str) -> bytes:
+        """Shared by get()/get_many() -- both need "the row says this
+        image lives in object storage, go get the actual bytes" and both
+        need the identical error if this backend wasn't configured with
+        an ObjectStorage to do that with. Deliberately NOT wrapped in
+        _run()/retried/given its own OperationEvent in this first pass --
+        object-storage round trips aren't yet covered by on_operation,
+        only Postgres ones are. Stated as a real gap, not silently
+        unmeasured by omission."""
+        if self._object_storage is None:
+            raise StorageError(
+                f"Image {image_id!r} is stored in object storage (key="
+                f"{object_storage_key!r}) but this ZeroBucket/PostgresBackend "
+                "was constructed without object_storage=... -- configure it "
+                "with the same bucket/credentials used to tier this image."
+            )
+        return self._object_storage.download(object_storage_key)
 
     def get_many(
         self, image_ids: list[str], *, connection: psycopg.Connection | None = None
@@ -635,6 +750,17 @@ class PostgresBackend(StorageBackend):
         Order of results is NOT guaranteed to match `image_ids` (a single
         WHERE id = ANY(...) query has no defined row order) -- client.py
         re-correlates by id, don't rely on this method's return order.
+
+        Tiered rows are fetched from object storage ONE AT A TIME, after
+        the single Postgres query returns -- not concurrently, not
+        batched into fewer object-storage requests. A get_many() call
+        touching many tiered images will be noticeably slower than one
+        touching only Postgres-resident images. Stated directly rather
+        than left to be discovered: this was left unoptimized in this
+        first pass rather than adding real complexity (e.g. thread-pool
+        fan-out) for a path that's expected to be the less-common case
+        (most of a typical dataset stays in Postgres; only large/old
+        images get explicitly tiered).
         """
         if not image_ids:
             return []
@@ -656,19 +782,24 @@ class PostgresBackend(StorageBackend):
             rows = self._run(connection, work, operation="get_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image batch: {exc}") from exc
-        return [
-            StoredRecord(
-                id=str(row[0]),
-                data=bytes(row[1]),
-                mime_type=row[2],
-                original_filename=row[3],
-                size_bytes=row[4],
-                width=row[5],
-                height=row[6],
-                checksum_sha256=row[7],
+        records = []
+        for row in rows:
+            data = row[1]
+            if not self._dedup and row[8] == "object_storage":
+                data = self._fetch_tiered_bytes(row[10], image_id=str(row[0]))
+            records.append(
+                StoredRecord(
+                    id=str(row[0]),
+                    data=bytes(data),
+                    mime_type=row[2],
+                    original_filename=row[3],
+                    size_bytes=row[4],
+                    width=row[5],
+                    height=row[6],
+                    checksum_sha256=row[7],
+                )
             )
-            for row in rows
-        ]
+        return records
 
     def get_metadata(
         self, image_id: str, *, connection: psycopg.Connection | None = None
@@ -718,13 +849,51 @@ class PostgresBackend(StorageBackend):
         row and this raises StorageError rather than silently yielding a
         short read -- a truncated image passed off as complete would be
         a much worse failure mode than a loud one.
-        """
-        metadata = self.get_metadata(image_id, connection=connection)
-        if metadata is None:
-            return None
 
-        select_chunk_sql = _DEDUP_SELECT_CHUNK if self._dedup else _SELECT_CHUNK
-        total_size = metadata.size_bytes
+        For a TIERED row (storage_backend='object_storage'), this
+        delegates entirely to ObjectStorage.download_stream() instead of
+        the substring() approach below -- which, worth stating directly,
+        is actually a strictly BETTER streaming implementation: it uses
+        real HTTP byte-Range requests against S3, not just a Python-side
+        memory optimization on top of transferring the full value every
+        time (see object_storage.py's download_stream() docstring). Not
+        available in dedup mode (dedup mode doesn't support tiering at
+        all yet -- see PostgresBackend's docstring) or if this backend
+        wasn't constructed with object_storage=... configured.
+        """
+        if self._dedup:
+            metadata = self.get_metadata(image_id, connection=connection)
+            if metadata is None:
+                return None
+            total_size = metadata.size_bytes
+            select_chunk_sql = _DEDUP_SELECT_CHUNK
+        else:
+
+            def info_work(cur):
+                cur.execute(_SELECT_STREAM_INFO, (image_id,))
+                return cur.fetchone()
+
+            try:
+                info_row = self._run(connection, info_work, operation="get_metadata")
+            except Exception as exc:  # noqa: BLE001
+                raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
+            if info_row is None:
+                return None
+            total_size, storage_backend, object_storage_key = info_row
+
+            if storage_backend == "object_storage":
+                if self._object_storage is None:
+                    raise StorageError(
+                        f"Image {image_id!r} is stored in object storage (key="
+                        f"{object_storage_key!r}) but this backend was "
+                        "constructed without object_storage=... -- configure "
+                        "it with the same bucket/credentials used to tier "
+                        "this image."
+                    )
+                return self._object_storage.download_stream(
+                    object_storage_key, chunk_size=chunk_size
+                )
+            select_chunk_sql = _SELECT_CHUNK
 
         def generator() -> Iterator[bytes]:
             offset = 1  # substring() is 1-indexed
@@ -759,6 +928,93 @@ class PostgresBackend(StorageBackend):
 
         return generator()
 
+    # ---- tier_to_object_storage ------------------------------------------
+
+    def tier_to_object_storage(
+        self, image_id: str, *, connection: psycopg.Connection | None = None
+    ) -> bool | None:
+        """Move an image's bytes out of Postgres and into object storage,
+        replacing this row's `data` with a pointer (storage_backend,
+        object_storage_bucket, object_storage_key). Returns None if
+        `image_id` doesn't exist (mirrors get()/get_metadata()'s
+        not-found-returns-None convention -- client.py raises
+        ImageNotFoundError from that None, same as everywhere else),
+        False if it exists but was ALREADY tiered (a safe no-op, not an
+        error -- lets you re-run a backfill script without it choking on
+        rows it already handled), True if it was actually tiered just
+        now.
+
+        Requires object_storage= to have been passed to this backend's
+        constructor -- raises StorageError immediately, before touching
+        the database at all, if it wasn't.
+
+        SAFETY: the upload to object storage happens INSIDE the same
+        database transaction as the row lookup/lock (SELECT ... FOR
+        UPDATE) and the subsequent UPDATE that flips storage_backend --
+        all as one `_run()` call. If the object-storage upload fails for
+        any reason (network error, bad credentials, bucket doesn't
+        exist), the exception propagates, the whole transaction rolls
+        back, and the row is left completely untouched -- still fully in
+        Postgres, exactly as if tiering had never been attempted. There
+        is no window where an image's bytes exist in neither location,
+        and no window where a row claims to be tiered but the object-
+        storage upload never actually completed.
+
+        TRADEOFF, stated directly: this holds a Postgres row-level lock
+        (via SELECT ... FOR UPDATE) for the entire duration of the
+        object-storage upload -- a real network call, potentially slow
+        for a large image. A concurrent get()/delete()/tier_to_object_storage()
+        call on this SAME image_id will block until this finishes; every
+        OTHER row is completely unaffected. This is a deliberate
+        simplicity/safety tradeoff for what's expected to be an
+        infrequent, explicitly-triggered maintenance operation, not
+        something called on a hot request path.
+
+        On retry (connection=None, a transient error mid-operation):
+        _run() replays the whole `work(cur)` callable, including the
+        object-storage upload. This is safe specifically because the
+        upload key is deterministic (str(image_id)) and S3's PutObject
+        semantics overwrite silently -- re-uploading the same bytes to
+        the same key on retry is a harmless no-op, not a correctness
+        risk, and the row lock ensures no other writer can have changed
+        things in between attempts.
+        """
+        if self._dedup:
+            raise StorageError(
+                "tier_to_object_storage() is not supported in dedup mode "
+                "in this first pass -- see PostgresBackend's docstring."
+            )
+        if self._object_storage is None:
+            raise StorageError(
+                "tier_to_object_storage() requires this backend to be "
+                "constructed with object_storage=... -- see ObjectStorage "
+                "in object_storage.py."
+            )
+
+        object_storage = self._object_storage  # narrow for closures below
+
+        def work(cur):
+            cur.execute(_SELECT_FOR_TIERING, (image_id,))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            data, mime_type, size_bytes, storage_backend = row
+            if storage_backend != "postgres":
+                return False
+            key = str(image_id)
+            object_storage.upload(key, bytes(data), mime_type=mime_type)
+            cur.execute(_UPDATE_AFTER_TIERING, (object_storage.bucket, key, image_id))
+            return True
+
+        try:
+            return self._run(connection, work, operation="tier_to_object_storage")
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(
+                f"Failed to tier image to object storage: {exc}"
+            ) from exc
+
     # ---- delete -------------------------------------------------------------
 
     def delete(
@@ -768,13 +1024,32 @@ class PostgresBackend(StorageBackend):
             return self._delete_dedup(image_id, connection=connection)
 
         def work(cur):
-            cur.execute(_DELETE, (image_id,))
-            return cur.rowcount > 0
+            cur.execute(_DELETE_RETURNING, (image_id,))
+            return cur.fetchone()
 
         try:
-            return self._run(connection, work, operation="delete")
+            row = self._run(connection, work, operation="delete")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image: {exc}") from exc
+        if row is None:
+            return False
+        storage_backend, object_storage_key = row
+        if storage_backend == "object_storage" and self._object_storage is not None:
+            # Best-effort, AFTER the Postgres row is already gone -- a
+            # deliberate ordering choice, not an oversight. The row being
+            # gone is what makes the image correctly "not found" to every
+            # caller from here on, regardless of whether this S3 delete
+            # below succeeds; if it fails, the result is a harmless
+            # orphaned object costing a few cents, not a data-integrity
+            # problem (contrast: deleting from S3 FIRST and having the
+            # Postgres DELETE fail afterward would leave a row that
+            # claims to exist but points at nothing -- a worse failure
+            # mode). If this backend has no object_storage configured at
+            # all, the orphan is simply left behind with no attempt --
+            # documented as a stated limitation (see class docstring),
+            # not silently swallowed.
+            self._object_storage.delete(object_storage_key)
+        return True
 
     def _delete_dedup(
         self, image_id: str, *, connection: psycopg.Connection | None
@@ -811,15 +1086,27 @@ class PostgresBackend(StorageBackend):
 
         def work(cur):
             cur.execute(
-                "DELETE FROM zerobucket_images WHERE id = ANY(%s) RETURNING id;",
+                "DELETE FROM zerobucket_images WHERE id = ANY(%s) "
+                "RETURNING id, storage_backend, object_storage_key;",
                 (image_ids,),
             )
-            return [str(row[0]) for row in cur.fetchall()]
+            return cur.fetchall()
 
         try:
-            return self._run(connection, work, operation="delete_many")
+            rows = self._run(connection, work, operation="delete_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image batch: {exc}") from exc
+        deleted_ids = []
+        for row in rows:
+            image_id, storage_backend, object_storage_key = row
+            deleted_ids.append(str(image_id))
+            if storage_backend == "object_storage" and self._object_storage is not None:
+                # Same best-effort, after-the-fact ordering as delete()
+                # above, one at a time -- not batched into a single S3
+                # DeleteObjects call in this first pass. See delete()'s
+                # docstring for the ordering reasoning.
+                self._object_storage.delete(object_storage_key)
+        return deleted_ids
 
     def _delete_many_dedup(
         self, image_ids: list[str], *, connection: psycopg.Connection | None
