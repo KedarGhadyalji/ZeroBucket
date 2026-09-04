@@ -134,6 +134,33 @@ on GitHub for exactly what's gated (`get`/`get_many`/`get_stream`/
 `stream_to`/`metadata`, NOT `exists`) and the `put_many`/`get_many`
 batch evaluation semantics.
 
+### Object-storage tiering
+
+```python
+from zerobucket import ZeroBucket, ObjectStorage
+
+store = ObjectStorage("my-bucket", region_name="us-east-1")  # bucket must already exist
+images = ZeroBucket(database_url=DATABASE_URL, object_storage=store)
+
+image_id = images.put("large_scan.jpg")
+images.tier_to_object_storage(image_id)   # explicit -- put() never auto-tiers
+
+image = images.get(image_id)              # works exactly the same, fetched from S3
+images.delete(image_id)                   # cleans up both the Postgres row and the S3 object
+```
+
+Opt-in escape hatch for images that outgrow keeping everything in
+Postgres -- doesn't change anything for images you don't tier. S3-
+compatible via `boto3` (`pip install zerobucket[s3]`, not installed by
+default). Explicit trigger only (no automatic size-based tiering in
+`put()` yet), transparent reads (`get`/`get_many`/`get_stream`/
+`stream_to`/`metadata`/`exists` all work identically either way), and
+not available with `dedup=True` yet. The upload happens inside the same
+DB transaction as the row update, so a failed upload leaves the row
+completely untouched. See the
+[full explanation](https://github.com/KedarGhadyalji/ZeroBucket#object-storage-tiering)
+on GitHub for the transactional-safety details and the row-lock tradeoff.
+
 ### Optimizing images (compression)
 
 Off by default -- `put()` stores your exact input bytes unless you opt in:

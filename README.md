@@ -229,6 +229,101 @@ asyncio.run(main())
 Linux and macOS are unaffected -- their default event loop is already
 compatible.
 
+### Object-storage tiering
+
+Postgres storage has a real, honestly-stated ceiling (see
+[Limitations](#limitations)): as a table of images grows into the tens
+or hundreds of GB, backups get slower, replication lag grows, and
+database storage costs more per GB than object storage does. Tiering is
+the release valve for the minority of users who actually hit that
+ceiling -- **it's opt-in, changes nothing for anyone who doesn't use
+it**, and doesn't reverse ZeroBucket's core promise (small/medium
+collections still just live in Postgres, forever, for free).
+
+```python
+from zerobucket import ZeroBucket, ObjectStorage
+
+store = ObjectStorage(
+    "my-bucket",                      # must already exist -- see below
+    aws_access_key_id="...",          # or omit both to use boto3's own
+    aws_secret_access_key="...",      # standard credential resolution
+    region_name="us-east-1",
+)
+images = ZeroBucket(database_url=DATABASE_URL, object_storage=store)
+
+image_id = images.put("large_scan.jpg")
+images.tier_to_object_storage(image_id)   # moves bytes: Postgres -> S3
+
+# Everything below behaves EXACTLY the same as before tiering:
+image = images.get(image_id)              # fetched from S3, transparently
+images.delete(image_id)                   # cleans up both the row and the S3 object
+```
+
+**Scope decisions made explicitly, not by default** (each was actually
+asked and decided, not assumed):
+
+- **S3-compatible only, via `boto3`** -- covers AWS S3 itself plus
+  anything speaking the same API (Cloudflare R2, MinIO, Backblaze B2,
+  DigitalOcean Spaces). `boto3` is an OPTIONAL dependency
+  (`pip install zerobucket[s3]`) -- importing `zerobucket` itself never
+  requires it; only constructing an `ObjectStorage` does.
+- **Explicit migration, not automatic.** `put()` never silently tiers
+  anything based on size -- new images always land in Postgres, exactly
+  like before this feature existed. You (or a script you write and
+  schedule) call `tier_to_object_storage(image_id)` deliberately. This
+  mirrors `migrate_classic_to_dedup()`'s existing pattern: nothing
+  happens automatically, you run it when you decide to. There's no
+  built-in "tier everything over N bytes" bulk command yet -- you write
+  that loop yourself, over whatever selection criteria fit your data
+  (size, age, whatever you query for).
+- **Fully transparent reads.** `get()`, `get_many()`, `get_stream()`,
+  `stream_to()`, `metadata()`, `exists()` all work identically whether a
+  given image's bytes live in Postgres or in object storage -- your
+  application code never needs a separate code path. `delete()`
+  additionally cleans up the object-storage copy when deleting a tiered
+  image.
+- **Not available in dedup mode in this first pass.** Combining
+  content-addressed storage (one blob shared by many ids) with tiering
+  (a specific blob's bytes living in one place or the other) was judged
+  a meaningfully bigger, riskier design problem than tiering classic-
+  mode rows -- `ZeroBucket(dedup=True, object_storage=...)` raises
+  `ValueError` immediately at construction, rather than failing
+  confusingly later.
+
+**Safety guarantee worth being explicit about:** `tier_to_object_storage()`
+uploads to object storage _inside_ the same database transaction as the
+row lock and the update that flips where the bytes live. If the upload
+fails for any reason, the whole transaction rolls back and the row is
+left completely untouched -- still fully in Postgres, exactly as if
+tiering had never been attempted. There is no window where an image's
+bytes exist in neither location, and no window where a row claims to be
+tiered but the upload never actually completed. The tradeoff for that
+guarantee: a Postgres row-level lock is held for the entire duration of
+the upload (a real network call) -- a deliberate simplicity/safety
+choice for what's meant to be an infrequent, explicitly-triggered
+maintenance operation, not a hot request path. A concurrent
+read/delete/tier call on that _same_ image blocks until it finishes;
+every other row is completely unaffected.
+
+`ObjectStorage` does **not** create the bucket for you, unlike
+Postgres's `auto_migrate=True` schema creation -- bucket creation
+involves choices (region, versioning, encryption, lifecycle policies,
+public-access blocking) that are yours to make deliberately for
+anything touching real object storage and real money. Create the bucket
+yourself first.
+
+`get_stream()` on a tiered image is actually a genuine capability
+_upgrade_, not just parity: it delegates to real S3 byte-Range requests
+under the hood, rather than the Postgres-backed path's substring()-based
+approach (see [Streaming reads/writes](#streaming-readswrites-for-large-files)).
+
+If a _different_ `ZeroBucket` instance -- pointed at the same database,
+but constructed without `object_storage=` -- ever encounters a row that
+some other instance already tiered, it raises a clear `StorageError`
+rather than silently returning nothing or corrupted data. Make sure
+every process that might read tiered images is configured with the same
+bucket/credentials used to tier them.
+
 ### Serving from a web API
 
 ```python
@@ -671,13 +766,16 @@ memory cost across image sizes. In short:
 
 Be honest with yourself about whether ZeroBucket fits your workload:
 
-- **Not for large files or high-volume media.** `get_stream()`/
-  `stream_to()` avoid holding a full image in _Python_ memory during a
-  read, but Postgres itself still handles the full stored value the same
-  way it always has for a BYTEA column -- there is no true reduction in
-  server-side memory/IO cost, no HTTP range/partial-content support, and
-  no CDN. If you're serving millions of images a day or storing video,
-  use S3 (or similar) instead.
+- **Not for large files or high-volume media, unless you tier them.**
+  `get_stream()`/`stream_to()` avoid holding a full image in _Python_
+  memory during a read, but Postgres itself still handles the full
+  stored value the same way it always has for a BYTEA column -- there is
+  no true reduction in server-side memory/IO cost for anything still
+  living in Postgres, and no CDN. [Object-storage tiering](#object-storage-tiering)
+  is the escape hatch for images that outgrow this -- opt-in, explicit,
+  and doesn't change anything for images you don't tier. If you're
+  serving millions of images a day or storing video, use S3 (or
+  similar) directly instead of routing through Postgres at all.
 - **Deduplication exists but is opt-in, not automatic.** By default
   (`dedup=False`), uploading the same image twice still stores it twice
   -- pass `dedup=True` for content-addressed, reference-counted storage.
@@ -767,7 +865,7 @@ Not yet built, tracked honestly rather than implied:
 - [x] Deduplication with reference counting (opt-in, `dedup=True`)
 - [ ] SQLite and MySQL adapters
 - [x] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`, `zerobucket verify`)
-- [ ] Optional object-storage backend for files that outgrow the database tier
+- [x] Optional object-storage backend for files that outgrow the database tier (`tier_to_object_storage()`, S3-compatible via `boto3` -- see [Object-storage tiering](#object-storage-tiering))
 - [x] Async client support (`AsyncZeroBucket`, via psycopg3's native async mode -- see [Async support](#async-support) for why this isn't literally the `asyncpg` package despite the name here historically)
 - [x] Batch operations (`put_many`/`get_many`/`delete_many`)
 - [x] Retry/backoff policy for transient database errors

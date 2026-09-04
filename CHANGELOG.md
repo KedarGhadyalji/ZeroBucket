@@ -2,6 +2,164 @@
 
 All notable changes to this project are documented here.
 
+## [0.14.0] - 2026-09-03
+
+### Added
+
+- Object-storage tiering, the second item on Stage 5's roadmap. New
+  `ObjectStorage` class (`object_storage.py`), a new `object_storage=`
+  parameter on `ZeroBucket`/`PostgresBackend`, and a new
+  `tier_to_object_storage(image_id)` method.
+
+### Scope decisions -- confirmed with the requester before writing code, not assumed
+
+Three real design decisions were raised as explicit options before any
+implementation started (trigger mechanism, storage target, read-path
+transparency), because guessing wrong on any of them would have meant
+redoing real work, not adjusting a detail:
+
+- **Trigger: explicit only**, not automatic size-based tiering at
+  `put()` time. New images always land in Postgres, unchanged from
+  today; `tier_to_object_storage(image_id)` is the only thing that
+  moves bytes out, called deliberately (by you, or a script you write).
+  Mirrors the existing `migrate_classic_to_dedup()` pattern. No built-in
+  bulk/backfill command yet -- you write that loop yourself over
+  whatever selection criteria fit your data.
+- **Storage target: S3-compatible only, via `boto3`**, added as an
+  OPTIONAL dependency (`pip install zerobucket[s3]`) -- not a generic
+  pluggable backend interface, and no local-filesystem tiering. Covers
+  AWS S3 plus anything speaking the same API (R2, MinIO, B2,
+  DigitalOcean Spaces) through one client. `zerobucket.object_storage`
+  defers its `import boto3` to `ObjectStorage.__init__` specifically so
+  plain `import zerobucket` never requires boto3 at all -- confirmed
+  directly: a fresh venv install without the `[s3]` extra has no boto3
+  in `pip freeze`, and `import zerobucket` still succeeds.
+- **Read path: fully transparent.** `get()`, `get_many()`,
+  `get_stream()`, `stream_to()`, `metadata()`, `exists()` all work
+  identically regardless of where a given image's bytes actually live.
+  `delete()` additionally cleans up the object-storage copy for tiered
+  images.
+
+Not available with `dedup=True` in this first pass -- combining
+content-addressed storage (one blob shared by many ids) with tiering
+was judged a meaningfully bigger, riskier problem than tiering classic-
+mode rows. `ZeroBucket(dedup=True, object_storage=...)` raises
+`ValueError` immediately at construction.
+
+### The transactional-safety guarantee, and what it costs
+
+`tier_to_object_storage()` uploads to object storage INSIDE the same
+Postgres transaction as the row lock (`SELECT ... FOR UPDATE`) and the
+subsequent `UPDATE` that flips `storage_backend`. If the upload fails
+for any reason, the exception propagates, the whole transaction rolls
+back, and the row is left completely untouched -- still fully in
+Postgres, exactly as if tiering had never been attempted. There is no
+window where an image's bytes exist in neither location, and no window
+where a row claims to be tiered but the upload never completed.
+Verified with a dedicated test that injects a failing upload and
+confirms the row is byte-for-byte unchanged afterward, not just that an
+exception was raised.
+
+The cost, stated directly rather than left implicit: this holds a
+Postgres row-level lock for the entire duration of the upload -- a real
+network call, potentially slow for a large image. A concurrent
+`get()`/`delete()`/`tier_to_object_storage()` call on that SAME
+`image_id` blocks until tiering finishes; every other row is completely
+unaffected. Accepted as a deliberate simplicity/safety tradeoff for
+what's expected to be an infrequent, explicitly-triggered maintenance
+operation, not a hot request path.
+
+On retry (no caller-supplied `connection=`, a transient mid-operation
+failure): the whole operation, including the object-storage upload,
+gets replayed. This is safe specifically because the upload key is
+deterministic (`str(image_id)`) and S3's `PutObject` overwrites
+silently -- a retried upload to the same key is a harmless no-op, not a
+correctness risk.
+
+### Schema change -- additive and idempotent, safe against existing data
+
+```sql
+ALTER TABLE zerobucket_images ALTER COLUMN data DROP NOT NULL;
+ALTER TABLE zerobucket_images ADD COLUMN IF NOT EXISTS storage_backend TEXT NOT NULL DEFAULT 'postgres';
+ALTER TABLE zerobucket_images ADD COLUMN IF NOT EXISTS object_storage_bucket TEXT;
+ALTER TABLE zerobucket_images ADD COLUMN IF NOT EXISTS object_storage_key TEXT;
+-- plus a CHECK constraint (added only if not already present) enforcing:
+-- exactly one of (postgres row with data) or (tiered row with a
+-- pointer) is ever true, never both, never neither.
+```
+
+Runs automatically via the existing `auto_migrate=True` path, same as
+every prior schema change in this project. Every row that existed
+before this release already satisfies the new `CHECK` constraint
+without being touched, via the `storage_backend` column's default —
+verified by running this migration against a database with existing
+classic-mode rows already in it, not just against a fresh empty schema.
+
+### A genuine capability upgrade, not just parity
+
+`get_stream()` on a tiered image delegates to `ObjectStorage.
+download_stream()`, which uses REAL HTTP byte-Range requests against
+S3 -- strictly better than the Postgres-backed path's `substring()`-
+based approach (see v0.11.0's entry), which still transfers the full
+value every time regardless of chunking. Worth stating plainly: tiered
+images get a genuinely different, more capable streaming
+implementation, not the same one pointed at a different byte source.
+
+### A real bug caught during development, not assumed away
+
+- The first implementation attempt tried testing `ObjectStorage`
+  against a standalone `moto_server` subprocess (a real running
+  S3-compatible HTTP server) for the most realistic possible test, the
+  same philosophy as using real Postgres instead of mocks throughout
+  this project. It proved unreliable in this project's sandbox
+  specifically: backgrounded server processes did not consistently
+  survive between separate tool invocations, and the subprocess itself
+  intermittently hung the calling shell entirely (traced to a `pkill`
+  invocation stalling with no matching processes present, and separately
+  to `moto_server`'s own forking/reload behavior holding output pipes
+  open). Switched to `moto.mock_aws()`, an in-process context manager
+  that patches botocore's HTTP layer directly -- the standard, widely-
+  used way most boto3-based projects test against AWS APIs, not a
+  compromise invented only for this environment. Both `object_storage.py`
+  itself and the full `tier_to_object_storage()` round trip were
+  re-verified against it before proceeding, so this pivot cost a false
+  start but not any actual test coverage.
+- A copy-paste-derived relative-import bug (`from ..exceptions import
+StorageError` inside `object_storage.py`, one directory level too
+  deep -- the pattern was copied from `adapters/postgres.py`, which
+  really is one level deeper) was caught immediately by actually
+  importing the new module, before it ever reached the test suite.
+
+### Files delivered
+
+- New: `object_storage.py`, `tests/test_tiering.py` (16 new tests)
+- Changed: `adapters/postgres.py` (schema, `_SELECT_FULL`/`get`/
+  `get_many`/`get_stream`/`delete`/`delete_many` updated for tiered
+  rows, new `tier_to_object_storage()`, `object_storage=` constructor
+  param, `dedup=True` + `object_storage=` rejected at construction),
+  `client.py` (`object_storage=` param, `tier_to_object_storage()`
+  client method), `__init__.py` (export `ObjectStorage`, version),
+  `pyproject.toml` (version, new `s3` optional extra, `boto3`/`moto[s3]`
+  added to dev dependencies), `tests/conftest.py` (new `s3_bucket`/
+  `object_store`/`tiered_images` fixtures), both READMEs (new
+  "Object-storage tiering" section, updated Limitations/quick-reference/
+  roadmap checkbox)
+
+223/223 tests pass (16 new), lint clean, mypy shows the same
+pre-existing categories of findings as prior releases plus one new,
+deliberate, explicitly-commented `type: ignore[attr-defined]`
+(`tier_to_object_storage()` is intentionally NOT part of the generic
+`StorageBackend` interface -- see client.py's comment for why). Built,
+`twine check`ed, and functionally verified end-to-end from a genuinely
+fresh venv install of the built wheel TWICE: once without the `[s3]`
+extra (confirming `import zerobucket` still works and boto3 is absent
+from `pip freeze`, and that constructing `ObjectStorage` without boto3
+installed raises a clear `ImportError` with the install instructions),
+and once with `[s3]` installed (confirming the full tier → transparent-
+read → delete round trip, idempotent re-tiering, and the clear-error
+behavior for a second `ZeroBucket` instance without `object_storage=`
+encountering an already-tiered row).
+
 ## [0.13.0] - 2026-09-02
 
 ### Added
