@@ -269,13 +269,11 @@ asked and decided, not assumed):
   requires it; only constructing an `ObjectStorage` does.
 - **Explicit migration, not automatic.** `put()` never silently tiers
   anything based on size -- new images always land in Postgres, exactly
-  like before this feature existed. You (or a script you write and
-  schedule) call `tier_to_object_storage(image_id)` deliberately. This
-  mirrors `migrate_classic_to_dedup()`'s existing pattern: nothing
-  happens automatically, you run it when you decide to. There's no
-  built-in "tier everything over N bytes" bulk command yet -- you write
-  that loop yourself, over whatever selection criteria fit your data
-  (size, age, whatever you query for).
+  like before this feature existed. Something -- you, a script, or the
+  `zerobucket tier` CLI command below -- calls
+  `tier_to_object_storage(image_id)` deliberately. This mirrors
+  `migrate_classic_to_dedup()`'s existing pattern: nothing happens
+  automatically, you (or a scheduled job) run it when you decide to.
 - **Fully transparent reads.** `get()`, `get_many()`, `get_stream()`,
   `stream_to()`, `metadata()`, `exists()` all work identically whether a
   given image's bytes live in Postgres or in object storage -- your
@@ -832,6 +830,11 @@ zerobucket migrate   # currently the same as init -- no versioned migrations yet
 zerobucket info      # image count, total size, on-disk size, breakdown by format
 zerobucket verify    # re-checksum every stored image to detect corruption
 zerobucket verify --sample 100   # check a random sample instead of everything
+zerobucket tier IMAGE_ID --bucket my-bucket             # tier a single image
+zerobucket tier --all --bucket my-bucket                # tier every untiered image
+zerobucket tier --min-size 2000000 --bucket my-bucket    # tier images >= 2MB
+zerobucket tier --older-than 90 --bucket my-bucket       # tier images older than 90 days
+zerobucket tier --all --bucket my-bucket --dry-run       # preview without doing it
 ```
 
 All commands take `--database-url`, or read `ZEROBUCKET_DATABASE_URL` from
@@ -846,6 +849,23 @@ zerobucket info
 which image IDs), so it's usable as a cron job or CI check, not just an
 interactive command. It streams one image's bytes at a time rather than
 loading the whole table into memory -- safe to run against a large table.
+
+`tier` requires `pip install zerobucket[s3]` (boto3) -- every other
+command still needs nothing beyond the base install. It's the single-id
+form of `tier_to_object_storage()` when given an id, or the reference
+"backfill script" implementation (see
+[Object-storage tiering](#object-storage-tiering)) when given `--all`/
+`--min-size`/`--older-than` instead -- combine those to narrow a bulk
+run, add `--limit N` to cap how many it processes in one go, and
+`--dry-run` to see what would be tiered without touching anything.
+`--min-size`/`--older-than`/`--all` only ever select rows not already
+tiered; re-running the same bulk command is safe and just reports
+everything already handled as skipped, not an error. `--endpoint-url`,
+`--region`, `--aws-access-key-id`, and `--aws-secret-access-key` mirror
+`ObjectStorage`'s own constructor arguments (see that section) --
+credentials fall back to boto3's standard resolution if omitted.
+Exits with status 1 if anything failed to tier, same convention as
+`verify`.
 
 ## Operations
 

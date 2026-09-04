@@ -2,6 +2,73 @@
 
 All notable changes to this project are documented here.
 
+## [0.15.0] - 2026-09-04
+
+### Added
+
+- `zerobucket tier` CLI command -- closes a real gap left by v0.14.0's
+  object-storage tiering: `tier_to_object_storage()` had no CLI
+  equivalent, even though the sibling `migrate_classic_to_dedup()`
+  feature it was explicitly modeled after already had one (`zerobucket
+migrate`). Caught while scoping the next round of work, not reported
+  by a user -- flagged and fixed before it became one.
+
+### Two forms, one command
+
+- **Single id**: `zerobucket tier IMAGE_ID --bucket my-bucket` -- a thin
+  wrapper around exactly what `ZeroBucket.tier_to_object_storage()` does
+  from Python, so tiering one image doesn't require writing a script
+  just to supply a bucket and credentials.
+- **Bulk**: `zerobucket tier --all|--min-size N|--older-than DAYS
+[--limit N] [--dry-run] --bucket my-bucket` -- the reference
+  implementation of the "backfill script" v0.14.0's docs said callers
+  would have to write themselves. This does NOT reverse that release's
+  stated scope decision that `put()` never auto-tiers based on size --
+  tiering is still only ever triggered explicitly, by something calling
+  `tier_to_object_storage()`; this just means the selection-query-plus-
+  loop boilerplate doesn't have to be hand-written anymore. Only ever
+  selects rows not already tiered -- confirmed with a dedicated test
+  that an already-tiered row isn't even a candidate for `--all`, not
+  merely re-processed as a no-op.
+
+### Small but deliberate design choices
+
+- `--dry-run` lists exactly what a bulk run would tier without doing
+  it -- tiering is consequential (real data movement, real object-
+  storage cost, a held Postgres row lock per image for the duration of
+  each upload -- see v0.14.0's entry), so previewing a bulk selection
+  before committing to it felt worth the small extra surface area.
+- Requesting both a single `IMAGE_ID` and a bulk filter (`--all`/
+  `--min-size`/`--older-than`) in the same invocation is a usage error
+  (exit code 2), not "the id wins" or "the filter wins" silently.
+  Same for requesting neither.
+- Exits with status 1 if anything failed to tier (not-found ids,
+  upload failures), same convention `verify` already uses -- usable in
+  a cron job or CI check, not just interactively.
+- `tier` is the one CLI command that needs `boto3` (`pip install
+zerobucket[s3]`) -- every other command still needs nothing beyond
+  the base install, unchanged from before. Running `tier` without
+  boto3 installed surfaces `ObjectStorage`'s own clear `ImportError`
+  message (with the install instructions in it), not a raw traceback --
+  verified with a test that simulates the import failing.
+
+### Files delivered
+
+- Changed: `cli.py` (`cmd_tier`, `_select_tier_candidates`, `tier`
+  subparser), `tests/test_cli.py` (11 new tests), `pyproject.toml`
+  (version only), both READMEs (CLI section, and the "Object-storage
+  tiering" section's wording updated now that a backfill reference
+  implementation actually exists)
+
+234/234 tests pass (11 new), lint clean. Verified directly against real
+Postgres and a real boto3 client (via `moto`'s S3 emulator, same
+approach as v0.14.0) before writing formal tests, then again via the
+formal test suite: single-id tiering, idempotent re-tiering, not-found
+handling, all three bulk filters (individually confirmed to actually
+filter, not just accept the flag), `--limit`, `--dry-run` genuinely not
+mutating anything, both usage-error combinations, and the no-boto3
+error path.
+
 ## [0.14.0] - 2026-09-03
 
 ### Added

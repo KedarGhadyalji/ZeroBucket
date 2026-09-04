@@ -281,11 +281,12 @@ support built into the core.
 zerobucket init      # create the schema if missing
 zerobucket info      # image count, total size, breakdown by format
 zerobucket verify    # re-checksum every image to detect corruption
+zerobucket tier --all --bucket my-bucket   # move untiered images into S3 (needs zerobucket[s3])
 ```
 
 Takes `--database-url` or reads `ZEROBUCKET_DATABASE_URL` from the
-environment. `verify` exits non-zero on any mismatch, so it's usable in
-cron/CI. See the
+environment. `verify`/`tier` exit non-zero on any failure, so both are
+usable in cron/CI. See the
 [full CLI docs](https://github.com/KedarGhadyalji/ZeroBucket#cli) on
 GitHub.
 
