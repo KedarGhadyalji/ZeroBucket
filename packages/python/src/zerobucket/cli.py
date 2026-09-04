@@ -4,10 +4,15 @@
     zerobucket migrate   -- apply schema migrations (currently: same as init)
     zerobucket info      -- storage stats: count, size, breakdown by format
     zerobucket verify    -- re-checksum stored images to detect corruption
+    zerobucket tier      -- move image(s) into S3-compatible object storage
 
 Uses only argparse and psycopg (both already dependencies) -- no new
 dependency was added just for the CLI, consistent with keeping this
-project's dependency footprint deliberately small.
+project's dependency footprint deliberately small. The one exception is
+`tier`, which needs boto3 (`pip install zerobucket[s3]`) -- but that
+import is deferred into ObjectStorage.__init__ the same way it is
+everywhere else in this project (see object_storage.py), so running any
+OTHER command still never requires boto3 to be installed.
 """
 
 from __future__ import annotations
@@ -170,6 +175,139 @@ def cmd_verify(args: argparse.Namespace) -> None:
         print(f"OK: all {checked} image(s) verified, no checksum mismatches.")
 
 
+def _select_tier_candidates(
+    conn: psycopg.Connection, args: argparse.Namespace
+) -> list[str]:
+    """Bulk selection for `tier`'s --min-size/--older-than/--all filters.
+    Only ever returns ids still storage_backend='postgres' -- an already-
+    tiered row simply isn't a candidate, rather than being selected and
+    then relying on tier_to_object_storage()'s own idempotent no-op to
+    skip it silently (that no-op still exists as a safety net, but the
+    query not even selecting it makes a --dry-run listing accurate)."""
+    conditions = ["storage_backend = 'postgres'"]
+    params: dict[str, object] = {}
+    if args.min_size is not None:
+        conditions.append("size_bytes >= %(min_size)s")
+        params["min_size"] = args.min_size
+    if args.older_than is not None:
+        conditions.append(
+            "created_at <= now() - (%(older_than_days)s || ' days')::interval"
+        )
+        params["older_than_days"] = args.older_than
+    sql = f"SELECT id FROM zerobucket_images WHERE {' AND '.join(conditions)} ORDER BY created_at"
+    if args.limit is not None:
+        sql += " LIMIT %(limit)s"
+        params["limit"] = args.limit
+    sql += ";"
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return [str(row[0]) for row in cur.fetchall()]
+
+
+def cmd_tier(args: argparse.Namespace) -> None:
+    """Single-id form (`zerobucket tier IMAGE_ID --bucket ...`) is a thin
+    wrapper around exactly what ZeroBucket.tier_to_object_storage() does
+    from Python -- this exists so tiering one image doesn't require
+    writing a Python script just to supply a bucket and credentials.
+
+    Bulk form (--all / --min-size / --older-than) is the reference
+    implementation of the "backfill script" this project's docs
+    previously said callers would have to write themselves -- providing
+    one here doesn't reverse that scope decision (tier_to_object_storage()
+    itself still never runs automatically from put()), it just means you
+    don't have to write the selection-query-plus-loop boilerplate by
+    hand. Processes ids ONE AT A TIME, sequentially -- no concurrency,
+    same documented tradeoff as get_many()'s handling of multiple tiered
+    rows (see PostgresBackend.get_many()'s docstring): this is expected
+    to be an infrequent maintenance operation, not a hot path, and each
+    tier_to_object_storage() call already holds a row lock for its
+    duration (see that method's docstring) -- there's no benefit to
+    racing multiple of those against each other from one CLI invocation.
+    """
+    bulk_selection_given = (
+        args.all or args.min_size is not None or args.older_than is not None
+    )
+    if args.image_id and bulk_selection_given:
+        print(
+            "Error: can't combine a single IMAGE_ID with --all/--min-size/--older-than.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not args.image_id and not bulk_selection_given:
+        print(
+            "Error: specify either a single IMAGE_ID to tier, or a bulk "
+            "selection filter (--all, --min-size, and/or --older-than).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    url = _resolve_database_url(args)
+
+    from .object_storage import ObjectStorage
+
+    try:
+        store = ObjectStorage(
+            args.bucket,
+            endpoint_url=args.endpoint_url,
+            aws_access_key_id=args.aws_access_key_id,
+            aws_secret_access_key=args.aws_secret_access_key,
+            region_name=args.region,
+        )
+    except ImportError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        backend = PostgresBackend(url, object_storage=store)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: could not connect: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        if args.image_id:
+            candidate_ids = [args.image_id]
+        else:
+            with psycopg.connect(url) as select_conn:
+                candidate_ids = _select_tier_candidates(select_conn, args)
+            if not candidate_ids:
+                print("No matching images to tier (or all already tiered).")
+                return
+
+        if args.dry_run:
+            print(f"Would tier {len(candidate_ids)} image(s):")
+            for image_id in candidate_ids:
+                print(f"  {image_id}")
+            return
+
+        tiered = skipped = failed = 0
+        total = len(candidate_ids)
+        for i, image_id in enumerate(candidate_ids, 1):
+            try:
+                result = backend.tier_to_object_storage(image_id)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  FAILED {image_id}: {exc}", file=sys.stderr)
+                failed += 1
+            else:
+                if result is None:
+                    print(f"  NOT FOUND {image_id}", file=sys.stderr)
+                    failed += 1
+                elif result is False:
+                    skipped += 1
+                else:
+                    tiered += 1
+            if total > 1 and (i % 50 == 0 or i == total):
+                print(f"  {i}/{total} processed...")
+
+        print()
+        print(
+            f"Tiered: {tiered}, already tiered (skipped): {skipped}, failed: {failed}"
+        )
+        if failed:
+            sys.exit(1)
+    finally:
+        backend.close()
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="zerobucket",
@@ -220,6 +358,73 @@ def main(argv: list[str] | None = None) -> None:
         help="Check a random sample of N images instead of every image.",
     )
     p_verify.set_defaults(func=cmd_verify)
+
+    p_tier = subparsers.add_parser(
+        "tier",
+        parents=[common],
+        help="Move image(s) from Postgres into S3-compatible object storage.",
+    )
+    p_tier.add_argument(
+        "image_id",
+        nargs="?",
+        default=None,
+        help="Tier a single image by id. Omit and use --all/--min-size/"
+        "--older-than instead for bulk selection.",
+    )
+    p_tier.add_argument(
+        "--bucket", required=True, help="S3(-compatible) bucket -- must already exist."
+    )
+    p_tier.add_argument(
+        "--endpoint-url",
+        default=None,
+        help="For non-AWS S3-compatible services (Cloudflare R2, MinIO, etc). "
+        "Omit for real AWS S3.",
+    )
+    p_tier.add_argument(
+        "--region",
+        default=None,
+        help="AWS region. Required by some S3-compatible services even when "
+        "the region concept is meaningless to them.",
+    )
+    p_tier.add_argument(
+        "--aws-access-key-id",
+        default=None,
+        help="Falls back to boto3's standard credential resolution "
+        "(environment, ~/.aws/credentials, IAM role) if omitted.",
+    )
+    p_tier.add_argument("--aws-secret-access-key", default=None)
+    p_tier.add_argument(
+        "--min-size",
+        type=int,
+        default=None,
+        metavar="BYTES",
+        help="Bulk: only tier images at least this many bytes.",
+    )
+    p_tier.add_argument(
+        "--older-than",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help="Bulk: only tier images created at least this many days ago.",
+    )
+    p_tier.add_argument(
+        "--all",
+        action="store_true",
+        help="Bulk: tier every not-yet-tiered image (combine with "
+        "--min-size/--older-than to narrow, or use alone for everything).",
+    )
+    p_tier.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Bulk: cap how many images one run processes.",
+    )
+    p_tier.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List what would be tiered without actually doing it.",
+    )
+    p_tier.set_defaults(func=cmd_tier)
 
     args = parser.parse_args(argv)
     args.func(args)
