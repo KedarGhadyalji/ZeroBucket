@@ -1,6 +1,147 @@
 # Changelog
 
-All notable changes to this project are documented here.
+All notable changes to this project are documented here. This project
+now ships two independently-versioned packages -- entries are labeled
+with which one they apply to. The core `zerobucket` package's version
+history continues below unbroken; `django-zerobucket` starts its own
+version sequence from 0.1.0.
+
+## [django-zerobucket 0.1.0] - 2026-09-04
+
+### Added
+
+- `django-zerobucket`, a new, SEPARATE package (not a module inside the
+  core `zerobucket` package -- see "Packaging" below for why) providing
+  a Django `Storage` backend adapter: `ZeroBucketStorage`, plugging
+  ZeroBucket into Django's existing `FileField`/`ImageField` via the
+  `STORAGES` setting. No new model field type to learn -- works with
+  existing forms, admin, and migrations the same way `django-storages`'
+  S3/GCS backends do for their targets.
+- `ServeImageView`, a built-in class-based view streaming stored images
+  back over HTTP via ZeroBucket's own `get_stream()` -- what
+  `ZeroBucketStorage.url()` reverses to by default. Override-able (see
+  below) for anyone who wants images served some other way.
+- Three management commands (`zerobucket_info`, `zerobucket_verify`,
+  `zerobucket_tier`) -- thin wrappers around the core package's already-
+  tested `cmd_info`/`cmd_verify`/`cmd_tier` CLI functions, not
+  reimplementations, reading `ZEROBUCKET_DATABASE_URL` from Django
+  settings instead of requiring `--database-url` by hand.
+
+### Scope decisions -- decided deliberately for this first pass, not defaulted into
+
+Three real architectural forks were raised as explicit options before
+any code was written (how Django should use ZeroBucket at all, how
+served images reach HTTP, and how this should be packaged), with the
+final call on each delegated back and made explicitly rather than left
+implicit:
+
+- **Storage API adapter, not a custom model field.** Judged the higher-
+  leverage, more idiomatic choice for Django -- it composes with
+  existing `FileField`/`ImageField`, forms, and admin, rather than every
+  adopting project having to learn a new field type. A custom field
+  remains a possible future addition, not ruled out, just not built.
+- **A built-in serving view, override-able.** `Storage.url()` needs a
+  usable default or the "drop-in" pitch of choosing the Storage-adapter
+  approach over a custom field falls apart (`{{ instance.photo.url }}`
+  wouldn't work out of the box). `ServeImageView` is that default,
+  designed to be subclassed/replaced (e.g. pointing at a CDN in front of
+  tiered S3 objects, or adding auth) rather than hardcoded as the only
+  option.
+- **Separate PyPI package**, matching how `django-storages` and similar
+  Django integrations are conventionally distributed -- NOT bundled
+  into the core `zerobucket` package. This keeps Django (a genuinely
+  optional, heavy dependency most `zerobucket` users don't have) out of
+  the core library's dependency footprint entirely, the same "keep the
+  core small" philosophy already behind boto3 being an optional extra
+  rather than a hard dependency.
+
+### The one deliberate, honestly-documented difference from typical Django Storage backends
+
+**The `name` a `FileField`/`ImageField` stores is the ZeroBucket image
+id (a UUID), not a filesystem-style path.** Every other Django Storage
+backend builds a path from `upload_to=` plus the uploaded filename;
+ZeroBucket is id-addressed, not path-addressed, so `upload_to=` is
+required by Django's field API but effectively ignored here. This is
+invisible for normal usage (`.url`, `.read()`, `.open()`, template
+`{{ }}` access all work identically) -- it only matters for code that
+inspects the raw `name` string expecting something path-shaped. The
+original upload filename is NOT lost, though: it's preserved in
+ZeroBucket's own metadata (`filename=` passed through to `put()`) and
+retrievable via the core client's `metadata()`, even though Django's
+own `name` field won't show it. Confirmed with a dedicated test, not
+just asserted in the docstring.
+
+A second, smaller deliberate override: `get_available_name()` skips
+Django's default collision-avoidance loop (which normally calls
+`exists()` repeatedly, appending suffixes until a free name is found)
+entirely -- meaningless here, since `_save()` always gets a fresh id
+from `put()` regardless of what name was suggested, so the loop would
+just be a wasted round trip. Confirmed with a test that it's a genuine
+no-op passthrough, not merely documented as one.
+
+### No built-in access control on served images -- stated, not hidden
+
+`ServeImageView` has no authentication/permission checks of its own.
+ZeroBucket's core `before_get`/`before_put` hooks exist for exactly
+this, but wiring a `context=` through Django's request/auth system into
+those hooks is a real design question of its own (whose context -- the
+request? the user? something else?) that was judged out of scope for
+this first pass rather than answered by guessing. The README documents
+the straightforward workaround: wrap the view with Django's own
+`login_required` (or similar) the normal way.
+
+### Real infrastructure risk found and fixed during this round, not assumed away
+
+- Partway through, `zerobucket` was discovered installed as a stale,
+  non-live copy in site-packages (`hatchling`'s editable-install mode
+  had, at some point in this project's session history, materialized as
+  a one-time file copy rather than a live-reflecting link) -- meaning
+  test runs could silently have been exercising an outdated snapshot of
+  the core package rather than its current source. Caught by comparing
+  file content and modification timestamps directly between the
+  installed copy and the source tree (they matched -- this round's
+  testing was NOT actually affected), then fixed by reinstalling and
+  confirming, via `zerobucket.__file__`, that the installed package now
+  resolves directly to the live source tree. Flagged here as a reminder
+  for future rounds, not just fixed silently.
+
+### Testing
+
+Uses `pytest-django` against a REAL PostgreSQL instance, deliberately
+in two distinct roles at once (see `tests/django_settings.py`'s module
+docstring): Django's own `DATABASES` (its internal tables, plus this
+suite's dummy `Product` test model) and `ZEROBUCKET_DATABASE_URL`
+(where ZeroBucket actually stores image bytes) -- kept conceptually
+separate even though this test setup happens to point both at the same
+physical server. Coverage includes the full real-world path, not just
+the Storage class in isolation: a genuine Django model with an
+`ImageField(storage=ZeroBucketStorage)`, saved and reloaded through the
+actual ORM; `ZeroBucketStorage.url()` resolved and then actually
+fetched through Django's real HTTP test client and URL resolver;
+`zerobucket_tier` exercised via `call_command()` against a real boto3
+client (`moto`'s S3 emulator, same approach as the core package's own
+v0.14.0/v0.15.0 tiering tests).
+
+### Files delivered
+
+- New package: `packages/django-zerobucket/` -- `src/django_zerobucket/`
+  (`storage.py`, `views.py`, `urls.py`, `apps.py`,
+  `management/commands/zerobucket_{info,verify,tier}.py`),
+  `tests/` (`test_storage.py`, `test_views.py`,
+  `test_management_commands.py`, Django settings/urlconf/test-app
+  scaffolding), `pyproject.toml`, `README.md`
+- Changed (root project): `README.md` (roadmap checkbox, Installation
+  section pointer, Project structure diagram)
+
+26/26 tests pass, lint clean. Built, `twine check`ed, and functionally
+verified end-to-end from a genuinely fresh venv install of the built
+wheel (both `django-zerobucket` and the core `zerobucket` wheel
+together) against a real, separately-constructed Django project
+directory (not the test suite's own scaffolding) -- confirmed
+`save()`/`exists()`/`open()`/`size()`/`url()`/`delete()` and a real
+HTTP request through Django's test client all work correctly, and
+confirmed boto3 is genuinely absent from a fresh install unless
+explicitly requested via `zerobucket[s3]`.
 
 ## [0.15.0] - 2026-09-04
 

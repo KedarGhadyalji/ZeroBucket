@@ -79,6 +79,10 @@ pip install zerobucket
 Requires Python 3.10+ and a PostgreSQL 13+ database (uses
 `gen_random_uuid()`, built in since Postgres 13).
 
+Using Django? See [`django-zerobucket`](packages/django-zerobucket) --
+a separate package, a Storage backend adapter that plugs ZeroBucket into
+your existing `FileField`/`ImageField` (`pip install django-zerobucket`).
+
 ## Usage
 
 ```python
@@ -795,15 +799,26 @@ Be honest with yourself about whether ZeroBucket fits your workload:
 ```
 zerobucket/
 ├── packages/
-│   └── python/          # this package
-│       ├── src/zerobucket/
-│       │   ├── client.py       # the public ZeroBucket class
-│       │   ├── validation.py   # content-based format/size/corruption checks
-│       │   ├── exceptions.py
-│       │   ├── types.py        # Image, ImageMetadata
-│       │   └── adapters/
-│       │       ├── base.py     # StorageBackend interface (bytes in/out only)
-│       │       └── postgres.py # the only implementation so far
+│   ├── python/          # the core zerobucket package
+│   │   ├── src/zerobucket/
+│   │   │   ├── client.py       # the public ZeroBucket class
+│   │   │   ├── async_client.py # AsyncZeroBucket
+│   │   │   ├── validation.py   # content-based format/size/corruption checks
+│   │   │   ├── object_storage.py # S3-compatible tiering
+│   │   │   ├── exceptions.py
+│   │   │   ├── types.py        # Image, ImageMetadata
+│   │   │   ├── cli.py          # zerobucket init/migrate/info/verify/tier
+│   │   │   └── adapters/
+│   │   │       ├── base.py           # StorageBackend interface (sync)
+│   │   │       ├── postgres.py       # the only sync implementation so far
+│   │   │       ├── base_async.py     # AsyncStorageBackend interface
+│   │   │       └── postgres_async.py # async Postgres implementation
+│   │   └── tests/
+│   └── django-zerobucket/  # separate package: Django Storage backend adapter
+│       ├── src/django_zerobucket/
+│       │   ├── storage.py      # ZeroBucketStorage(Storage)
+│       │   ├── views.py        # ServeImageView
+│       │   └── management/commands/  # zerobucket_info/verify/tier
 │       └── tests/
 ├── benchmarks/
 │   ├── run_benchmark.py
@@ -892,7 +907,7 @@ Not yet built, tracked honestly rather than implied:
 - [x] `before_get(image_id, context) -> bool` / `before_put(context) -> bool` authorization hooks
 - [x] Pluggable content validators (`put(validator=...)`) -- includes a PDF reference implementation
 - [x] Streaming reads/writes for large files (`get_stream()`/`stream_to()`; bounded-read writes)
-- [ ] Django integration package
+- [x] Django integration package (`django-zerobucket` -- Storage backend for `FileField`/`ImageField`, see [`packages/django-zerobucket`](packages/django-zerobucket))
 - [x] Configurable connection pool sizing (`pool_min_size`/`pool_max_size`/`pool_timeout`)
 - [x] `on_operation` observability hook (per-operation timing, retry count, success/failure)
 
