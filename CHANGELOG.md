@@ -6,6 +6,75 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## [0.16.0] - 2026-09-17
+
+### Added -- PHASE 1 OF 4, NOT A COMPLETE FEATURE YET
+
+- `SQLiteBackend` (`adapters/sqlite.py`), the first of the roadmap's
+  last remaining item ("SQLite and MySQL adapters"). Implements
+  classic-mode core CRUD only: `put`, `put_many`, `get`, `get_many`,
+  `get_metadata`, `delete`, `delete_many`, `exists`, `close`. Use it via
+  the existing `backend=` constructor override:
+  `ZeroBucket(backend=SQLiteBackend("path/to.db"))` -- no dedicated
+  `sqlite://` connection-string auto-detection in `client.py` yet.
+- Confirms the `StorageBackend` abstraction genuinely is backend-
+  agnostic, not just in theory: image validation, checksumming, and the
+  `before_get`/`before_put` access-control hooks all work identically
+  against `SQLiteBackend` with zero changes to `client.py` -- verified
+  directly with dedicated tests, not assumed because it works for
+  Postgres.
+
+### Explicitly NOT done yet -- stated in the module's own docstring, not just here
+
+- `get_stream()` raises `NotImplementedError` with a message pointing
+  back at this gap -- not silently missing, not a confusing low-level
+  error.
+- No dedup mode, no `tier_to_object_storage()`, no async support
+  (`aiosqlite`) for SQLite yet.
+- No MySQL/MariaDB adapter code at all yet (a real MariaDB instance was
+  set up and confirmed reachable via `pymysql`/`asyncmy` during this
+  round, in preparation -- no adapter built on top of it yet).
+
+### Two real, honestly-documented design differences from the Postgres adapter
+
+- **No connection pool.** Unlike a networked database, opening a SQLite
+  connection is cheap (no network round trip, no auth handshake) --
+  this backend opens a fresh connection per operation rather than
+  maintaining a pool. Stated in the module docstring as a deliberate
+  choice specific to SQLite's local-file nature, not a pattern to copy
+  into a hypothetical future networked adapter without re-deriving
+  whether it still makes sense there.
+- **WAL mode enabled on every connection** (`PRAGMA journal_mode=WAL`).
+  SQLite's default rollback-journal mode serializes all readers behind
+  a writer; WAL mode allows concurrent readers alongside a single
+  writer -- relevant even for a single local file used by more than one
+  process/thread.
+
+### A real bug caught by actually running it, not assumed away
+
+- SQLite's `sqlite3.Connection.execute()` rejects multi-statement SQL
+  scripts outright (`sqlite3.ProgrammingError: You can only execute one
+statement at a time`) -- unlike psycopg, which runs the Postgres
+  adapter's multi-statement schema string without complaint. Fixed by
+  using `executescript()` for schema migration specifically. Found
+  immediately by running the adapter against a real `.db` file before
+  writing any tests, not discovered later.
+
+### Files delivered
+
+- New: `adapters/sqlite.py`, `tests/test_sqlite_adapter.py` (22 new
+  tests, run against a real SQLite file on disk via `tempfile`, not an
+  in-memory mock)
+- Changed: `__init__.py` (export `SQLiteBackend`), `pyproject.toml`
+  (version only)
+
+256/256 tests pass (22 new), lint clean. No fresh-venv install
+verification for this specific phase yet (SQLite ships in Python's
+standard library, so there's no new dependency to verify pulls in
+correctly the way boto3/Django did for prior features) -- full
+build/install verification will happen once this feature is complete
+enough to be a rounded release, not mid-phase.
+
 ## [django-zerobucket 0.1.0] - 2026-09-04
 
 ### Added

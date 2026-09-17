@@ -898,7 +898,7 @@ Not yet built, tracked honestly rather than implied:
 - [x] Optional HEIC/HEIF support (`pip install zerobucket[heic]`)
 - [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)
 - [x] Deduplication with reference counting (opt-in, `dedup=True`)
-- [ ] SQLite and MySQL adapters
+- [ ] SQLite and MySQL adapters (in progress -- `SQLiteBackend` classic-mode core CRUD landed in 0.16.0; streaming/dedup/tiering/async for SQLite, and MySQL entirely, still to come)
 - [x] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`, `zerobucket verify`)
 - [x] Optional object-storage backend for files that outgrow the database tier (`tier_to_object_storage()`, S3-compatible via `boto3` -- see [Object-storage tiering](#object-storage-tiering))
 - [x] Async client support (`AsyncZeroBucket`, via psycopg3's native async mode -- see [Async support](#async-support) for why this isn't literally the `asyncpg` package despite the name here historically)
