@@ -12,6 +12,7 @@ from .adapters.postgres import (
     migrate_classic_to_dedup,
 )
 from .adapters.postgres_async import AsyncPostgresBackend
+from .adapters.sqlite import SQLiteBackend
 from .async_client import AsyncZeroBucket
 from .client import ZeroBucket
 from .content_types import ContentValidator, ValidatedContent
@@ -36,12 +37,13 @@ from .types import (
     ImageMetadata,
 )
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 __all__ = [
     "ZeroBucket",
     "AsyncZeroBucket",
     "AsyncPostgresBackend",
+    "SQLiteBackend",
     "ObjectStorage",
     "Image",
     "ImageMetadata",
