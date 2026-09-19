@@ -1,14 +1,13 @@
-"""Tests for SQLiteBackend -- Phase 1 of the SQLite adapter (see
-adapters/sqlite.py's module docstring for what's implemented so far:
-classic-mode core CRUD only, no streaming/dedup/tiering/async yet).
+"""Tests for SQLiteBackend -- Phase 1 (classic-mode core CRUD, see
+v0.16.0) plus Phase 2 (get_stream()/tier_to_object_storage(), this
+round). Streaming and tiering are the two features covered here.
+NOT yet implemented for SQLite, tracked as explicit follow-up: dedup
+mode, async support.
 
-Runs against a REAL SQLite file on disk (via tempfile), not an
-in-memory mock -- same "test against real infrastructure" philosophy
-used for the Postgres/S3/Django test suites throughout this project.
-Goes through the full ZeroBucket client (via backend=SQLiteBackend(...)),
-not the raw backend directly, for most tests -- confirms the client
-layer (validation, checksums, hooks) is genuinely backend-agnostic in
-practice, not just in theory.
+Runs against REAL infrastructure throughout: a real SQLite file on disk
+(via tempfile) and, for tiering, a real boto3 client against moto's S3
+emulator (same approach used for the Postgres adapter's own tiering
+tests) -- not mocked at the boundary being tested.
 """
 
 from __future__ import annotations
@@ -17,10 +16,12 @@ import os
 import tempfile
 
 import pytest
+from moto import mock_aws
 
 from zerobucket import AccessDeniedError, ImageNotFoundError, ZeroBucket
 from zerobucket.adapters.sqlite import SQLiteBackend
 from zerobucket.exceptions import StorageError
+from zerobucket.object_storage import ObjectStorage
 
 
 @pytest.fixture
@@ -198,15 +199,255 @@ def test_delete_many_large_batch_builds_correct_in_clause(sqlite_images, jpeg_by
     assert all(not sqlite_images.exists(i) for i in ids)
 
 
-# ---- get_stream is explicitly not implemented yet --------------------
+# ---- get_stream() ----------------------------------------------------
 
 
-def test_get_stream_raises_not_implemented(sqlite_images, jpeg_bytes):
-    """Confirms the Phase 1 gap fails loudly and clearly, not silently
-    or with a confusing low-level error."""
+def _bigger_jpeg_bytes():
+    import io
+
+    from PIL import Image as PILImage
+
+    img = PILImage.new("RGB", (800, 600), color=(9, 88, 177))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    return buf.getvalue()
+
+
+def test_get_stream_reconstructs_exact_bytes(sqlite_images):
+    data = _bigger_jpeg_bytes()
+    image_id = sqlite_images.put(data)
+
+    chunks = list(sqlite_images.get_stream(image_id, chunk_size=1000))
+    assert b"".join(chunks) == data
+    assert len(chunks) > 1
+
+
+def test_get_stream_not_found_raises(sqlite_images):
+    with pytest.raises(ImageNotFoundError):
+        sqlite_images.get_stream("00000000-0000-0000-0000-000000000000")
+
+
+def test_get_stream_small_chunk_size_all_but_last_chunk_exact(sqlite_images):
+    data = _bigger_jpeg_bytes()
+    image_id = sqlite_images.put(data)
+    chunks = list(sqlite_images.get_stream(image_id, chunk_size=97))
+    for chunk in chunks[:-1]:
+        assert len(chunk) == 97
+    assert len(chunks[-1]) <= 97
+
+
+def test_get_stream_survives_concurrent_delete_mid_stream(sqlite_path):
+    """VERIFIED, different-from-Postgres behavior, not a bug: SQLite's
+    WAL-mode snapshot isolation means a stream already in progress keeps
+    reading the row's original data even after a DIFFERENT connection
+    deletes it. Confirmed here for the full get_stream() path, not just
+    in isolation against bare blobopen() -- see this method's docstring
+    for why this differs from the Postgres adapter (which raises
+    StorageError in the equivalent scenario) and why that's not
+    something to assume is universal across backends."""
+    import sqlite3
+
+    backend = SQLiteBackend(sqlite_path)
+    zb = ZeroBucket(backend=backend)
+    data = _bigger_jpeg_bytes()
+    image_id = zb.put(data)
+
+    stream = zb.get_stream(image_id, chunk_size=50)
+    first_chunk = next(stream)
+    assert first_chunk
+
+    other_conn = sqlite3.connect(sqlite_path)
+    other_conn.execute("DELETE FROM zerobucket_images WHERE id = ?;", (image_id,))
+    other_conn.commit()
+    other_conn.close()
+
+    # The stream survives the concurrent delete and still delivers the
+    # complete, correct original bytes.
+    rest = b"".join(stream)
+    assert first_chunk + rest == data
+
+    # But the row really is gone now, from a fresh connection's view.
+    assert zb.exists(image_id) is False
+    zb.close()
+
+
+# ---- tier_to_object_storage() ------------------------------------------
+
+
+@pytest.fixture
+def s3_bucket():
+    with mock_aws():
+        import boto3
+
+        bucket = "zerobucket-sqlite-tier-test"
+        boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=bucket)
+        yield bucket
+
+
+@pytest.fixture
+def object_store(s3_bucket):
+    return ObjectStorage(s3_bucket, region_name="us-east-1")
+
+
+@pytest.fixture
+def tiered_backend(sqlite_path, object_store):
+    return SQLiteBackend(sqlite_path, object_storage=object_store)
+
+
+@pytest.fixture
+def tiered_images(tiered_backend):
+    zb = ZeroBucket(backend=tiered_backend)
+    yield zb
+    zb.close()
+
+
+def test_tier_moves_bytes_out_of_sqlite(
+    tiered_images, tiered_backend, object_store, jpeg_bytes
+):
+    image_id = tiered_images.put(jpeg_bytes)
+    assert tiered_backend.tier_to_object_storage(image_id) is True
+    assert object_store.download(image_id) == jpeg_bytes
+
+
+def test_tier_is_idempotent_no_op_on_second_call(
+    tiered_images, tiered_backend, jpeg_bytes
+):
+    image_id = tiered_images.put(jpeg_bytes)
+    assert tiered_backend.tier_to_object_storage(image_id) is True
+    assert tiered_backend.tier_to_object_storage(image_id) is False
+
+
+def test_tier_not_found_returns_none(tiered_backend):
+    assert (
+        tiered_backend.tier_to_object_storage("00000000-0000-0000-0000-000000000000")
+        is None
+    )
+
+
+def test_tier_without_object_storage_configured_raises(sqlite_images, jpeg_bytes):
     image_id = sqlite_images.put(jpeg_bytes)
-    with pytest.raises(NotImplementedError, match="not yet implemented"):
-        sqlite_images.get_stream(image_id)
+    with pytest.raises(StorageError, match="object_storage"):
+        sqlite_images._backend.tier_to_object_storage(image_id)
+
+
+def test_get_works_identically_after_tiering(tiered_images, tiered_backend, jpeg_bytes):
+    image_id = tiered_images.put(jpeg_bytes)
+    tiered_backend.tier_to_object_storage(image_id)
+    assert tiered_images.get(image_id).data == jpeg_bytes
+
+
+def test_get_stream_delegates_to_object_storage_after_tiering(
+    tiered_images, tiered_backend
+):
+    data = _bigger_jpeg_bytes()
+    image_id = tiered_images.put(data)
+    tiered_backend.tier_to_object_storage(image_id)
+    chunks = list(tiered_images.get_stream(image_id, chunk_size=500))
+    assert b"".join(chunks) == data
+
+
+def test_delete_cleans_up_both_sqlite_row_and_object_storage(
+    tiered_images, tiered_backend, object_store, jpeg_bytes
+):
+    image_id = tiered_images.put(jpeg_bytes)
+    tiered_backend.tier_to_object_storage(image_id)
+    assert object_store.exists(image_id) is True
+
+    assert tiered_images.delete(image_id) is True
+    assert tiered_images.exists(image_id) is False
+    assert object_store.exists(image_id) is False
+
+
+def test_failed_upload_leaves_row_completely_untouched(
+    tiered_images, tiered_backend, object_store, jpeg_bytes
+):
+    """The core safety guarantee: BEGIN IMMEDIATE means a failed upload
+    rolls back the whole transaction, leaving the row exactly as if
+    tiering had never been attempted."""
+    image_id = tiered_images.put(jpeg_bytes)
+
+    def broken_upload(*args, **kwargs):
+        raise RuntimeError("simulated network failure")
+
+    original_upload = object_store.upload
+    object_store.upload = broken_upload
+    try:
+        with pytest.raises(StorageError):
+            tiered_backend.tier_to_object_storage(image_id)
+    finally:
+        object_store.upload = original_upload
+
+    assert tiered_images.get(image_id).data == jpeg_bytes
+    import sqlite3
+
+    conn = sqlite3.connect(tiered_backend._database_path)  # noqa: SLF001
+    cur = conn.execute(
+        "SELECT storage_backend FROM zerobucket_images WHERE id = ?;", (image_id,)
+    )
+    assert cur.fetchone()[0] == "sqlite"
+    conn.close()
+
+
+def test_tier_blocks_other_writes_for_its_duration(
+    tiered_backend, object_store, jpeg_bytes
+):
+    """Confirms the documented coarse-lock tradeoff is real, not just
+    described in the docstring: BEGIN IMMEDIATE during tiering should
+    block a concurrent writer using a separate connection until the
+    tiering transaction finishes.
+
+    Uses a deterministic technique, not a timing measurement: a second
+    connection with a very short busy_timeout attempts a write WHILE
+    the tiering upload is deliberately slowed down and still in
+    progress. If tiering is genuinely holding the write lock, that
+    second connection's write must fail with `sqlite3.OperationalError:
+    database is locked` (verified in isolation first, against a bare
+    BEGIN IMMEDIATE with no other project code involved, before writing
+    this test around the real tier_to_object_storage() call)."""
+    import sqlite3
+    import threading
+    import time
+
+    zb = ZeroBucket(backend=tiered_backend)
+    image_id = zb.put(jpeg_bytes)
+
+    real_upload = object_store.upload
+    upload_started = threading.Event()
+
+    def slow_upload(*args, **kwargs):
+        upload_started.set()
+        time.sleep(0.4)
+        return real_upload(*args, **kwargs)
+
+    object_store.upload = slow_upload
+
+    tier_result = []
+
+    def do_tier():
+        tier_result.append(tiered_backend.tier_to_object_storage(image_id))
+
+    tier_thread = threading.Thread(target=do_tier)
+    tier_thread.start()
+    assert upload_started.wait(timeout=5), "tier never reached the upload step"
+    time.sleep(0.05)  # make sure BEGIN IMMEDIATE has definitely been issued
+
+    other_conn = sqlite3.connect(
+        tiered_backend._database_path, timeout=0.05
+    )  # noqa: SLF001
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            other_conn.execute(
+                "UPDATE zerobucket_images SET original_filename = 'x' WHERE id = ?;",
+                (image_id,),
+            )
+    finally:
+        other_conn.close()
+
+    tier_thread.join(timeout=5)
+    object_store.upload = real_upload
+    zb.close()
+
+    assert tier_result == [True]
 
 
 # ---- access-control hooks work identically (backend-agnostic) --------
