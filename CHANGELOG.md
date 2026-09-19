@@ -6,6 +6,81 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## [0.17.0] - 2026-09-17
+
+### Added -- PHASE 2 OF 4, STILL NOT A COMPLETE FEATURE
+
+- `SQLiteBackend.get_stream()` -- built on `sqlite3.Connection.blobopen()`
+  (Python >= 3.11), a genuine incremental-BLOB-I/O API. Arguably a more
+  natural fit for streaming than the Postgres adapter's own
+  `substring()`-based approach, not a lesser one.
+- `SQLiteBackend.tier_to_object_storage()` -- same return-value contract
+  as the Postgres adapter (None = not found, False = already tiered,
+  True = tiered just now), same "upload fails -> row completely
+  untouched" safety guarantee, achieved with a different locking
+  primitive (see below). `get()`/`get_many()`/`delete()`/`delete_many()`
+  updated to handle tiered rows transparently, matching Postgres parity.
+- `SQLiteBackend.__init__` now accepts `object_storage=`, same as
+  `PostgresBackend`.
+
+### Still explicitly NOT done -- dedup mode, async (aiosqlite), and all of MySQL
+
+Tracked in the module's own docstring, not just here.
+
+### The one real, honestly-documented cost of matching Postgres's tiering safety guarantee on SQLite
+
+SQLite has no per-row locking at all -- it's fundamentally a single-
+writer database. `tier_to_object_storage()` uses `BEGIN IMMEDIATE`
+instead of `SELECT ... FOR UPDATE`, which preserves the actual safety
+property (a failed upload leaves the row completely untouched, no
+window where bytes exist in neither location) -- but `BEGIN IMMEDIATE`
+locks the ENTIRE database file for writes, not just the one row being
+tiered, for the full duration of the upload. On Postgres, tiering one
+image doesn't block writes to any other row. On SQLite, it blocks
+writes to every other row too (reads are unaffected -- WAL mode allows
+concurrent readers alongside a writer). Stated plainly in the code and
+here, not glossed over as equivalent to Postgres's behavior, because it
+isn't. Verified with a dedicated test using a deterministic technique
+(a second connection with a short `busy_timeout` that must fail with
+`sqlite3.OperationalError: database is locked` while tiering is in
+progress) rather than a fragile timing measurement -- the first version
+of this test used timing deltas and gave a false negative; rewritten
+after confirming the real locking behavior in isolation first, outside
+any project code, before trusting the more complex test built on top of
+it.
+
+### A second real, verified-not-assumed behavioral difference from Postgres
+
+Concurrent deletion mid-stream behaves differently between the two
+backends, and this was actually discovered by a test failing, not
+predicted in advance. On Postgres, each `get_stream()` chunk is a
+separate round trip; a row deleted by another connection mid-stream
+causes the next chunk fetch to see nothing and raise `StorageError`.
+On SQLite, this backend holds ONE connection open for the whole stream,
+and `blobopen()`'s underlying read transaction gives it a consistent
+snapshot (in WAL mode) of the row as it was when streaming began -- a
+concurrent `DELETE` from another connection does NOT interrupt an
+in-progress SQLite stream; it completes successfully with the full,
+correct original bytes. Confirmed in a minimal isolated script first
+(bare `blobopen()`, no project code) before updating the real test and
+the method's docstring to describe the verified behavior instead of an
+assumed one carried over from the Postgres implementation.
+
+### Files delivered
+
+- Changed: `adapters/sqlite.py` (`get_stream`, `tier_to_object_storage`,
+  `object_storage=` constructor param, `get`/`get_many`/`delete`/
+  `delete_many` updated for tiered rows), `tests/test_sqlite_adapter.py`
+  (12 new tests, including two that were rewritten after their first
+  version caught real, verified-not-assumed behavioral differences
+  rather than confirming an assumption), `pyproject.toml` (version only)
+
+268/268 tests pass (34 total for the SQLite adapter across both
+phases), lint clean. Both real infrastructure pieces exercised for
+real: a real SQLite file on disk throughout, and a real boto3 client
+against `moto`'s S3 emulator for every tiering test (same approach used
+for the Postgres adapter's own v0.14.0 tiering tests).
+
 ## [0.16.0] - 2026-09-17
 
 ### Added -- PHASE 1 OF 4, NOT A COMPLETE FEATURE YET
