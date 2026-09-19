@@ -1,15 +1,11 @@
 """SQLite storage adapter.
 
-PHASE 1 OF A MULTI-PHASE BUILD, stated directly rather than implied:
-this file currently implements classic-mode core CRUD only (put,
-put_many, get, get_many, get_metadata, delete, delete_many, exists).
-NOT yet implemented, tracked as explicit follow-up phases, not silent
-gaps: get_stream(), dedup mode, tier_to_object_storage(), async support
-(aiosqlite), and the before_get/before_put hook interaction hasn't been
-exercised against this backend yet either (the hooks live entirely in
-client.py and are backend-agnostic by construction, so they're expected
-to work unmodified -- but "expected to" isn't the same as "tested
-against," and this docstring won't claim tested until it's been done).
+PHASE 2 OF A MULTI-PHASE BUILD, stated directly rather than implied.
+Phase 1 shipped classic-mode core CRUD (put, put_many, get, get_many,
+get_metadata, delete, delete_many, exists) -- see v0.16.0's CHANGELOG
+entry. This phase adds get_stream()/tier_to_object_storage(). STILL NOT
+implemented, tracked as explicit follow-up phases, not silent gaps:
+dedup mode, async support (aiosqlite), and MySQL entirely.
 
 Stores image bytes directly in a BLOB column. All queries are
 parameterized; nothing is ever built via string concatenation.
@@ -38,15 +34,21 @@ than left for someone to wonder about while reading unfamiliar code:
   readers alongside a single writer, which matters even for a single
   local file being used by more than one process/thread.
 - No `SELECT ... FOR UPDATE` -- SQLite has no per-row locking at all
-  (it's fundamentally a single-writer database). Relevant once tiering
-  is implemented in a later phase (see this module's docstring above);
-  not relevant to anything implemented so far in this file, since
-  nothing here yet needs a lock stronger than SQLite's normal implicit
-  transaction behavior.
+  (it's fundamentally a single-writer database). `tier_to_object_storage()`
+  below uses `BEGIN IMMEDIATE` instead -- SQLite's closest equivalent,
+  but meaningfully COARSER: it locks the ENTIRE database file for
+  writes, not just one row, for the duration of the object-storage
+  upload. See that method's docstring for the full reasoning and what
+  this actually costs you.
 - `= ANY(array)` isn't SQLite syntax -- get_many()/delete_many() build
   a dynamically-sized `IN (?, ?, ...)` placeholder list instead.
 - `RETURNING` IS supported (SQLite >= 3.35, released March 2021) and is
   used the same way the Postgres adapter uses it.
+- get_stream() uses `sqlite3.Connection.blobopen()` (Python >= 3.11), a
+  genuine incremental-BLOB-I/O API -- not a workaround built on top of
+  substring()-style range queries the way the Postgres adapter's
+  version is. This is arguably a more natural fit for streaming than
+  the Postgres implementation, not a lesser one.
 """
 
 from __future__ import annotations
@@ -57,9 +59,29 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 
 from ..exceptions import StorageError
+from ..object_storage import ObjectStorage
 from .base import StorageBackend, StoredRecord, StoredRecordMetadata
 
 DEFAULT_STREAM_CHUNK_SIZE = 1024 * 1024
+
+_SELECT_STREAM_INFO = """
+SELECT rowid, size_bytes, storage_backend, object_storage_key
+FROM zerobucket_images
+WHERE id = ?;
+"""
+
+_SELECT_FOR_TIERING = """
+SELECT data, mime_type, size_bytes, storage_backend
+FROM zerobucket_images
+WHERE id = ?;
+"""
+
+_UPDATE_AFTER_TIERING = """
+UPDATE zerobucket_images
+SET data = NULL, storage_backend = 'object_storage',
+    object_storage_bucket = ?, object_storage_key = ?, updated_at = ?
+WHERE id = ?;
+"""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS zerobucket_images (
@@ -109,7 +131,8 @@ RETURNING id;
 """
 
 _SELECT_FULL = """
-SELECT id, data, mime_type, original_filename, size_bytes, width, height, checksum_sha256
+SELECT id, data, mime_type, original_filename, size_bytes, width, height,
+       checksum_sha256, storage_backend, object_storage_key
 FROM zerobucket_images
 WHERE id = ?;
 """
@@ -120,7 +143,10 @@ FROM zerobucket_images
 WHERE id = ?;
 """
 
-_DELETE = "DELETE FROM zerobucket_images WHERE id = ?;"
+_DELETE_RETURNING = """
+DELETE FROM zerobucket_images WHERE id = ?
+RETURNING storage_backend, object_storage_key;
+"""
 
 _EXISTS = "SELECT 1 FROM zerobucket_images WHERE id = ?;"
 
@@ -139,8 +165,15 @@ class SQLiteBackend(StorageBackend):
     same pattern the Postgres adapter uses.
     """
 
-    def __init__(self, database_path: str, *, auto_migrate: bool = True) -> None:
+    def __init__(
+        self,
+        database_path: str,
+        *,
+        auto_migrate: bool = True,
+        object_storage: ObjectStorage | None = None,
+    ) -> None:
         self._database_path = database_path
+        self._object_storage = object_storage
         if auto_migrate:
             conn = self._connect()
             try:
@@ -277,9 +310,12 @@ class SQLiteBackend(StorageBackend):
             raise StorageError(f"Failed to retrieve image: {exc}") from exc
         if row is None:
             return None
+        data = row[1]
+        if row[8] == "object_storage":
+            data = self._fetch_tiered_bytes(row[9], image_id=image_id)
         return StoredRecord(
             id=str(row[0]),
-            data=bytes(row[1]),
+            data=bytes(data),
             mime_type=row[2],
             original_filename=row[3],
             size_bytes=row[4],
@@ -287,6 +323,18 @@ class SQLiteBackend(StorageBackend):
             height=row[6],
             checksum_sha256=row[7],
         )
+
+    def _fetch_tiered_bytes(self, object_storage_key: str, *, image_id: str) -> bytes:
+        """Shared by get()/get_many() -- identical purpose and error
+        message to PostgresBackend's own helper of the same name."""
+        if self._object_storage is None:
+            raise StorageError(
+                f"Image {image_id!r} is stored in object storage (key="
+                f"{object_storage_key!r}) but this backend was constructed "
+                "without object_storage=... -- configure it with the same "
+                "bucket/credentials used to tier this image."
+            )
+        return self._object_storage.download(object_storage_key)
 
     def get_many(
         self, image_ids: list[str], *, connection: sqlite3.Connection | None = None
@@ -304,19 +352,24 @@ class SQLiteBackend(StorageBackend):
             rows = self._run(connection, work)
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image batch: {exc}") from exc
-        return [
-            StoredRecord(
-                id=str(row[0]),
-                data=bytes(row[1]),
-                mime_type=row[2],
-                original_filename=row[3],
-                size_bytes=row[4],
-                width=row[5],
-                height=row[6],
-                checksum_sha256=row[7],
+        records = []
+        for row in rows:
+            data = row[1]
+            if row[8] == "object_storage":
+                data = self._fetch_tiered_bytes(row[9], image_id=str(row[0]))
+            records.append(
+                StoredRecord(
+                    id=str(row[0]),
+                    data=bytes(data),
+                    mime_type=row[2],
+                    original_filename=row[3],
+                    size_bytes=row[4],
+                    width=row[5],
+                    height=row[6],
+                    checksum_sha256=row[7],
+                )
             )
-            for row in rows
-        ]
+        return records
 
     def get_metadata(
         self, image_id: str, *, connection: sqlite3.Connection | None = None
@@ -348,11 +401,187 @@ class SQLiteBackend(StorageBackend):
         chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
         connection: sqlite3.Connection | None = None,
     ) -> Iterator[bytes] | None:
-        raise NotImplementedError(
-            "get_stream() is not yet implemented for SQLiteBackend -- "
-            "tracked as a follow-up phase, see adapters/sqlite.py's "
-            "module docstring. Use get() instead for now."
-        )
+        """Uses `sqlite3.Connection.blobopen()` -- a real incremental-
+        BLOB-read API, not a range-query workaround. Unlike the Postgres
+        adapter (which does one `_run()` call PER CHUNK, each its own
+        pooled connection), this holds ONE connection open for the
+        WHOLE stream -- necessary because the Blob handle is tied to
+        the connection that opened it. If `connection=None`, this method
+        opens and owns that connection itself, closing it when the
+        generator is exhausted (or garbage-collected/explicitly closed
+        without being fully consumed -- the `finally` block below covers
+        both).
+
+        Same not-found contract as the Postgres adapter's version:
+        returns None immediately if the id doesn't exist (checked
+        eagerly, before any generator is even created).
+
+        MID-STREAM CONCURRENT DELETION BEHAVES DIFFERENTLY FROM
+        POSTGRES, verified directly rather than assumed to match: on
+        Postgres, each chunk is its own round trip/query, so a row
+        deleted by another connection mid-stream causes the NEXT chunk
+        fetch to see no row and raise StorageError. On SQLite, this
+        method holds ONE connection open for the whole stream, and
+        `blobopen()`'s underlying read transaction gives it a
+        consistent snapshot (in WAL mode) of the row as it was when
+        streaming began -- a concurrent DELETE from another connection
+        does NOT interrupt or truncate an in-progress stream here; the
+        stream completes successfully with the complete original
+        bytes. Neither behavior is a bug -- they're honest consequences
+        of each database's actual isolation model, not a deliberate
+        design choice to differ, and this difference should not be
+        assumed away by code written against one backend and later
+        pointed at the other.
+
+        For a TIERED row, delegates to ObjectStorage.download_stream()
+        exactly the way the Postgres adapter's version does -- same
+        real HTTP byte-Range benefit, same requirement that this
+        backend was constructed with object_storage=... to read it back.
+        Once a row is tiered, streaming goes through S3, not SQLite, so
+        the snapshot-isolation behavior above only applies to
+        non-tiered rows.
+        """
+        owns_connection = connection is None
+        conn = connection if connection is not None else self._connect()
+        try:
+            cur = conn.execute(_SELECT_STREAM_INFO, (image_id,))
+            info_row = cur.fetchone()
+        except Exception as exc:  # noqa: BLE001
+            if owns_connection:
+                conn.close()
+            raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
+
+        if info_row is None:
+            if owns_connection:
+                conn.close()
+            return None
+
+        rowid, total_size, storage_backend, object_storage_key = info_row
+
+        if storage_backend == "object_storage":
+            if owns_connection:
+                conn.close()
+            if self._object_storage is None:
+                raise StorageError(
+                    f"Image {image_id!r} is stored in object storage (key="
+                    f"{object_storage_key!r}) but this backend was "
+                    "constructed without object_storage=... -- configure "
+                    "it with the same bucket/credentials used to tier "
+                    "this image."
+                )
+            return self._object_storage.download_stream(
+                object_storage_key, chunk_size=chunk_size
+            )
+
+        def generator() -> Iterator[bytes]:
+            try:
+                blob = conn.blobopen("zerobucket_images", "data", rowid, readonly=True)
+            except Exception as exc:  # noqa: BLE001
+                if owns_connection:
+                    conn.close()
+                raise StorageError(f"Failed to stream image: {exc}") from exc
+            try:
+                delivered = 0
+                while delivered < total_size:
+                    try:
+                        chunk = blob.read(min(chunk_size, total_size - delivered))
+                    except Exception as exc:  # noqa: BLE001
+                        raise StorageError(f"Failed to stream image: {exc}") from exc
+                    if not chunk:
+                        raise StorageError(
+                            f"Image {image_id!r} was deleted while streaming "
+                            f"(delivered {delivered} of {total_size} bytes)."
+                        )
+                    yield chunk
+                    delivered += len(chunk)
+            finally:
+                blob.close()
+                if owns_connection:
+                    conn.close()
+
+        return generator()
+
+    # ---- tier_to_object_storage ------------------------------------------
+
+    def tier_to_object_storage(
+        self, image_id: str, *, connection: sqlite3.Connection | None = None
+    ) -> bool | None:
+        """See PostgresBackend.tier_to_object_storage()'s docstring for
+        the full contract (None = not found, False = already tiered
+        no-op, True = tiered just now) -- identical return semantics.
+
+        THE ONE REAL DIFFERENCE FROM POSTGRES, stated plainly: this uses
+        `BEGIN IMMEDIATE` instead of `SELECT ... FOR UPDATE`, because
+        SQLite has no per-row locking at all. `BEGIN IMMEDIATE` acquires
+        SQLite's RESERVED lock, which blocks every OTHER write to the
+        ENTIRE database file -- not just to this one row -- for as long
+        as this transaction is open, i.e. for the full duration of the
+        object-storage upload (a real network call). On Postgres, only
+        the one row being tiered is locked; every other row is
+        unaffected. On SQLite, tiering one image blocks ALL other writes
+        to ALL images (reads are unaffected -- WAL mode allows concurrent
+        readers alongside a writer) until the upload finishes.
+
+        This is accepted as the honest cost of preserving the same
+        safety guarantee (a failed upload leaves the row completely
+        untouched, no window where bytes exist in neither location) with
+        the locking primitive SQLite actually has -- not glossed over as
+        equivalent to Postgres's behavior, because it isn't.
+
+        Requires `isolation_level=None` (autocommit mode) on the
+        connection so `BEGIN IMMEDIATE` can be issued explicitly without
+        conflicting with Python sqlite3's own implicit transaction
+        management. If `connection=None` (the common case), this method
+        opens its own connection configured that way. If you pass your
+        own `connection=`, set `conn.isolation_level = None` on it
+        yourself first, or this will raise.
+        """
+        if self._object_storage is None:
+            raise StorageError(
+                "tier_to_object_storage() requires this backend to be "
+                "constructed with object_storage=... -- see ObjectStorage "
+                "in object_storage.py."
+            )
+
+        owns_connection = connection is None
+        conn = connection
+        if owns_connection:
+            conn = sqlite3.connect(self._database_path, isolation_level=None)
+            conn.execute("PRAGMA journal_mode=WAL;")
+
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                cur = conn.execute(_SELECT_FOR_TIERING, (image_id,))
+                row = cur.fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK;")
+                    return None
+                data, mime_type, size_bytes, storage_backend = row
+                if storage_backend != "sqlite":
+                    conn.execute("ROLLBACK;")
+                    return False
+
+                key = str(image_id)
+                self._object_storage.upload(key, bytes(data), mime_type=mime_type)
+                conn.execute(
+                    _UPDATE_AFTER_TIERING,
+                    (self._object_storage.bucket, key, _now_iso(), image_id),
+                )
+                conn.execute("COMMIT;")
+                return True
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(
+                f"Failed to tier image to object storage: {exc}"
+            ) from exc
+        finally:
+            if owns_connection:
+                conn.close()
 
     # ---- delete -------------------------------------------------------------
 
@@ -360,13 +589,23 @@ class SQLiteBackend(StorageBackend):
         self, image_id: str, *, connection: sqlite3.Connection | None = None
     ) -> bool:
         def work(conn):
-            cur = conn.execute(_DELETE, (image_id,))
-            return cur.rowcount > 0
+            cur = conn.execute(_DELETE_RETURNING, (image_id,))
+            return cur.fetchone()
 
         try:
-            return self._run(connection, work)
+            row = self._run(connection, work)
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image: {exc}") from exc
+        if row is None:
+            return False
+        storage_backend, object_storage_key = row
+        if storage_backend == "object_storage" and self._object_storage is not None:
+            # Same best-effort, after-the-fact ordering as PostgresBackend's
+            # delete() -- see its docstring for the reasoning (a harmless
+            # orphaned S3 object beats a row that claims to exist but
+            # points at nothing).
+            self._object_storage.delete(object_storage_key)
+        return True
 
     def delete_many(
         self, image_ids: list[str], *, connection: sqlite3.Connection | None = None
@@ -375,17 +614,25 @@ class SQLiteBackend(StorageBackend):
             return []
         placeholders = ",".join("?" * len(image_ids))
         sql = (
-            f"DELETE FROM zerobucket_images WHERE id IN ({placeholders}) RETURNING id;"
+            f"DELETE FROM zerobucket_images WHERE id IN ({placeholders}) "
+            "RETURNING id, storage_backend, object_storage_key;"
         )
 
         def work(conn):
             cur = conn.execute(sql, image_ids)
-            return [str(row[0]) for row in cur.fetchall()]
+            return cur.fetchall()
 
         try:
-            return self._run(connection, work)
+            rows = self._run(connection, work)
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image batch: {exc}") from exc
+        deleted_ids = []
+        for row in rows:
+            image_id, storage_backend, object_storage_key = row
+            deleted_ids.append(str(image_id))
+            if storage_backend == "object_storage" and self._object_storage is not None:
+                self._object_storage.delete(object_storage_key)
+        return deleted_ids
 
     # ---- exists -------------------------------------------------------------
 
