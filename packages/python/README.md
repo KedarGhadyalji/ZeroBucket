@@ -212,6 +212,24 @@ iterate it, and a **Windows note**: psycopg3's async mode needs a
 `AsyncZeroBucket` raises a clear error telling you how to fix this if
 you hit it, instead of a confusing timeout.
 
+### SQLite support (experimental, in progress)
+
+```python
+from zerobucket import ZeroBucket, SQLiteBackend
+
+images = ZeroBucket(backend=SQLiteBackend("images.db"))
+image_id = images.put("photo.jpg")
+```
+
+Core CRUD, `get_stream()`, and `tier_to_object_storage()` work today;
+`dedup=True` and async support don't yet. Two behaviors genuinely
+differ from the Postgres adapter (not just theoretically) -- tiering
+locks the whole database file rather than one row, and `get_stream()`
+survives a concurrent delete mid-stream instead of raising, thanks to
+SQLite's WAL-mode snapshot isolation. See the
+[full explanation](https://github.com/KedarGhadyalji/ZeroBucket#sqlite-support)
+on GitHub for why, and what's still missing.
+
 ## What it validates
 
 - **Format**: JPEG, PNG, WebP built in, plus HEIC/HEIF (iPhone photos) via
