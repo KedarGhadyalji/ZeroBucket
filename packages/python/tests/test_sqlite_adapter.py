@@ -492,3 +492,186 @@ def test_connection_kwarg_shares_one_sqlite_transaction(sqlite_path, jpeg_bytes)
     # Rolled back -- should not exist via a fresh connection.
     assert zb.exists(image_id) is False
     zb.close()
+
+
+# ---- dedup mode -----------------------------------------------------------
+
+
+@pytest.fixture
+def dedup_images(sqlite_path):
+    zb = ZeroBucket(backend=SQLiteBackend(sqlite_path, dedup=True))
+    yield zb
+    zb.close()
+
+
+def test_dedup_plus_object_storage_rejected_at_construction(sqlite_path):
+    from zerobucket.object_storage import ObjectStorage
+
+    store = ObjectStorage.__new__(ObjectStorage)  # avoid needing boto3/real creds
+    with pytest.raises(ValueError, match="dedup"):
+        SQLiteBackend(sqlite_path, dedup=True, object_storage=store)
+
+
+def test_dedup_schema_created(sqlite_path):
+    SQLiteBackend(sqlite_path, dedup=True)
+    import sqlite3
+
+    conn = sqlite3.connect(sqlite_path)
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table';"
+        ).fetchall()
+    }
+    assert "zerobucket_blobs" in tables
+    assert "zerobucket_image_refs" in tables
+    conn.close()
+
+
+def test_dedup_put_identical_content_shares_one_blob(
+    dedup_images, jpeg_bytes, sqlite_path
+):
+    id_a = dedup_images.put(jpeg_bytes)
+    id_b = dedup_images.put(jpeg_bytes)
+    assert id_a != id_b
+
+    import sqlite3
+
+    conn = sqlite3.connect(sqlite_path)
+    blob_count = conn.execute("SELECT COUNT(*) FROM zerobucket_blobs;").fetchone()[0]
+    ref_count = conn.execute("SELECT ref_count FROM zerobucket_blobs;").fetchone()[0]
+    conn.close()
+    assert blob_count == 1
+    assert ref_count == 2
+
+
+def test_dedup_get_both_refs_return_correct_bytes(dedup_images, jpeg_bytes):
+    id_a = dedup_images.put(jpeg_bytes)
+    id_b = dedup_images.put(jpeg_bytes)
+    assert dedup_images.get(id_a).data == jpeg_bytes
+    assert dedup_images.get(id_b).data == jpeg_bytes
+
+
+def test_dedup_different_content_gets_different_blobs(
+    dedup_images, jpeg_bytes, png_bytes, sqlite_path
+):
+    dedup_images.put(jpeg_bytes)
+    dedup_images.put(png_bytes)
+    import sqlite3
+
+    conn = sqlite3.connect(sqlite_path)
+    blob_count = conn.execute("SELECT COUNT(*) FROM zerobucket_blobs;").fetchone()[0]
+    conn.close()
+    assert blob_count == 2
+
+
+def test_dedup_delete_one_ref_other_survives(dedup_images, jpeg_bytes):
+    id_a = dedup_images.put(jpeg_bytes)
+    id_b = dedup_images.put(jpeg_bytes)
+
+    assert dedup_images.delete(id_a) is True
+    assert dedup_images.exists(id_a) is False
+    assert dedup_images.exists(id_b) is True
+    assert dedup_images.get(id_b).data == jpeg_bytes
+
+
+def test_dedup_deleting_last_ref_removes_blob(dedup_images, jpeg_bytes, sqlite_path):
+    id_a = dedup_images.put(jpeg_bytes)
+    dedup_images.delete(id_a)
+
+    import sqlite3
+
+    conn = sqlite3.connect(sqlite_path)
+    blob_count = conn.execute("SELECT COUNT(*) FROM zerobucket_blobs;").fetchone()[0]
+    conn.close()
+    assert blob_count == 0
+
+
+def test_dedup_delete_missing_id_returns_false(dedup_images):
+    assert dedup_images.delete("00000000-0000-0000-0000-000000000000") is False
+
+
+def test_dedup_put_many_repeated_content_accumulates_ref_count(
+    dedup_images, jpeg_bytes, sqlite_path
+):
+    """Verifies the within-one-batch ref_count accumulation claim
+    directly -- not just that put_many() succeeds, but that the
+    resulting ref_count is exactly 3, not 1, matching the same
+    guarantee the Postgres adapter verified empirically for its own
+    executemany-based implementation."""
+    results = dedup_images.put_many([jpeg_bytes, jpeg_bytes, jpeg_bytes])
+    assert all(r.success for r in results)
+    ids = [r.image_id for r in results]
+    assert len(set(ids)) == 3  # three distinct ids
+
+    import sqlite3
+
+    conn = sqlite3.connect(sqlite_path)
+    ref_count = conn.execute("SELECT ref_count FROM zerobucket_blobs;").fetchone()[0]
+    conn.close()
+    assert ref_count == 3
+
+
+def test_dedup_delete_many_decrements_correctly_for_shared_checksum(
+    dedup_images, jpeg_bytes, sqlite_path
+):
+    """Confirms delete_many()'s Counter-based decrement handles multiple
+    ids sharing one checksum within a single call correctly, not just
+    one-at-a-time delete()."""
+    ids = [
+        r.image_id for r in dedup_images.put_many([jpeg_bytes, jpeg_bytes, jpeg_bytes])
+    ]
+
+    results = dedup_images.delete_many(ids[:2])  # delete 2 of 3 refs
+    assert all(r.deleted for r in results)
+
+    import sqlite3
+
+    conn = sqlite3.connect(sqlite_path)
+    ref_count = conn.execute("SELECT ref_count FROM zerobucket_blobs;").fetchone()[0]
+    conn.close()
+    assert ref_count == 1
+    assert dedup_images.exists(ids[2]) is True
+
+
+def test_dedup_get_many_mixed(dedup_images, jpeg_bytes):
+    id_a = dedup_images.put(jpeg_bytes)
+    results = dedup_images.get_many([id_a, "00000000-0000-0000-0000-000000000000"])
+    by_id = {r.image_id: r for r in results}
+    assert by_id[id_a].success
+    assert not by_id["00000000-0000-0000-0000-000000000000"].success
+
+
+def test_dedup_get_stream(dedup_images):
+    data = _bigger_jpeg_bytes()
+    image_id = dedup_images.put(data)
+    chunks = list(dedup_images.get_stream(image_id, chunk_size=1000))
+    assert b"".join(chunks) == data
+
+
+def test_dedup_get_stream_two_refs_same_blob_both_correct(dedup_images):
+    """Two ids referencing the SAME blob must each stream their own
+    full, correct content -- streaming shouldn't confuse state between
+    refs sharing one underlying blob."""
+    data = _bigger_jpeg_bytes()
+    id_a = dedup_images.put(data)
+    id_b = dedup_images.put(data)
+    assert b"".join(dedup_images.get_stream(id_a, chunk_size=333)) == data
+    assert b"".join(dedup_images.get_stream(id_b, chunk_size=333)) == data
+
+
+def test_dedup_metadata(dedup_images, jpeg_bytes):
+    image_id = dedup_images.put(jpeg_bytes)
+    meta = dedup_images.metadata(image_id)
+    assert meta.size_bytes == len(jpeg_bytes)
+
+
+def test_dedup_before_get_hook_still_works(sqlite_path, jpeg_bytes):
+    zb = ZeroBucket(
+        backend=SQLiteBackend(sqlite_path, dedup=True),
+        before_get=lambda image_id, context: False,
+    )
+    image_id = zb.put(jpeg_bytes)
+    with pytest.raises(AccessDeniedError):
+        zb.get(image_id)
+    zb.close()

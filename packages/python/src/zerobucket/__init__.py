@@ -37,7 +37,7 @@ from .types import (
     ImageMetadata,
 )
 
-__version__ = "0.16.0"
+__version__ = "0.18.0"
 
 __all__ = [
     "ZeroBucket",

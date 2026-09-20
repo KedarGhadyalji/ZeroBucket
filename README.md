@@ -342,15 +342,25 @@ image_id = images.put("photo.jpg")
 image = images.get(image_id)
 ```
 
-What works today (as of 0.17.0): `put`/`put_many`/`get`/`get_many`/
+What works today (as of 0.18.0): `put`/`put_many`/`get`/`get_many`/
 `metadata`/`delete`/`delete_many`/`exists`, `get_stream()`/`stream_to()`,
 `tier_to_object_storage()` (pass `object_storage=` to `SQLiteBackend`
-the same way you would to `PostgresBackend`), and the `before_get`/
-`before_put` access-control hooks (which live entirely in the client
-layer and work identically regardless of backend).
+the same way you would to `PostgresBackend`), `dedup=True`
+(content-addressed storage with reference counting, same schema shape
+and behavior as the Postgres adapter's dedup mode -- see
+[Deduplication](#deduplication)), and the `before_get`/`before_put`
+access-control hooks (which live entirely in the client layer and work
+identically regardless of backend).
 
-**Not yet implemented:** `dedup=True`, async support (`aiosqlite`), and
-the `on_operation`/retry-backoff machinery `PostgresBackend` has.
+```python
+images = ZeroBucket(backend=SQLiteBackend("images.db", dedup=True))
+```
+
+**Not yet implemented:** async support (`aiosqlite`), and the
+`on_operation`/retry-backoff machinery `PostgresBackend` has.
+`dedup=True` combined with `object_storage=` raises `ValueError` at
+construction -- same restriction as the Postgres adapter; combining
+content-addressed storage with tiering is out of scope for both.
 
 Two real, verified differences from the Postgres adapter, not just
 theoretical ones -- worth knowing before you rely on identical behavior
@@ -949,7 +959,7 @@ Not yet built, tracked honestly rather than implied:
 - [x] Optional HEIC/HEIF support (`pip install zerobucket[heic]`)
 - [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)
 - [x] Deduplication with reference counting (opt-in, `dedup=True`)
-- [ ] SQLite and MySQL adapters (in progress -- `SQLiteBackend` now supports classic-mode core CRUD + `get_stream()` + `tier_to_object_storage()` as of 0.17.0, see [SQLite support](#sqlite-support); dedup mode and async support for SQLite, and MySQL entirely, still to come)
+- [ ] SQLite and MySQL adapters (in progress -- `SQLiteBackend` now supports classic-mode core CRUD + `get_stream()` + `tier_to_object_storage()` + `dedup=True` as of 0.18.0, see [SQLite support](#sqlite-support); async support for SQLite, and MySQL entirely, still to come)
 - [x] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`, `zerobucket verify`)
 - [x] Optional object-storage backend for files that outgrow the database tier (`tier_to_object_storage()`, S3-compatible via `boto3` -- see [Object-storage tiering](#object-storage-tiering))
 - [x] Async client support (`AsyncZeroBucket`, via psycopg3's native async mode -- see [Async support](#async-support) for why this isn't literally the `asyncpg` package despite the name here historically)

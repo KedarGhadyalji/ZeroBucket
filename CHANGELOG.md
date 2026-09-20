@@ -6,6 +6,65 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## [0.18.0] - 2026-09-17
+
+### Added -- SQLite dedup mode, closing the last SQLite gap besides async support
+
+- `SQLiteBackend(dedup=True)` -- content-addressed storage with
+  reference counting, mirroring `PostgresBackend`'s dedup schema and
+  behavior exactly in shape: separate `zerobucket_blobs`/
+  `zerobucket_image_refs` tables, a checksum-keyed blob shared by many
+  ids, `ref_count` incremented on each new reference and decremented on
+  delete, the blob itself removed once `ref_count` hits zero.
+- Every existing SQLite operation (`put`, `put_many`, `get`, `get_many`,
+  `get_metadata`, `get_stream`, `delete`, `delete_many`, `exists`) now
+  branches correctly between classic and dedup mode -- not a separate
+  parallel implementation bolted on, the same methods handle both.
+- Same restriction as `PostgresBackend`: `dedup=True` combined with
+  `object_storage=` raises `ValueError` immediately at construction.
+  Combining content-addressed storage (one blob, many ids) with tiering
+  (a specific blob's bytes living in one place or the other) remains
+  out of scope for both adapters, not just Postgres.
+
+### What's still explicitly not done for SQLite
+
+Async support (`aiosqlite`) and the `on_operation`/retry-backoff
+machinery `PostgresBackend` has. Tracked in the module's own docstring.
+MySQL: still nothing built.
+
+### Verified guarantees, not just implemented -- confirmed with real assertions, not only "it runs without error"
+
+- **Within-one-batch ref-count accumulation.** Three identical images in
+  one `put_many()` call produce `ref_count == 3` on the shared blob, not
+  `1` -- checked directly against the database, the same specific claim
+  the Postgres adapter's own dedup implementation verified empirically
+  for its `executemany()`-based version.
+- **Correct decrement for `delete_many()` across ids sharing one
+  checksum.** Deleting 2 of 3 refs to the same blob in a single
+  `delete_many()` call leaves `ref_count == 1`, not silently wrong from
+  only decrementing once per distinct checksum in the batch.
+- **Blob cleanup exactly at zero, not before or after.** Confirmed the
+  underlying blob row is actually gone from `zerobucket_blobs` after
+  the last referencing id is deleted, and confirmed a shared blob
+  survives when only one of its two referencing ids is deleted.
+- **Streaming a dedup'd blob through two different ids sharing it both
+  deliver correct, independent, full content** -- not just that dedup
+  streaming works once.
+
+### Files delivered
+
+- Changed: `adapters/sqlite.py` (dedup schema, all dedup query
+  constants, `dedup=True` constructor param plus the
+  `dedup`+`object_storage` construction guard, every CRUD/streaming
+  method updated to branch on `self._dedup`), `tests/test_sqlite_adapter.py`
+  (15 new dedup tests), `pyproject.toml` (version only)
+
+283/283 tests pass (15 new), lint clean. Manually smoke-tested against
+a real SQLite file before writing the formal suite (put/get/metadata/
+exists/stream, partial-ref deletion, batch operations, blob cleanup at
+zero) -- same "prove it works by hand first, then encode that proof as
+a test" approach used throughout this project.
+
 ## [0.17.0] - 2026-09-17
 
 ### Added -- PHASE 2 OF 4, STILL NOT A COMPLETE FEATURE

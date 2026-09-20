@@ -221,12 +221,12 @@ images = ZeroBucket(backend=SQLiteBackend("images.db"))
 image_id = images.put("photo.jpg")
 ```
 
-Core CRUD, `get_stream()`, and `tier_to_object_storage()` work today;
-`dedup=True` and async support don't yet. Two behaviors genuinely
-differ from the Postgres adapter (not just theoretically) -- tiering
-locks the whole database file rather than one row, and `get_stream()`
-survives a concurrent delete mid-stream instead of raising, thanks to
-SQLite's WAL-mode snapshot isolation. See the
+Core CRUD, `get_stream()`, `tier_to_object_storage()`, and
+`dedup=True` all work today; async support doesn't yet. Two behaviors
+genuinely differ from the Postgres adapter (not just theoretically) --
+tiering locks the whole database file rather than one row, and
+`get_stream()` survives a concurrent delete mid-stream instead of
+raising, thanks to SQLite's WAL-mode snapshot isolation. See the
 [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#sqlite-support)
 on GitHub for why, and what's still missing.
 
