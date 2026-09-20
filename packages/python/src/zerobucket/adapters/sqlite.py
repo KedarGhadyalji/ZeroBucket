@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from collections import Counter
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
@@ -122,6 +123,89 @@ CREATE INDEX IF NOT EXISTS idx_zerobucket_created_at ON zerobucket_images (creat
 # later phase (see module docstring) -- the columns exist now, the
 # feature using them doesn't yet.
 
+# Dedup mode: separate blobs/refs tables, mirroring the Postgres
+# adapter's dedup schema exactly in shape (see postgres.py's
+# _DEDUP_SCHEMA) -- content-addressed storage where one blob can be
+# shared by many ids via ref-counting. NO tiering columns here: dedup
+# mode does not support object-storage tiering in this adapter, same
+# restriction as PostgresBackend (rejected at construction below, not
+# discovered later as a confusing runtime failure).
+_DEDUP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS zerobucket_blobs (
+    checksum_sha256     TEXT PRIMARY KEY,
+    data                BLOB NOT NULL,
+    mime_type           TEXT NOT NULL,
+    size_bytes          INTEGER NOT NULL,
+    width               INTEGER,
+    height              INTEGER,
+    ref_count           INTEGER NOT NULL DEFAULT 0,
+    created_at          TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS zerobucket_image_refs (
+    id                  TEXT PRIMARY KEY,
+    checksum_sha256     TEXT NOT NULL REFERENCES zerobucket_blobs(checksum_sha256),
+    original_filename   TEXT,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_zerobucket_image_refs_checksum
+    ON zerobucket_image_refs (checksum_sha256);
+CREATE INDEX IF NOT EXISTS idx_zerobucket_image_refs_created_at
+    ON zerobucket_image_refs (created_at);
+"""
+
+# SQLite's UPSERT syntax (ON CONFLICT ... DO UPDATE, available since
+# 3.24) -- the unqualified `ref_count` on the SET side refers to the
+# existing row being updated, same semantics as Postgres's
+# `zerobucket_blobs.ref_count + 1` form, just without needing the
+# table-qualifier SQLite doesn't require here.
+_DEDUP_UPSERT_BLOB = """
+INSERT INTO zerobucket_blobs
+    (checksum_sha256, data, mime_type, size_bytes, width, height, ref_count, created_at)
+VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+ON CONFLICT (checksum_sha256) DO UPDATE SET ref_count = ref_count + 1;
+"""
+
+_DEDUP_INSERT_REF = """
+INSERT INTO zerobucket_image_refs (id, checksum_sha256, original_filename, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?)
+RETURNING id;
+"""
+
+_DEDUP_SELECT_FULL = """
+SELECT r.id, b.data, b.mime_type, r.original_filename, b.size_bytes,
+       b.width, b.height, r.checksum_sha256
+FROM zerobucket_image_refs r
+JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256
+WHERE r.id = ?;
+"""
+
+_DEDUP_SELECT_METADATA = """
+SELECT r.id, b.mime_type, r.original_filename, b.size_bytes, b.width, b.height, r.checksum_sha256
+FROM zerobucket_image_refs r
+JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256
+WHERE r.id = ?;
+"""
+
+_DEDUP_STREAM_INFO = """
+SELECT b.rowid, b.size_bytes
+FROM zerobucket_image_refs r
+JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256
+WHERE r.id = ?;
+"""
+
+_DEDUP_EXISTS = "SELECT 1 FROM zerobucket_image_refs WHERE id = ?;"
+
+_DEDUP_DELETE_REF = (
+    "DELETE FROM zerobucket_image_refs WHERE id = ? RETURNING checksum_sha256;"
+)
+
+_DEDUP_DECREMENT_BLOB = """
+UPDATE zerobucket_blobs SET ref_count = ref_count - ?
+WHERE checksum_sha256 = ?
+RETURNING ref_count;
+"""
+
 _INSERT = """
 INSERT INTO zerobucket_images
     (id, data, mime_type, original_filename, size_bytes, width, height,
@@ -170,14 +254,23 @@ class SQLiteBackend(StorageBackend):
         database_path: str,
         *,
         auto_migrate: bool = True,
+        dedup: bool = False,
         object_storage: ObjectStorage | None = None,
     ) -> None:
+        if object_storage is not None and dedup:
+            raise ValueError(
+                "object_storage= is not supported together with dedup=True "
+                "in this adapter -- same restriction as PostgresBackend, "
+                "see this module's docstring."
+            )
         self._database_path = database_path
+        self._dedup = dedup
         self._object_storage = object_storage
         if auto_migrate:
+            schema = _DEDUP_SCHEMA if dedup else _SCHEMA
             conn = self._connect()
             try:
-                conn.executescript(_SCHEMA)
+                conn.executescript(schema)
                 conn.commit()
             except Exception as exc:  # noqa: BLE001
                 raise StorageError(f"Migration failed: {exc}") from exc
@@ -222,6 +315,18 @@ class SQLiteBackend(StorageBackend):
         checksum_sha256: str,
         connection: sqlite3.Connection | None = None,
     ) -> str:
+        if self._dedup:
+            return self._put_dedup(
+                data=data,
+                mime_type=mime_type,
+                original_filename=original_filename,
+                size_bytes=size_bytes,
+                width=width,
+                height=height,
+                checksum_sha256=checksum_sha256,
+                connection=connection,
+            )
+
         image_id = str(uuid.uuid4())
         now = _now_iso()
 
@@ -251,6 +356,40 @@ class SQLiteBackend(StorageBackend):
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to store image: {exc}") from exc
 
+    def _put_dedup(
+        self,
+        *,
+        data: bytes,
+        mime_type: str,
+        original_filename: str | None,
+        size_bytes: int,
+        width: int | None,
+        height: int | None,
+        checksum_sha256: str,
+        connection: sqlite3.Connection | None,
+    ) -> str:
+        image_id = str(uuid.uuid4())
+        now = _now_iso()
+
+        def work(conn):
+            conn.execute(
+                _DEDUP_UPSERT_BLOB,
+                (checksum_sha256, data, mime_type, size_bytes, width, height, now),
+            )
+            cur = conn.execute(
+                _DEDUP_INSERT_REF,
+                (image_id, checksum_sha256, original_filename, now, now),
+            )
+            row = cur.fetchone()
+            return str(row[0])
+
+        try:
+            return self._run(connection, work)
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to store image: {exc}") from exc
+
     def put_many(
         self, rows: list[dict], *, connection: sqlite3.Connection | None = None
     ) -> list[str]:
@@ -264,6 +403,10 @@ class SQLiteBackend(StorageBackend):
         write/fsync cycle for the whole batch, not one per row."""
         if not rows:
             return []
+
+        if self._dedup:
+            return self._put_many_dedup(rows, connection=connection)
+
         now = _now_iso()
         prepared = [(str(uuid.uuid4()), row) for row in rows]
 
@@ -295,13 +438,64 @@ class SQLiteBackend(StorageBackend):
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to store image batch: {exc}") from exc
 
+    def _put_many_dedup(
+        self, rows: list[dict], *, connection: sqlite3.Connection | None
+    ) -> list[str]:
+        """Repeated identical checksums within one batch correctly
+        accumulate ref_count -- each row's upsert is a separate,
+        sequential statement execution within the same transaction, so
+        it sees the prior row's effect, same as the Postgres adapter's
+        equivalent (verified there empirically; the underlying mechanism
+        -- sequential statements within one transaction -- is identical
+        here, so this inherits that guarantee rather than needing to
+        re-derive it from scratch)."""
+        now = _now_iso()
+        prepared = [(str(uuid.uuid4()), row) for row in rows]
+
+        def work(conn):
+            ids = []
+            for image_id, row in prepared:
+                conn.execute(
+                    _DEDUP_UPSERT_BLOB,
+                    (
+                        row["checksum_sha256"],
+                        row["data"],
+                        row["mime_type"],
+                        row["size_bytes"],
+                        row["width"],
+                        row["height"],
+                        now,
+                    ),
+                )
+                cur = conn.execute(
+                    _DEDUP_INSERT_REF,
+                    (
+                        image_id,
+                        row["checksum_sha256"],
+                        row["original_filename"],
+                        now,
+                        now,
+                    ),
+                )
+                ids.append(str(cur.fetchone()[0]))
+            return ids
+
+        try:
+            return self._run(connection, work)
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to store image batch: {exc}") from exc
+
     # ---- get --------------------------------------------------------------
 
     def get(
         self, image_id: str, *, connection: sqlite3.Connection | None = None
     ) -> StoredRecord | None:
+        select_sql = _DEDUP_SELECT_FULL if self._dedup else _SELECT_FULL
+
         def work(conn):
-            cur = conn.execute(_SELECT_FULL, (image_id,))
+            cur = conn.execute(select_sql, (image_id,))
             return cur.fetchone()
 
         try:
@@ -311,7 +505,7 @@ class SQLiteBackend(StorageBackend):
         if row is None:
             return None
         data = row[1]
-        if row[8] == "object_storage":
+        if not self._dedup and row[8] == "object_storage":
             data = self._fetch_tiered_bytes(row[9], image_id=image_id)
         return StoredRecord(
             id=str(row[0]),
@@ -326,7 +520,9 @@ class SQLiteBackend(StorageBackend):
 
     def _fetch_tiered_bytes(self, object_storage_key: str, *, image_id: str) -> bytes:
         """Shared by get()/get_many() -- identical purpose and error
-        message to PostgresBackend's own helper of the same name."""
+        message to PostgresBackend's own helper of the same name. Only
+        ever called in classic mode -- dedup mode can never have a
+        tiered row (rejected at construction)."""
         if self._object_storage is None:
             raise StorageError(
                 f"Image {image_id!r} is stored in object storage (key="
@@ -342,7 +538,12 @@ class SQLiteBackend(StorageBackend):
         if not image_ids:
             return []
         placeholders = ",".join("?" * len(image_ids))
-        sql = _SELECT_FULL.replace("WHERE id = ?", f"WHERE id IN ({placeholders})")
+        if self._dedup:
+            sql = _DEDUP_SELECT_FULL.replace(
+                "WHERE r.id = ?", f"WHERE r.id IN ({placeholders})"
+            )
+        else:
+            sql = _SELECT_FULL.replace("WHERE id = ?", f"WHERE id IN ({placeholders})")
 
         def work(conn):
             cur = conn.execute(sql, image_ids)
@@ -355,7 +556,7 @@ class SQLiteBackend(StorageBackend):
         records = []
         for row in rows:
             data = row[1]
-            if row[8] == "object_storage":
+            if not self._dedup and row[8] == "object_storage":
                 data = self._fetch_tiered_bytes(row[9], image_id=str(row[0]))
             records.append(
                 StoredRecord(
@@ -374,8 +575,10 @@ class SQLiteBackend(StorageBackend):
     def get_metadata(
         self, image_id: str, *, connection: sqlite3.Connection | None = None
     ) -> StoredRecordMetadata | None:
+        select_sql = _DEDUP_SELECT_METADATA if self._dedup else _SELECT_METADATA
+
         def work(conn):
-            cur = conn.execute(_SELECT_METADATA, (image_id,))
+            cur = conn.execute(select_sql, (image_id,))
             return cur.fetchone()
 
         try:
@@ -443,39 +646,56 @@ class SQLiteBackend(StorageBackend):
         """
         owns_connection = connection is None
         conn = connection if connection is not None else self._connect()
-        try:
-            cur = conn.execute(_SELECT_STREAM_INFO, (image_id,))
-            info_row = cur.fetchone()
-        except Exception as exc:  # noqa: BLE001
-            if owns_connection:
-                conn.close()
-            raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
 
-        if info_row is None:
-            if owns_connection:
-                conn.close()
-            return None
+        if self._dedup:
+            try:
+                cur = conn.execute(_DEDUP_STREAM_INFO, (image_id,))
+                dedup_row = cur.fetchone()
+            except Exception as exc:  # noqa: BLE001
+                if owns_connection:
+                    conn.close()
+                raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
+            if dedup_row is None:
+                if owns_connection:
+                    conn.close()
+                return None
+            rowid, total_size = dedup_row
+            table = "zerobucket_blobs"
+        else:
+            try:
+                cur = conn.execute(_SELECT_STREAM_INFO, (image_id,))
+                info_row = cur.fetchone()
+            except Exception as exc:  # noqa: BLE001
+                if owns_connection:
+                    conn.close()
+                raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
 
-        rowid, total_size, storage_backend, object_storage_key = info_row
+            if info_row is None:
+                if owns_connection:
+                    conn.close()
+                return None
 
-        if storage_backend == "object_storage":
-            if owns_connection:
-                conn.close()
-            if self._object_storage is None:
-                raise StorageError(
-                    f"Image {image_id!r} is stored in object storage (key="
-                    f"{object_storage_key!r}) but this backend was "
-                    "constructed without object_storage=... -- configure "
-                    "it with the same bucket/credentials used to tier "
-                    "this image."
+            rowid, total_size, storage_backend, object_storage_key = info_row
+
+            if storage_backend == "object_storage":
+                if owns_connection:
+                    conn.close()
+                if self._object_storage is None:
+                    raise StorageError(
+                        f"Image {image_id!r} is stored in object storage (key="
+                        f"{object_storage_key!r}) but this backend was "
+                        "constructed without object_storage=... -- configure "
+                        "it with the same bucket/credentials used to tier "
+                        "this image."
+                    )
+                return self._object_storage.download_stream(
+                    object_storage_key, chunk_size=chunk_size
                 )
-            return self._object_storage.download_stream(
-                object_storage_key, chunk_size=chunk_size
-            )
+            table = "zerobucket_images"
 
         def generator() -> Iterator[bytes]:
             try:
-                blob = conn.blobopen("zerobucket_images", "data", rowid, readonly=True)
+                blob = conn.blobopen(table, "data", rowid, readonly=True)
             except Exception as exc:  # noqa: BLE001
                 if owns_connection:
                     conn.close()
@@ -588,6 +808,9 @@ class SQLiteBackend(StorageBackend):
     def delete(
         self, image_id: str, *, connection: sqlite3.Connection | None = None
     ) -> bool:
+        if self._dedup:
+            return self._delete_dedup(image_id, connection=connection)
+
         def work(conn):
             cur = conn.execute(_DELETE_RETURNING, (image_id,))
             return cur.fetchone()
@@ -607,11 +830,38 @@ class SQLiteBackend(StorageBackend):
             self._object_storage.delete(object_storage_key)
         return True
 
+    def _delete_dedup(
+        self, image_id: str, *, connection: sqlite3.Connection | None
+    ) -> bool:
+        def work(conn):
+            cur = conn.execute(_DEDUP_DELETE_REF, (image_id,))
+            row = cur.fetchone()
+            if row is None:
+                return False  # id didn't exist -- nothing to decrement either
+            checksum = row[0]
+            cur = conn.execute(_DEDUP_DECREMENT_BLOB, (1, checksum))
+            new_ref_count = cur.fetchone()[0]
+            if new_ref_count <= 0:
+                conn.execute(
+                    "DELETE FROM zerobucket_blobs WHERE checksum_sha256 = ? AND ref_count <= 0;",
+                    (checksum,),
+                )
+            return True
+
+        try:
+            return self._run(connection, work)
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to delete image: {exc}") from exc
+
     def delete_many(
         self, image_ids: list[str], *, connection: sqlite3.Connection | None = None
     ) -> list[str]:
         if not image_ids:
             return []
+
+        if self._dedup:
+            return self._delete_many_dedup(image_ids, connection=connection)
+
         placeholders = ",".join("?" * len(image_ids))
         sql = (
             f"DELETE FROM zerobucket_images WHERE id IN ({placeholders}) "
@@ -634,13 +884,59 @@ class SQLiteBackend(StorageBackend):
                 self._object_storage.delete(object_storage_key)
         return deleted_ids
 
+    def _delete_many_dedup(
+        self, image_ids: list[str], *, connection: sqlite3.Connection | None
+    ) -> list[str]:
+        """Multiple deleted refs can share the same checksum (two ids
+        both pointing at the same de-duplicated blob) -- counts
+        occurrences per checksum so each blob's ref_count is decremented
+        by the correct total, not by 1 per distinct checksum. Same
+        reasoning as PostgresBackend's equivalent."""
+        placeholders = ",".join("?" * len(image_ids))
+
+        def work(conn):
+            cur = conn.execute(
+                f"DELETE FROM zerobucket_image_refs WHERE id IN ({placeholders}) "
+                "RETURNING id, checksum_sha256;",
+                image_ids,
+            )
+            deleted_rows = cur.fetchall()
+            if not deleted_rows:
+                return []
+
+            deleted_ids = [str(row[0]) for row in deleted_rows]
+            checksum_counts = Counter(row[1] for row in deleted_rows)
+
+            empty_checksums = []
+            for checksum, count in checksum_counts.items():
+                cur = conn.execute(_DEDUP_DECREMENT_BLOB, (count, checksum))
+                new_ref_count = cur.fetchone()[0]
+                if new_ref_count <= 0:
+                    empty_checksums.append(checksum)
+
+            if empty_checksums:
+                empty_placeholders = ",".join("?" * len(empty_checksums))
+                conn.execute(
+                    f"DELETE FROM zerobucket_blobs WHERE checksum_sha256 IN "
+                    f"({empty_placeholders}) AND ref_count <= 0;",
+                    empty_checksums,
+                )
+            return deleted_ids
+
+        try:
+            return self._run(connection, work)
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to delete image batch: {exc}") from exc
+
     # ---- exists -------------------------------------------------------------
 
     def exists(
         self, image_id: str, *, connection: sqlite3.Connection | None = None
     ) -> bool:
+        exists_sql = _DEDUP_EXISTS if self._dedup else _EXISTS
+
         def work(conn):
-            cur = conn.execute(_EXISTS, (image_id,))
+            cur = conn.execute(exists_sql, (image_id,))
             return cur.fetchone() is not None
 
         try:
