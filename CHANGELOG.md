@@ -6,6 +6,142 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## [0.19.0] - 2026-09-17
+
+### Fixed -- before this reached anyone, caught on TWO real Windows test runs, not one
+
+- Both `SQLiteBackend` and `AsyncSQLiteBackend` now set an explicit
+  SQLite busy timeout (10s, at two layers: `timeout=` on connect plus
+  an explicit `PRAGMA busy_timeout`) on every connection they open, AND
+  set WAL mode (`PRAGMA journal_mode=WAL`) exactly ONCE per backend
+  instance rather than on every connection.
+- **This took two attempts to actually fix, not one -- both attempts
+  driven by real Windows test runs, not assumed correct from reasoning
+  alone.** `test_concurrent_first_calls_only_migrate_once` (20
+  concurrent connections against a fresh SQLite file) failed on
+  Windows with `sqlite3.OperationalError: database is locked`. Neither
+  failure reproduced in this project's own Linux-based development
+  sandbox -- exactly why testing on the platform it'll actually run on
+  matters, the same lesson as v0.13.0's Windows event-loop issue.
+  - **First attempt**: added the busy-timeout settings above. This was
+    a real, worthwhile fix on its own (Python's `sqlite3` already
+    defaults `timeout=` to 5.0s, but that was an implicit, unexamined
+    default rather than an explicit, generous, documented one) -- but
+    it was NOT sufficient. A second Windows run showed the identical
+    failure, and the overall suite ran noticeably slower (114s -> 169s)
+    -- the tell that connections were now waiting out most of the
+    timeout and still failing, not failing instantly, which pointed at
+    a deeper problem the timeout alone couldn't paper over.
+  - **Second, actual fix**: the traceback showed the failure happening
+    specifically on `PRAGMA journal_mode=WAL` -- a pragma that was
+    being re-issued on EVERY connection, when WAL mode is actually a
+    durable, file-level setting that only needs to be set once, ever.
+    20 connections all racing to perform that conversion simultaneously
+    against a brand-new file is a far worse contention pattern than
+    ordinary reads/writes, and no amount of busy-timeout patience
+    reliably resolves a race in the conversion itself. Moved WAL-mode
+    setup to run exactly once per backend instance (inside the same
+    lock-guarded readiness/migration step that already existed for
+    async, and behind a one-time flag for sync), and removed it
+    entirely from the per-operation `_connect()` path in both adapters
+    and from `tier_to_object_storage()`'s standalone connection.
+- Verified in this sandbox: full suite green, 10 repeated runs of the
+  previously-flaky test, and a harsher synthetic stress test (50
+  concurrent connections x 10 cycles = 500 total) against a fresh file
+  each time, all clean -- plus a direct check that `tier_to_object_storage()`
+  still sets WAL mode correctly even when it's the very first operation
+  ever performed on an instance (`auto_migrate=False`). None of this
+  proves the Windows fix works -- only a third Windows run does -- but
+  it does confirm the fix introduces no regressions and the "set once"
+  logic itself is correct.
+
+### Added -- closes the last SQLite gap: async support
+
+- `AsyncSQLiteBackend` (`adapters/sqlite_async.py`), built on
+  `aiosqlite`. SQLite now has both a sync and an async backend, same as
+  Postgres.
+- `aiosqlite` added as a new optional extra (`pip install
+zerobucket[sqlite-async]`), NOT a hard dependency -- the import is
+  deferred into `AsyncSQLiteBackend.__init__` the same way boto3's is
+  deferred in `ObjectStorage.__init__`. Verified directly: plain
+  `import zerobucket` (and the export of `AsyncSQLiteBackend` itself)
+  works with `aiosqlite` completely absent; only actually
+  _constructing_ an `AsyncSQLiteBackend` requires it, and does so with
+  a clear `ImportError` (install instructions included) rather than a
+  raw traceback.
+
+### Scope: matches AsyncPostgresBackend's scope exactly, not by accident
+
+Core CRUD + streaming, classic mode only -- no `dedup=True`, no
+`tier_to_object_storage()`, no `on_operation`/retry machinery. This was
+a deliberate choice to keep the two async adapters consistent with each
+other, rather than let SQLite's async support drift wider than
+Postgres's (which was itself deliberately scoped narrower than sync
+SQLite/Postgres back in v0.13.0).
+
+### A real, verified driver constraint that shaped this file's design
+
+`aiosqlite.Connection` does not expose `blobopen()` at all -- confirmed
+by inspecting its actual method list directly, not assumed absent
+because it seemed plausible. Sync `SQLiteBackend.get_stream()` is built
+entirely on `blobopen()`'s incremental-BLOB-I/O API; that approach was
+simply unavailable here. `AsyncSQLiteBackend.get_stream()` instead uses
+SQLite's `substr()` function in repeated ranged queries -- the same
+strategy `AsyncPostgresBackend.get_stream()` already uses via
+Postgres's `substring()` -- verified to behave correctly (1-indexed,
+clamps at the value's actual end) before relying on it.
+
+### A real, verified consequence of that constraint: three backends, two different behaviors for one scenario
+
+This is the one worth understanding before assuming SQLite's two
+backends behave identically to each other: sync `SQLiteBackend.get_stream()`
+holds one connection/blob handle open for the whole stream and, thanks
+to WAL-mode snapshot isolation, SURVIVES a concurrent delete mid-stream
+(see v0.17.0's entry). `AsyncSQLiteBackend.get_stream()` issues a
+SEPARATE query per chunk instead (no `blobopen()` to hold a snapshot
+open with), so a concurrent delete mid-stream IS observed and DOES
+raise `StorageError` -- matching `AsyncPostgresBackend`'s behavior, not
+sync `SQLiteBackend`'s. Confirmed directly with a dedicated test for
+each backend rather than assumed consistent just because both happen to
+be "SQLite."
+
+### A real bug caught by actually running it, not assumed away
+
+`put_many()`'s per-row `INSERT ... RETURNING` statements need their
+result explicitly drained (`await cur.fetchone()`) before the
+transaction can commit under `aiosqlite` -- omitting that raised
+`cannot commit transaction - SQL statements in progress`. The SYNC
+`sqlite3` driver does not enforce this the same way (the sync adapter's
+own `put_many()` never fetches the RETURNING result and works fine) --
+a genuine, verified difference in driver behavior, not a copy-paste
+mistake carried over from the sync version. Found immediately by
+running a real smoke test against a real file before writing any formal
+tests, exactly the failure mode this project's "prove it by hand first"
+habit exists to catch.
+
+### Files delivered
+
+- New: `adapters/sqlite_async.py`, `tests/test_sqlite_async_adapter.py`
+  (16 new tests)
+- Changed: `__init__.py` (export `AsyncSQLiteBackend`),
+  `pyproject.toml` (version, new `sqlite-async` optional extra,
+  `aiosqlite` added to dev dependencies)
+
+299/299 tests pass (16 new), lint clean, mypy shows only the same
+pre-existing categories of findings every other adapter file in this
+project already carries (confirmed directly against `sqlite.py` itself
+for comparison, not assumed). Manually smoke-tested against a real
+SQLite file before writing the formal suite -- full CRUD, streaming,
+batch operations, the concurrent-delete-mid-stream behavior difference,
+and concurrent first-call migration safety, the same "prove it by hand,
+then encode the proof as a test" approach used throughout this project.
+
+With this release, `SQLiteBackend`/`AsyncSQLiteBackend` are at real
+feature parity with `PostgresBackend`/`AsyncPostgresBackend` (same
+scope boundaries on both sides -- async is narrower than sync for both
+databases, by the same deliberate design choice each time). MySQL
+remains entirely unbuilt.
+
 ## [0.18.0] - 2026-09-17
 
 ### Added -- SQLite dedup mode, closing the last SQLite gap besides async support

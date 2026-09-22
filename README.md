@@ -329,10 +329,10 @@ bucket/credentials used to tier them.
 ### SQLite support
 
 **Experimental, in progress -- not yet at feature parity with the
-Postgres adapter.** `SQLiteBackend` stores images in a local SQLite
-file instead of Postgres. Use it via the existing `backend=` override
-(there's no dedicated `sqlite://` connection-string auto-detection in
-the constructor yet):
+Postgres adapter.** `SQLiteBackend`/`AsyncSQLiteBackend` store images
+in a local SQLite file instead of Postgres. Use them via the existing
+`backend=` override (there's no dedicated `sqlite://` connection-string
+auto-detection in either constructor yet):
 
 ```python
 from zerobucket import ZeroBucket, SQLiteBackend
@@ -342,12 +342,19 @@ image_id = images.put("photo.jpg")
 image = images.get(image_id)
 ```
 
-What works today (as of 0.18.0): `put`/`put_many`/`get`/`get_many`/
-`metadata`/`delete`/`delete_many`/`exists`, `get_stream()`/`stream_to()`,
-`tier_to_object_storage()` (pass `object_storage=` to `SQLiteBackend`
-the same way you would to `PostgresBackend`), `dedup=True`
-(content-addressed storage with reference counting, same schema shape
-and behavior as the Postgres adapter's dedup mode -- see
+```python
+from zerobucket import AsyncZeroBucket, AsyncSQLiteBackend
+
+images = AsyncZeroBucket(backend=AsyncSQLiteBackend("images.db"))
+image_id = await images.put("photo.jpg")
+```
+
+What works today (as of 0.19.0), sync: `put`/`put_many`/`get`/
+`get_many`/`metadata`/`delete`/`delete_many`/`exists`, `get_stream()`/
+`stream_to()`, `tier_to_object_storage()` (pass `object_storage=` to
+`SQLiteBackend` the same way you would to `PostgresBackend`),
+`dedup=True` (content-addressed storage with reference counting, same
+schema shape and behavior as the Postgres adapter's dedup mode -- see
 [Deduplication](#deduplication)), and the `before_get`/`before_put`
 access-control hooks (which live entirely in the client layer and work
 identically regardless of backend).
@@ -356,15 +363,21 @@ identically regardless of backend).
 images = ZeroBucket(backend=SQLiteBackend("images.db", dedup=True))
 ```
 
-**Not yet implemented:** async support (`aiosqlite`), and the
-`on_operation`/retry-backoff machinery `PostgresBackend` has.
-`dedup=True` combined with `object_storage=` raises `ValueError` at
-construction -- same restriction as the Postgres adapter; combining
-content-addressed storage with tiering is out of scope for both.
+What works today, async (`AsyncSQLiteBackend`, `pip install
+zerobucket[sqlite-async]`): core CRUD + `get_stream()`/`stream_to()`,
+classic mode only -- same scope `AsyncPostgresBackend` has (no
+`dedup=True`, no `tier_to_object_storage()`, no `on_operation`/retry
+machinery), deliberately kept consistent between the two async
+adapters rather than letting SQLite's async support drift wider.
 
-Two real, verified differences from the Postgres adapter, not just
-theoretical ones -- worth knowing before you rely on identical behavior
-across backends:
+**Not yet implemented:** the `on_operation`/retry-backoff machinery
+`PostgresBackend` has, for either sync or async SQLite. `dedup=True`
+combined with `object_storage=` raises `ValueError` at construction --
+same restriction as the Postgres adapter; combining content-addressed
+storage with tiering is out of scope for both.
+
+Three real, verified differences worth knowing before you rely on
+identical behavior across backends -- not theoretical ones:
 
 - **`tier_to_object_storage()` locks the whole database file, not just
   one row, for the duration of the upload.** SQLite has no per-row
@@ -376,8 +389,9 @@ UPDATE`-based version has, but `BEGIN IMMEDIATE` is a coarser lock --
   finishes (reads are unaffected; WAL mode allows concurrent readers
   alongside a writer). On Postgres, tiering one image never blocks
   writes to any other row.
-- **`get_stream()` survives a concurrent delete mid-stream, instead of
-  raising.** On Postgres, each chunk is a separate round trip, so a row
+- **Sync `get_stream()` survives a concurrent delete mid-stream,
+  instead of raising.** On Postgres, each chunk is a separate round
+  trip, so a row
   deleted by another connection mid-stream causes the next chunk fetch
   to see nothing and raise `StorageError`. On SQLite, this backend
   holds one connection open for the whole stream, and `blobopen()`'s
@@ -385,6 +399,16 @@ UPDATE`-based version has, but `BEGIN IMMEDIATE` is a coarser lock --
   as it was when streaming began -- a concurrent delete doesn't
   interrupt an in-progress stream; it completes with the full, correct
   original bytes.
+- **Async `get_stream()` does NOT share that survival guarantee --
+  it raises, matching Postgres.** `aiosqlite` doesn't expose
+  `blobopen()` at all, so `AsyncSQLiteBackend.get_stream()` is built on
+  repeated `substr()` range queries instead (like the Postgres async
+  adapter's `substring()`-based version), one query per chunk. A
+  concurrent delete mid-stream is therefore observed and raises
+  `StorageError` -- the sync and async SQLite backends genuinely behave
+  differently from each other for this exact scenario, not just
+  differently from Postgres. Confirmed directly with a dedicated test
+  for each, not assumed consistent just because both are "SQLite."
 
 ### Serving from a web API
 
@@ -873,7 +897,8 @@ zerobucket/
 │   │   │       ├── postgres.py       # sync Postgres implementation
 │   │   │       ├── sqlite.py         # sync SQLite implementation (in progress)
 │   │   │       ├── base_async.py     # AsyncStorageBackend interface
-│   │   │       └── postgres_async.py # async Postgres implementation
+│   │   │       ├── postgres_async.py # async Postgres implementation
+│   │   │       └── sqlite_async.py   # async SQLite implementation (in progress)
 │   │   └── tests/
 │   └── django-zerobucket/  # separate package: Django Storage backend adapter
 │       ├── src/django_zerobucket/
@@ -959,7 +984,7 @@ Not yet built, tracked honestly rather than implied:
 - [x] Optional HEIC/HEIF support (`pip install zerobucket[heic]`)
 - [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)
 - [x] Deduplication with reference counting (opt-in, `dedup=True`)
-- [ ] SQLite and MySQL adapters (in progress -- `SQLiteBackend` now supports classic-mode core CRUD + `get_stream()` + `tier_to_object_storage()` + `dedup=True` as of 0.18.0, see [SQLite support](#sqlite-support); async support for SQLite, and MySQL entirely, still to come)
+- [ ] SQLite and MySQL adapters (in progress -- `SQLiteBackend`/`AsyncSQLiteBackend` now at feature parity with `PostgresBackend`/`AsyncPostgresBackend` as of 0.19.0, see [SQLite support](#sqlite-support); MySQL entirely still to come)
 - [x] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`, `zerobucket verify`)
 - [x] Optional object-storage backend for files that outgrow the database tier (`tier_to_object_storage()`, S3-compatible via `boto3` -- see [Object-storage tiering](#object-storage-tiering))
 - [x] Async client support (`AsyncZeroBucket`, via psycopg3's native async mode -- see [Async support](#async-support) for why this isn't literally the `asyncpg` package despite the name here historically)

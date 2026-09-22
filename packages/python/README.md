@@ -221,12 +221,21 @@ images = ZeroBucket(backend=SQLiteBackend("images.db"))
 image_id = images.put("photo.jpg")
 ```
 
-Core CRUD, `get_stream()`, `tier_to_object_storage()`, and
-`dedup=True` all work today; async support doesn't yet. Two behaviors
-genuinely differ from the Postgres adapter (not just theoretically) --
-tiering locks the whole database file rather than one row, and
-`get_stream()` survives a concurrent delete mid-stream instead of
-raising, thanks to SQLite's WAL-mode snapshot isolation. See the
+```python
+from zerobucket import AsyncZeroBucket, AsyncSQLiteBackend  # pip install zerobucket[sqlite-async]
+
+images = AsyncZeroBucket(backend=AsyncSQLiteBackend("images.db"))
+```
+
+Sync: core CRUD, `get_stream()`, `tier_to_object_storage()`, and
+`dedup=True` all work. Async (`AsyncSQLiteBackend`): core CRUD +
+`get_stream()`, classic mode only -- same scope as `AsyncPostgresBackend`,
+kept consistent on purpose. Three behaviors genuinely differ across
+backends (not just theoretically) -- tiering locks the whole database
+file rather than one row; sync `get_stream()` survives a concurrent
+delete mid-stream thanks to WAL-mode snapshot isolation, while async
+`get_stream()` raises instead (no `blobopen()` in `aiosqlite`), matching
+Postgres. See the
 [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#sqlite-support)
 on GitHub for why, and what's still missing.
 
