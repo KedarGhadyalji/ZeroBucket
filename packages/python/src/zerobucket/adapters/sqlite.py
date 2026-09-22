@@ -28,11 +28,15 @@ than left for someone to wonder about while reading unfamiliar code:
   sense for a networked database -- don't copy this pattern into a
   hypothetical future networked-backend adapter without re-deriving
   whether it still makes sense there.
-- WAL mode (`PRAGMA journal_mode=WAL`) is enabled on every connection
-  opened by this backend -- SQLite's default rollback-journal mode
-  serializes ALL readers behind a writer; WAL mode allows concurrent
-  readers alongside a single writer, which matters even for a single
-  local file being used by more than one process/thread.
+- WAL mode (`PRAGMA journal_mode=WAL`) is enabled ONCE per backend
+  instance (a durable, file-level setting, not a per-connection one --
+  see `_connect()`'s docstring for why re-issuing it on every
+  connection was tried first and was itself the cause of a real,
+  observed-on-Windows lock-contention bug, not just redundant work),
+  not per connection. SQLite's default rollback-journal mode serializes
+  ALL readers behind a writer; WAL mode allows concurrent readers
+  alongside a single writer, which matters even for a single local file
+  being used by more than one process/thread.
 - No `SELECT ... FOR UPDATE` -- SQLite has no per-row locking at all
   (it's fundamentally a single-writer database). `tier_to_object_storage()`
   below uses `BEGIN IMMEDIATE` instead -- SQLite's closest equivalent,
@@ -64,6 +68,13 @@ from ..object_storage import ObjectStorage
 from .base import StorageBackend, StoredRecord, StoredRecordMetadata
 
 DEFAULT_STREAM_CHUNK_SIZE = 1024 * 1024
+
+# 10 seconds. See _connect()'s docstring for why this is set explicitly
+# (and at two layers -- timeout= plus an explicit PRAGMA) on every
+# connection this backend opens, including tier_to_object_storage()'s
+# own dedicated connection below.
+_BUSY_TIMEOUT_SECONDS = 10.0
+_BUSY_TIMEOUT_MS = int(_BUSY_TIMEOUT_SECONDS * 1000)
 
 _SELECT_STREAM_INFO = """
 SELECT rowid, size_bytes, storage_backend, object_storage_key
@@ -266,6 +277,7 @@ class SQLiteBackend(StorageBackend):
         self._database_path = database_path
         self._dedup = dedup
         self._object_storage = object_storage
+        self._wal_configured = False
         if auto_migrate:
             schema = _DEDUP_SCHEMA if dedup else _SCHEMA
             conn = self._connect()
@@ -278,8 +290,34 @@ class SQLiteBackend(StorageBackend):
                 conn.close()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._database_path)
-        conn.execute("PRAGMA journal_mode=WAL;")
+        """Explicit busy_timeout at two layers -- see
+        AsyncSQLiteBackend._connect()'s docstring in sqlite_async.py for
+        the full reasoning (a real, observed-on-Windows gap under
+        concurrent connections, not theoretical caution). Python's
+        sqlite3 module already defaults `timeout=` to 5.0s, so this
+        backend was never fully unprotected -- but 5s wasn't safely
+        generous under heavier concurrency, and leaving it as an
+        implicit default rather than an explicit, documented choice
+        made that easy to overlook. Bumped to 10s and made explicit,
+        matching the async adapter's value exactly so the two backends
+        behave consistently under load rather than by coincidence.
+
+        WAL mode is set at most ONCE per backend instance (tracked via
+        `self._wal_configured`), not on every connection -- see
+        AsyncSQLiteBackend._ensure_ready()'s docstring for why
+        re-issuing that pragma on every connection was itself a real
+        bug (not just redundant work) once many connections open
+        concurrently against the same file. The sync adapter's tests
+        never surfaced this the way the async ones did on Windows, but
+        the same fix applies here for the same reason -- nothing
+        prevents a `SQLiteBackend` instance from being used across
+        multiple threads.
+        """
+        conn = sqlite3.connect(self._database_path, timeout=_BUSY_TIMEOUT_SECONDS)
+        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
+        if not self._wal_configured:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            self._wal_configured = True
         conn.execute("PRAGMA foreign_keys=ON;")
         return conn
 
@@ -766,8 +804,18 @@ class SQLiteBackend(StorageBackend):
         owns_connection = connection is None
         conn = connection
         if owns_connection:
-            conn = sqlite3.connect(self._database_path, isolation_level=None)
-            conn.execute("PRAGMA journal_mode=WAL;")
+            conn = sqlite3.connect(
+                self._database_path,
+                isolation_level=None,
+                timeout=_BUSY_TIMEOUT_SECONDS,
+            )
+            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
+            # Same one-time-only guard as _connect() -- see that
+            # method's docstring for why re-issuing this on every
+            # connection was itself a real bug, not just redundant work.
+            if not self._wal_configured:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                self._wal_configured = True
 
         try:
             conn.execute("BEGIN IMMEDIATE;")
