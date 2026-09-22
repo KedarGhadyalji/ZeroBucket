@@ -13,6 +13,7 @@ from .adapters.postgres import (
 )
 from .adapters.postgres_async import AsyncPostgresBackend
 from .adapters.sqlite import SQLiteBackend
+from .adapters.sqlite_async import AsyncSQLiteBackend
 from .async_client import AsyncZeroBucket
 from .client import ZeroBucket
 from .content_types import ContentValidator, ValidatedContent
@@ -37,13 +38,14 @@ from .types import (
     ImageMetadata,
 )
 
-__version__ = "0.18.0"
+__version__ = "0.19.0"
 
 __all__ = [
     "ZeroBucket",
     "AsyncZeroBucket",
     "AsyncPostgresBackend",
     "SQLiteBackend",
+    "AsyncSQLiteBackend",
     "ObjectStorage",
     "Image",
     "ImageMetadata",
