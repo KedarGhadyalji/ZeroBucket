@@ -6,6 +6,7 @@ image_id = images.put("avatar.jpg")
 image = images.get(image_id)
 """
 
+from .adapters.mysql import MySQLBackend
 from .adapters.postgres import (
     DEFAULT_STREAM_CHUNK_SIZE,
     OperationEvent,
@@ -38,7 +39,7 @@ from .types import (
     ImageMetadata,
 )
 
-__version__ = "0.19.0"
+__version__ = "0.20.0"
 
 __all__ = [
     "ZeroBucket",
@@ -46,6 +47,7 @@ __all__ = [
     "AsyncPostgresBackend",
     "SQLiteBackend",
     "AsyncSQLiteBackend",
+    "MySQLBackend",
     "ObjectStorage",
     "Image",
     "ImageMetadata",
