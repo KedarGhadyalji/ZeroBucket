@@ -6,6 +6,75 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## [0.20.0] - 2026-09-23
+
+### Added -- MySQL/MariaDB adapter, Phase 1 of a multi-phase build (see roadmap item #1)
+
+- `MySQLBackend` (`zerobucket.adapters.mysql`), the first of the two
+  remaining databases from the original roadmap. This phase ships
+  **classic-mode core CRUD only**: `put`, `put_many`, `get`,
+  `get_many`, `get_metadata`, `delete`, `delete_many`, `exists`. NOT
+  yet implemented, tracked as explicit follow-up phases rather than a
+  silent gap: `get_stream()` (raises `NotImplementedError` with a
+  clear message), object-storage tiering, dedup mode, async support,
+  and connection pooling. Same phased approach that shipped the SQLite
+  adapter (v0.16.0 -> v0.19.0).
+- Uses **PyMySQL** (pure-Python, no compiled extension), installed via
+  the new `zerobucket[mysql]` optional extra -- confirmed via two
+  separate fresh-venv installs from the actual built wheel that plain
+  `import zerobucket` works with PyMySQL completely absent (and raises
+  a clear `StorageError`, not an `ImportError`, if you try to construct
+  a `MySQLBackend` without it), and that the full put/get/delete round
+  trip works for real against a real MariaDB instance once
+  `zerobucket[mysql]` is installed.
+- Three genuine, verified MySQL/MariaDB-specific design divergences
+  from the Postgres and SQLite adapters, documented directly in the
+  module rather than left to be discovered:
+  - **No `RETURNING`.** MariaDB 10.5+ has it, but real MySQL 8.0 does
+    not, on any statement -- confirmed against MySQL's own reference
+    docs rather than assumed from the MariaDB instance this was tested
+    against. `put()`/`put_many()` don't need it (the id is generated
+    in Python before the `INSERT`, same as SQLite). `delete_many()`
+    instead uses `SELECT ... FOR UPDATE` immediately before the
+    `DELETE`, inside one transaction -- the row lock closes the same
+    concurrent-delete race a `RETURNING`-based statement would close,
+    just as two statements instead of one. Covered by a dedicated test
+    that mixes real and fake ids and confirms only the real ones come
+    back as deleted.
+  - **Indexes are declared inline inside `CREATE TABLE IF NOT EXISTS`**
+    (`INDEX name (col)`), not via a separate `CREATE INDEX IF NOT
+EXISTS` the way the Postgres/SQLite adapters both do it. Real MySQL
+    8.0 does not support `IF NOT EXISTS` on `CREATE INDEX` at all
+    (MariaDB does, since 10.1.4) -- inline index declarations sidestep
+    the incompatibility entirely since both engines support the whole
+    idempotent `CREATE TABLE IF NOT EXISTS` uniformly.
+  - **No connection pool in this phase**, unlike Postgres. Unlike
+    SQLite (a local file, where "no pool" is a deliberate, permanent
+    design choice), MySQL is a genuinely networked database where
+    connection setup has a real cost -- this is stated as a Phase 1
+    scope decision to keep, not a judgment that it's the right
+    long-term design. `pool_min_size`/`pool_max_size`/`pool_timeout`
+    (matching `PostgresBackend`'s own knobs) are explicit follow-up
+    work.
+- 23 new tests, all against a **real MariaDB 10.11 instance** (this
+  project's sandbox) -- round-trip correctness, a large (>100KB, random
+  -noise-pixel so PNG compression can't defeat the point) blob, batch
+  put/get/delete including the dynamically-sized `IN (%s, %s, ...)`
+  placeholder list at 25 ids, `auto_migrate=False`, migration
+  idempotency, `connection=` participation in a caller-managed
+  transaction, and `get_stream()` raising `NotImplementedError`
+  cleanly rather than failing some other way.
+- Full existing suite re-verified alongside this: 92 passed (23 new
+  MySQL + all SQLite sync/async + CLI), Postgres-dependent tests
+  cleanly skipped in this sandbox pass (no reachable Postgres instance
+  this round -- the same "environment reset between rounds" situation
+  as earlier in this project's history, not a MySQL-adapter-caused
+  regression; nothing in `base.py`/`client.py`/the Postgres adapter
+  itself was touched this round). Lint clean. `mypy` shows the same
+  pre-existing "missing stubs for an optional third-party dependency"
+  category already present for `boto3` -- now also for `pymysql`, not
+  a new class of issue.
+
 ## [0.19.0] - 2026-09-17
 
 ### Fixed -- before this reached anyone, caught on TWO real Windows test runs, not one

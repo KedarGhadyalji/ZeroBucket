@@ -239,6 +239,25 @@ Postgres. See the
 [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#sqlite-support)
 on GitHub for why, and what's still missing.
 
+### MySQL support (experimental, Phase 1)
+
+```python
+from zerobucket import ZeroBucket, MySQLBackend  # pip install zerobucket[mysql]
+
+images = ZeroBucket(backend=MySQLBackend("mysql://user:pass@localhost:3306/mydb"))
+image_id = images.put("photo.jpg")
+```
+
+Core CRUD only in this phase (`put`/`put_many`/`get`/`get_many`/
+`metadata`/`delete`/`delete_many`/`exists`) -- `get_stream()`, tiering,
+`dedup=True`, async support, and connection pooling are explicit
+follow-up phases, not silently missing. Uses PyMySQL; no `RETURNING`
+(real MySQL 8.0 doesn't support it on any statement, unlike MariaDB
+10.5+), so `delete_many()` uses `SELECT ... FOR UPDATE` then `DELETE`
+inside one transaction instead. See the
+[full explanation](https://github.com/KedarGhadyalji/ZeroBucket#mysql-support)
+on GitHub for every verified design divergence.
+
 ## What it validates
 
 - **Format**: JPEG, PNG, WebP built in, plus HEIC/HEIF (iPhone photos) via
