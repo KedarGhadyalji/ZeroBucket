@@ -6,6 +6,74 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## [0.21.0] - 2026-09-23
+
+### Added -- MySQL/MariaDB adapter, Phase 2 (streaming reads + object-storage tiering)
+
+- `MySQLBackend.get_stream()` -- ranged `SUBSTRING(data FROM ... FOR
+...)` queries, the same SQL-standard form Postgres's `substring()`
+  -based streaming uses, confirmed to behave identically on
+  MySQL/MariaDB (1-indexed, clamps at the value's end) rather than
+  assumed just because the syntax is spelled the same. For a TIERED
+  row, delegates to `ObjectStorage.download_stream()` instead -- real
+  S3 byte-Range requests.
+- `MySQLBackend.tier_to_object_storage()` and `object_storage=` on the
+  constructor. Same safety guarantee as every other adapter: the
+  object-storage upload happens INSIDE the same transaction as the row
+  lock/update, so a failed upload rolls back the whole transaction and
+  leaves the row completely untouched -- verified with a test that
+  injects a failing upload and confirms the row is byte-for-byte
+  unchanged afterward, not just that an exception fired.
+- **A genuine, verified improvement over SQLite's equivalent**: MySQL/
+  MariaDB's InnoDB storage engine has real per-row locking via `SELECT
+... FOR UPDATE` -- unlike SQLite (no row-level locking at all,
+  falls back to locking the WHOLE database file via `BEGIN IMMEDIATE`
+  for the same safety guarantee), tiering one image on this backend
+  never blocks writes to any other row, matching Postgres exactly.
+  Confirmed with a dedicated, deterministic test (short
+  `innodb_lock_wait_timeout` + a deliberately slowed-down upload): a
+  concurrent write to a DIFFERENT row succeeds immediately while
+  tiering is in flight, while a concurrent write to the SAME row
+  blocks and times out. First attempt at this test used a lock timeout
+  longer than the simulated upload delay and silently passed for the
+  wrong reason (the second write just waited then succeeded, never
+  hit the timeout) -- caught by an isolated debug script showing the
+  real wait time, not assumed correct from the first green run;
+  widened the gap between the two durations to fix it for real.
+- Additive, idempotent migration (`_migrate_tiering()`) adds
+  `storage_backend`/`object_storage_bucket`/`object_storage_key` to an
+  existing Phase 1 table and a CHECK constraint enforcing "exactly one
+  of MySQL-resident or tiered, never both, never neither" -- checked
+  via `information_schema` directly rather than relying on `ADD COLUMN
+IF NOT EXISTS`, since this project would rather not depend on a
+  specific minimum MySQL/MariaDB version being confirmed correct for
+  every reader's deployment. Existing rows are untouched (satisfy the
+  constraint via the column default). Stated directly: the CHECK
+  constraint itself requires MySQL 8.0.16+/MariaDB 10.2.1+ to be
+  enforced (both silently ignore it before those versions) -- a
+  minimum-version requirement for tiering specifically, not silently
+  assumed to work everywhere.
+- `delete()`/`delete_many()` now also clean up the tiered object (if
+  any) after the MySQL row is gone -- same deliberate ordering as
+  every other adapter (row-gone-first, S3-cleanup-best-effort-after):
+  a failed S3 delete leaves a harmless orphan, not a data-integrity
+  problem.
+- 12 new tests (35 total for the MySQL adapter now), all against a
+  real MariaDB 10.11 instance plus moto's in-process S3 emulator --
+  streaming round-trip correctness, small-chunk exactness, a
+  concurrent-delete-mid-stream test confirming this backend raises
+  (matching Postgres, NOT sync SQLite's WAL-survives-it behavior --
+  each chunk is its own round trip with no held snapshot), tiering
+  idempotency, not-found, the row-lock isolation test above, and the
+  failed-upload-leaves-row-untouched safety guarantee.
+- Verified from a **genuinely fresh venv install of the actual built
+  wheel** (`zerobucket[mysql,s3]`): the full
+  put -> stream -> tier -> get (now transparently from S3) ->
+  stream (now transparently from S3) -> delete (cleans up both sides)
+  path, against real MariaDB and mocked S3, not just against the
+  source tree. Full existing suite re-verified alongside this: 104
+  passed (35 MySQL + all SQLite sync/async + CLI), lint clean.
+
 ## [0.20.0] - 2026-09-23
 
 ### Added -- MySQL/MariaDB adapter, Phase 1 of a multi-phase build (see roadmap item #1)

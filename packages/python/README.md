@@ -239,7 +239,7 @@ Postgres. See the
 [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#sqlite-support)
 on GitHub for why, and what's still missing.
 
-### MySQL support (experimental, Phase 1)
+### MySQL support (experimental, Phase 2)
 
 ```python
 from zerobucket import ZeroBucket, MySQLBackend  # pip install zerobucket[mysql]
@@ -248,13 +248,17 @@ images = ZeroBucket(backend=MySQLBackend("mysql://user:pass@localhost:3306/mydb"
 image_id = images.put("photo.jpg")
 ```
 
-Core CRUD only in this phase (`put`/`put_many`/`get`/`get_many`/
-`metadata`/`delete`/`delete_many`/`exists`) -- `get_stream()`, tiering,
-`dedup=True`, async support, and connection pooling are explicit
-follow-up phases, not silently missing. Uses PyMySQL; no `RETURNING`
-(real MySQL 8.0 doesn't support it on any statement, unlike MariaDB
-10.5+), so `delete_many()` uses `SELECT ... FOR UPDATE` then `DELETE`
-inside one transaction instead. See the
+Core CRUD, `get_stream()` (ranged `SUBSTRING()` queries), and
+`tier_to_object_storage()` (`object_storage=`, also needs
+`zerobucket[s3]`) all work as of 0.21.0 -- `dedup=True`, async support,
+and connection pooling are explicit follow-up phases, not silently
+missing. No `RETURNING` (real MySQL 8.0 doesn't support it on any
+statement, unlike MariaDB 10.5+), so `delete_many()`/
+`tier_to_object_storage()` use `SELECT ... FOR UPDATE` then the
+following statement inside one transaction instead. A genuine
+improvement over SQLite's equivalent: InnoDB has real per-row locking,
+so tiering one image never blocks writes to any other row (SQLite has
+to lock the whole database file for the same guarantee). See the
 [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#mysql-support)
 on GitHub for every verified design divergence.
 
