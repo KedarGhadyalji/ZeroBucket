@@ -25,6 +25,21 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      mysql:
+        image: mariadb:10.11
+        env:
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: zerobucket_test
+          MARIADB_USER: zerobucket
+          MARIADB_PASSWORD: zerobucket
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -u root -proot"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
@@ -49,4 +64,5 @@ jobs:
         working-directory: packages/python
         env:
           ZEROBUCKET_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/zerobucket_test
+          ZEROBUCKET_TEST_MYSQL_URL: mysql://zerobucket:zerobucket@127.0.0.1:3306/zerobucket_test
         run: pytest -v

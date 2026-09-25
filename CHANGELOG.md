@@ -6,6 +6,50 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## [0.21.1] - 2026-09-24
+
+### Fixed -- Python 3.10 compatibility bug breaking CI (and any real 3.10 install)
+
+- `from datetime import UTC` was used in three files -- `SQLiteBackend`,
+  `AsyncSQLiteBackend`, and `MySQLBackend`'s `_now()` helpers. `UTC` as
+  a top-level `datetime` module attribute was added in **Python
+  3.11** -- this package declares `requires-python = ">=3.10"` and
+  CI's matrix tests 3.10/3.11/3.12, so importing any of these three
+  adapters on a real Python 3.10 install raised `ImportError: cannot
+import name 'UTC' from 'datetime'` immediately at import time, before
+  a single test could even be collected.
+- **This bug is OLDER than this round's MySQL work**, stated directly
+  rather than glossed over: `SQLiteBackend` has had it since v0.16.0,
+  `AsyncSQLiteBackend` since v0.19.0. `MySQLBackend` (v0.20.0) just
+  repeated the same mistake a third time rather than introducing a new
+  one. Root-caused by reading the actual CI failure (`test (3.10)`
+  failed and cancelled the 3.11/3.12 jobs via fail-fast, while 3.11
+  and 3.12 themselves showed no error of their own -- consistent with
+  a 3.10-only import failure, not a real test failure) and confirming
+  directly against Python's own changelog/reference which version
+  added `datetime.UTC`, rather than guessing from the symptom alone.
+- Fix: `from datetime import UTC, datetime` -> `from datetime import
+datetime, timezone`, and `datetime.now(UTC)` -> `datetime.now(timezone.utc)`
+  in all three files. `timezone.utc` has been available since Python
+  3.2 -- identical value, just the older, universally-compatible
+  spelling. Searched the entire `src/` tree (both packages) afterward
+  to confirm no other occurrence of `datetime.UTC` or Python
+  3.11+-only constructs (`typing.Self`, `except*`, `tomllib`) remained
+  anywhere.
+- Could not run the actual Python 3.10 interpreter in this sandbox to
+  confirm directly (Ubuntu 24.04's default archives no longer ship a
+  `python3.10` package, and this sandbox's network allowlist doesn't
+  include a source with one) -- stated plainly rather than silently
+  assumed fixed. Confidence here rests on `timezone.utc` being
+  unambiguous, longstanding stdlib API (Python 3.2+, well before this
+  project's 3.10 floor) rather than on having reproduced the failure
+  locally; the real confirmation is the next CI run actually going
+  green on all three matrix versions.
+- No functional/behavioral change -- `datetime.now(timezone.utc)` and
+  `datetime.now(UTC)` produce identical `datetime` objects; this is a
+  compatibility-only fix. Full suite re-verified: 104 passed (35 MySQL
+  - all SQLite sync/async + CLI), lint clean.
+
 ## [0.21.0] - 2026-09-23
 
 ### Added -- MySQL/MariaDB adapter, Phase 2 (streaming reads + object-storage tiering)
