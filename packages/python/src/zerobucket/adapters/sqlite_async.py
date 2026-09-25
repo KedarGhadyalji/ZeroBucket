@@ -40,7 +40,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from ..exceptions import StorageError
@@ -93,7 +93,7 @@ _BUSY_TIMEOUT_MS = int(_BUSY_TIMEOUT_SECONDS * 1000)
 
 
 def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 class AsyncSQLiteBackend(AsyncStorageBackend):

@@ -111,7 +111,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlparse
 
@@ -266,7 +266,7 @@ def _now() -> datetime:
     # never relying on the server's own timezone setting) keeps this
     # consistent regardless of how a given MySQL/MariaDB instance is
     # configured.
-    return datetime.now(UTC).replace(tzinfo=None)
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _parse_database_url(database_url: str) -> dict:

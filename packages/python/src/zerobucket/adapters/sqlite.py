@@ -61,7 +61,7 @@ import sqlite3
 import uuid
 from collections import Counter
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from ..exceptions import StorageError
 from ..object_storage import ObjectStorage
@@ -247,7 +247,7 @@ _EXISTS = "SELECT 1 FROM zerobucket_images WHERE id = ?;"
 
 
 def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 class SQLiteBackend(StorageBackend):
