@@ -1,12 +1,13 @@
 """MySQL / MariaDB storage adapter.
 
-PHASE 2 OF A MULTI-PHASE BUILD, stated directly rather than implied,
+PHASE 3 OF A MULTI-PHASE BUILD, stated directly rather than implied,
 same convention used for the SQLite adapter. Phase 1 (v0.20.0) shipped
-classic-mode core CRUD. This phase adds streaming reads
-(`get_stream()`) and object-storage tiering (`tier_to_object_storage()`,
-`object_storage=`). NOT yet implemented, tracked as explicit follow-up
-phases rather than a silent gap: dedup mode, async support, connection
-pooling.
+classic-mode core CRUD. Phase 2 (v0.21.0) added streaming reads and
+object-storage tiering. This phase adds dedup mode (`dedup=True`) --
+content-addressed storage with reference counting, mirroring the
+Postgres/SQLite adapters' dedup schema exactly in shape. NOT yet
+implemented, tracked as explicit follow-up phases rather than a silent
+gap: async support, connection pooling.
 
 Tested against MariaDB 10.11 (this project's sandbox); written against
 MySQL/MariaDB syntax common to both, and the specific divergences
@@ -48,22 +49,36 @@ unfamiliar code:
   RETURNING-based statement would close (the row lock guarantees a row
   selected as existing/untiered is still there, unchanged, when the
   next statement acts on it), just as two statements instead of one.
+  Dedup mode's ref-counting hits the same wall a second way: Postgres's
+  `UPDATE ... SET ref_count = ref_count - %s ... RETURNING ref_count`
+  can't be one statement here either -- this adapter does `SELECT
+  ref_count ... FOR UPDATE`, computes the new value in Python, then
+  `UPDATE`, all inside the row lock, rather than a single atomic
+  RETURNING-based decrement.
 - No connection pool in this phase. Unlike SQLite (a local file, where
   "no pool" is a deliberate, durable design choice -- see that
   adapter's module docstring), MySQL is a genuinely networked database
   where connection setup (TCP handshake + auth) has a real, non-trivial
   cost. This phase still opens a fresh PyMySQL connection per operation
-  when connection=None purely to keep scope focused on streaming and
-  tiering correctness, not because that's judged to be the right
-  long-term design -- pool_min_size/pool_max_size/pool_timeout
-  (matching PostgresBackend's own knobs) are explicitly flagged as
-  follow-up work, not silently absent.
+  when connection=None purely to keep scope focused on correctness, not
+  because that's judged to be the right long-term design --
+  pool_min_size/pool_max_size/pool_timeout (matching PostgresBackend's
+  own knobs) are explicitly flagged as follow-up work, not silently
+  absent.
 - Tiering columns (storage_backend/object_storage_bucket/
   object_storage_key) were deliberately NOT baked into Phase 1's
   schema (see that phase's CHANGELOG entry for why -- it mirrors how
   PostgresBackend's own schema evolved historically, classic-mode
   first, tiering columns added later via an additive migration). This
-  phase's `_migrate_tiering()` is that additive migration for MySQL.
+  phase's `_migrate_tiering()` is that additive migration for MySQL --
+  and, same restriction as PostgresBackend/SQLiteBackend, is only ever
+  applied to the CLASSIC-mode schema. Dedup mode gets its own separate
+  schema (`zerobucket_blobs`/`zerobucket_image_refs`) with NO tiering
+  columns at all, and `object_storage=` combined with `dedup=True`
+  raises ValueError immediately at construction, before touching the
+  database -- same restriction, same reasoning, as every other adapter
+  in this project (tiering a de-duplicated blob shared by many ids is
+  out of scope for this pass).
   It does NOT rely on `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` --
   even though real MySQL 8.0 and MariaDB 10.0.2+ both do support that
   clause, this project would rather check column/constraint existence
@@ -94,7 +109,10 @@ unfamiliar code:
   adapter's success with the same syntax). For a TIERED row, this
   delegates to `ObjectStorage.download_stream()` instead -- real S3
   byte-Range requests, strictly better than the SUBSTRING approach,
-  same as every other adapter's tiered `get_stream()` path.
+  same as every other adapter's tiered `get_stream()` path. In dedup
+  mode, the exact same ranged-SUBSTRING approach streams from
+  `zerobucket_blobs.data` via a join through `zerobucket_image_refs` --
+  there is no tiering path in dedup mode at all (see above).
 - `tier_to_object_storage()`'s row lock is a genuine, real per-row
   `SELECT ... FOR UPDATE` via InnoDB -- unlike SQLite's `BEGIN
   IMMEDIATE` workaround (which locks the WHOLE database file because
@@ -105,11 +123,21 @@ unfamiliar code:
   test (a second connection can write to a DIFFERENT row while tiering
   is in progress on this one), not assumed just because InnoDB is
   "supposed to" support row locks.
+- **Dedup-mode ref-counting is race-safe by construction, not by this
+  code's own logic**: `INSERT ... ON DUPLICATE KEY UPDATE ref_count =
+  ref_count + 1` (MySQL's UPSERT syntax -- Postgres uses `ON CONFLICT
+  ... DO UPDATE`, SQLite uses the same `ON CONFLICT` form Postgres
+  does; MySQL's is spelled differently but gives the identical atomic
+  guarantee) lets InnoDB handle the increment atomically at the row
+  level. Confirmed empirically, not just assumed from the syntax:
+  20 concurrent threads upserting the same checksum produced
+  `ref_count == 20`, not less -- see the dedicated concurrency test.
 """
 
 from __future__ import annotations
 
 import uuid
+from collections import Counter
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -202,6 +230,106 @@ WHERE id = %s;
 _DELETE = "DELETE FROM zerobucket_images WHERE id = %s;"
 
 _EXISTS = "SELECT 1 FROM zerobucket_images WHERE id = %s;"
+
+# ---- Dedup-mode schema and queries -------------------------------------
+#
+# Mirrors the Postgres/SQLite adapters' dedup schema exactly in shape:
+# content-addressed storage where one blob can be shared by many ids
+# via ref-counting. NO tiering columns here -- dedup mode does not
+# support object-storage tiering in this adapter, same restriction as
+# PostgresBackend/SQLiteBackend (rejected at construction below, not
+# discovered later as a confusing runtime failure). See module
+# docstring for the RETURNING-related divergences in the queries below.
+#
+# Split into TWO separate CREATE TABLE statements/constants (not one
+# string like classic mode's single-table _SCHEMA) -- a real bug caught
+# by actually running it, not assumed safe from the SQL being valid:
+# PyMySQL's cursor.execute() only accepts ONE statement per call by
+# default (multi-statement execution needs an explicit
+# CLIENT.MULTI_STATEMENTS connection flag this adapter doesn't set),
+# so a single string with two CREATE TABLEs back to back raised a
+# syntax error the moment migration actually ran, not something
+# visible from reading the SQL alone.
+
+_DEDUP_SCHEMA_BLOBS = """
+CREATE TABLE IF NOT EXISTS zerobucket_blobs (
+    checksum_sha256     CHAR(64) PRIMARY KEY,
+    data                LONGBLOB NOT NULL,
+    mime_type           VARCHAR(255) NOT NULL,
+    size_bytes          INT NOT NULL,
+    width               INT,
+    height              INT,
+    ref_count           INT NOT NULL DEFAULT 0,
+    created_at          DATETIME(6) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+_DEDUP_SCHEMA_REFS = """
+CREATE TABLE IF NOT EXISTS zerobucket_image_refs (
+    id                  CHAR(36) PRIMARY KEY,
+    checksum_sha256     CHAR(64) NOT NULL,
+    original_filename   TEXT,
+    created_at          DATETIME(6) NOT NULL,
+    updated_at          DATETIME(6) NOT NULL,
+    INDEX idx_zerobucket_image_refs_checksum (checksum_sha256),
+    INDEX idx_zerobucket_image_refs_created_at (created_at),
+    FOREIGN KEY (checksum_sha256) REFERENCES zerobucket_blobs(checksum_sha256)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+# MySQL's UPSERT syntax (`ON DUPLICATE KEY UPDATE`, not `ON CONFLICT`
+# like Postgres/SQLite) -- InnoDB handles the atomicity at the row
+# level, same as Postgres does at the Postgres row level. Verified
+# empirically during development, not just assumed from the syntax:
+# 20 concurrent threads upserting the same checksum produced
+# ref_count == 20, not less -- see the dedicated concurrency test.
+_DEDUP_UPSERT_BLOB = """
+INSERT INTO zerobucket_blobs
+    (checksum_sha256, data, mime_type, size_bytes, width, height, ref_count, created_at)
+VALUES (%s, %s, %s, %s, %s, %s, 1, %s)
+ON DUPLICATE KEY UPDATE ref_count = ref_count + 1;
+"""
+
+# No RETURNING (see module docstring) -- the ref's id is generated in
+# Python before this INSERT runs, same as classic mode's _INSERT, so
+# nothing needs to be read back here.
+_DEDUP_INSERT_REF = """
+INSERT INTO zerobucket_image_refs (id, checksum_sha256, original_filename, created_at, updated_at)
+VALUES (%s, %s, %s, %s, %s);
+"""
+
+_DEDUP_SELECT_FULL = """
+SELECT r.id, b.data, b.mime_type, r.original_filename, b.size_bytes,
+       b.width, b.height, r.checksum_sha256
+FROM zerobucket_image_refs r
+JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256
+WHERE r.id = %s;
+"""
+
+_DEDUP_SELECT_METADATA = """
+SELECT r.id, b.mime_type, r.original_filename, b.size_bytes, b.width, b.height, r.checksum_sha256
+FROM zerobucket_image_refs r
+JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256
+WHERE r.id = %s;
+"""
+
+_DEDUP_STREAM_INFO = """
+SELECT b.size_bytes
+FROM zerobucket_image_refs r
+JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256
+WHERE r.id = %s;
+"""
+
+# Same SUBSTRING() ranged-read form as classic mode's _SELECT_CHUNK,
+# joined through to the shared blob -- see module docstring.
+_DEDUP_SELECT_CHUNK = """
+SELECT SUBSTRING(b.data FROM %s FOR %s)
+FROM zerobucket_image_refs r
+JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256
+WHERE r.id = %s;
+"""
+
+_DEDUP_EXISTS = "SELECT 1 FROM zerobucket_image_refs WHERE id = %s;"
 
 
 def _table_columns(cur) -> set[str]:
@@ -296,9 +424,11 @@ class MySQLBackend(StorageBackend):
 
     object_storage: optional ObjectStorage instance (see
     object_storage.py), enabling tiering -- see
-    tier_to_object_storage(). dedup=True is not yet supported for this
-    backend (Phase 3), so there's no dedup+tiering interaction to guard
-    against here yet, unlike PostgresBackend/SQLiteBackend.
+    tier_to_object_storage(). dedup: content-addressed storage with
+    reference counting (see module docstring's dedup section).
+    object_storage= and dedup=True together raise ValueError
+    immediately at construction -- same restriction, same reasoning, as
+    PostgresBackend/SQLiteBackend.
 
     `connection=` here means a `pymysql.connections.Connection` (not a
     Postgres or SQLite connection) -- the interface in base.py types
@@ -311,8 +441,15 @@ class MySQLBackend(StorageBackend):
         database_url: str,
         *,
         auto_migrate: bool = True,
+        dedup: bool = False,
         object_storage: ObjectStorage | None = None,
     ) -> None:
+        if object_storage is not None and dedup:
+            raise ValueError(
+                "object_storage= is not supported together with dedup=True "
+                "in this adapter -- same restriction as "
+                "PostgresBackend/SQLiteBackend, see this module's docstring."
+            )
         try:
             import pymysql
             import pymysql.cursors
@@ -327,13 +464,18 @@ class MySQLBackend(StorageBackend):
             ) from exc
         self._pymysql = pymysql
         self._connect_kwargs = _parse_database_url(database_url)
+        self._dedup = dedup
         self._object_storage = object_storage
         if auto_migrate:
             conn = self._connect()
             try:
                 with conn.cursor() as cur:
-                    cur.execute(_SCHEMA)
-                    _migrate_tiering(cur)
+                    if dedup:
+                        cur.execute(_DEDUP_SCHEMA_BLOBS)
+                        cur.execute(_DEDUP_SCHEMA_REFS)
+                    else:
+                        cur.execute(_SCHEMA)
+                        _migrate_tiering(cur)
                 conn.commit()
             except Exception as exc:  # noqa: BLE001
                 raise StorageError(f"Migration failed: {exc}") from exc
@@ -397,6 +539,17 @@ class MySQLBackend(StorageBackend):
         checksum_sha256: str,
         connection: pymysql.connections.Connection | None = None,
     ) -> str:
+        if self._dedup:
+            return self._put_dedup(
+                data=data,
+                mime_type=mime_type,
+                original_filename=original_filename,
+                size_bytes=size_bytes,
+                width=width,
+                height=height,
+                checksum_sha256=checksum_sha256,
+                connection=connection,
+            )
         image_id = str(uuid.uuid4())
         now = _now()
 
@@ -426,6 +579,45 @@ class MySQLBackend(StorageBackend):
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to store image: {exc}") from exc
 
+    def _put_dedup(
+        self,
+        *,
+        data: bytes,
+        mime_type: str,
+        original_filename: str | None,
+        size_bytes: int,
+        width: int | None,
+        height: int | None,
+        checksum_sha256: str,
+        connection: pymysql.connections.Connection | None,
+    ) -> str:
+        """One transaction: upsert the blob (atomic ref_count increment
+        via `ON DUPLICATE KEY UPDATE`, see module docstring), then
+        insert a new ref row pointing at it. The ref's id is generated
+        in Python beforehand -- no RETURNING needed, same as classic
+        mode."""
+        image_id = str(uuid.uuid4())
+        now = _now()
+
+        def work(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    _DEDUP_UPSERT_BLOB,
+                    (checksum_sha256, data, mime_type, size_bytes, width, height, now),
+                )
+                cur.execute(
+                    _DEDUP_INSERT_REF,
+                    (image_id, checksum_sha256, original_filename, now, now),
+                )
+            return image_id
+
+        try:
+            return self._run(connection, work)
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to store image: {exc}") from exc
+
     def put_many(
         self,
         rows: list[dict],
@@ -439,6 +631,8 @@ class MySQLBackend(StorageBackend):
         batching every row into a single commit is still what matters."""
         if not rows:
             return []
+        if self._dedup:
+            return self._put_many_dedup(rows, connection=connection)
 
         now = _now()
         prepared = [(str(uuid.uuid4()), row) for row in rows]
@@ -470,11 +664,54 @@ class MySQLBackend(StorageBackend):
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to store image batch: {exc}") from exc
 
+    def _put_many_dedup(
+        self, rows: list[dict], *, connection: pymysql.connections.Connection | None
+    ) -> list[str]:
+        now = _now()
+        prepared = [(str(uuid.uuid4()), row) for row in rows]
+
+        def work(conn):
+            with conn.cursor() as cur:
+                for image_id, row in prepared:
+                    cur.execute(
+                        _DEDUP_UPSERT_BLOB,
+                        (
+                            row["checksum_sha256"],
+                            row["data"],
+                            row["mime_type"],
+                            row["size_bytes"],
+                            row["width"],
+                            row["height"],
+                            now,
+                        ),
+                    )
+                    cur.execute(
+                        _DEDUP_INSERT_REF,
+                        (
+                            image_id,
+                            row["checksum_sha256"],
+                            row["original_filename"],
+                            now,
+                            now,
+                        ),
+                    )
+            return [image_id for image_id, _ in prepared]
+
+        try:
+            return self._run(connection, work)
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to store image batch: {exc}") from exc
+
     # ---- get ------------------------------------------------------------
 
     def get(
         self, image_id: str, *, connection: pymysql.connections.Connection | None = None
     ) -> StoredRecord | None:
+        if self._dedup:
+            return self._get_dedup(image_id, connection=connection)
+
         def work(conn):
             with conn.cursor() as cur:
                 cur.execute(_SELECT_FULL, (image_id,))
@@ -513,6 +750,41 @@ class MySQLBackend(StorageBackend):
             checksum_sha256=checksum_sha256,
         )
 
+    def _get_dedup(
+        self, image_id: str, *, connection: pymysql.connections.Connection | None
+    ) -> StoredRecord | None:
+        def work(conn):
+            with conn.cursor() as cur:
+                cur.execute(_DEDUP_SELECT_FULL, (image_id,))
+                return cur.fetchone()
+
+        try:
+            row = self._run(connection, work)
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to retrieve image: {exc}") from exc
+        if row is None:
+            return None
+        (
+            row_id,
+            data,
+            mime_type,
+            original_filename,
+            size_bytes,
+            width,
+            height,
+            checksum,
+        ) = row
+        return StoredRecord(
+            id=str(row_id),
+            data=bytes(data),
+            mime_type=mime_type,
+            original_filename=original_filename,
+            size_bytes=size_bytes,
+            width=width,
+            height=height,
+            checksum_sha256=checksum,
+        )
+
     def get_many(
         self,
         image_ids: list[str],
@@ -521,6 +793,8 @@ class MySQLBackend(StorageBackend):
     ) -> list[StoredRecord]:
         if not image_ids:
             return []
+        if self._dedup:
+            return self._get_many_dedup(image_ids, connection=connection)
         placeholders = ",".join(["%s"] * len(image_ids))
         sql = _SELECT_FULL.replace("WHERE id = %s", f"WHERE id IN ({placeholders})")
 
@@ -567,12 +841,45 @@ class MySQLBackend(StorageBackend):
             )
         return results
 
+    def _get_many_dedup(
+        self, image_ids: list[str], *, connection: pymysql.connections.Connection | None
+    ) -> list[StoredRecord]:
+        placeholders = ",".join(["%s"] * len(image_ids))
+        sql = _DEDUP_SELECT_FULL.replace(
+            "WHERE r.id = %s", f"WHERE r.id IN ({placeholders})"
+        )
+
+        def work(conn):
+            with conn.cursor() as cur:
+                cur.execute(sql, image_ids)
+                return cur.fetchall()
+
+        try:
+            rows = self._run(connection, work)
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to retrieve image batch: {exc}") from exc
+        return [
+            StoredRecord(
+                id=str(row[0]),
+                data=bytes(row[1]),
+                mime_type=row[2],
+                original_filename=row[3],
+                size_bytes=row[4],
+                width=row[5],
+                height=row[6],
+                checksum_sha256=row[7],
+            )
+            for row in rows
+        ]
+
     def get_metadata(
         self, image_id: str, *, connection: pymysql.connections.Connection | None = None
     ) -> StoredRecordMetadata | None:
+        sql = _DEDUP_SELECT_METADATA if self._dedup else _SELECT_METADATA
+
         def work(conn):
             with conn.cursor() as cur:
-                cur.execute(_SELECT_METADATA, (image_id,))
+                cur.execute(sql, (image_id,))
                 return cur.fetchone()
 
         try:
@@ -608,7 +915,13 @@ class MySQLBackend(StorageBackend):
         requests). If the row disappears mid-stream (concurrent delete,
         no connection= holding a snapshot), the next chunk query returns
         no row and this raises StorageError rather than silently
-        yielding a short read."""
+        yielding a short read. In dedup mode, streams from the shared
+        blob via a join -- there is no tiering branch in dedup mode at
+        all (see module docstring)."""
+        if self._dedup:
+            return self._get_stream_dedup(
+                image_id, chunk_size=chunk_size, connection=connection
+            )
 
         def info_work(conn):
             with conn.cursor() as cur:
@@ -670,6 +983,60 @@ class MySQLBackend(StorageBackend):
 
         return generator()
 
+    def _get_stream_dedup(
+        self,
+        image_id: str,
+        *,
+        chunk_size: int,
+        connection: pymysql.connections.Connection | None,
+    ) -> Iterator[bytes] | None:
+        def info_work(conn):
+            with conn.cursor() as cur:
+                cur.execute(_DEDUP_STREAM_INFO, (image_id,))
+                return cur.fetchone()
+
+        try:
+            info_row = self._run(connection, info_work)
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
+        if info_row is None:
+            return None
+        (total_size,) = info_row
+
+        def generator() -> Iterator[bytes]:
+            offset = 1
+            remaining = total_size
+            delivered = 0
+            while remaining > 0:
+                length = min(chunk_size, remaining)
+
+                def work(conn, offset=offset, length=length):
+                    with conn.cursor() as cur:
+                        cur.execute(_DEDUP_SELECT_CHUNK, (offset, length, image_id))
+                        return cur.fetchone()
+
+                try:
+                    row = self._run(connection, work)
+                except Exception as exc:  # noqa: BLE001
+                    raise StorageError(f"Failed to stream image: {exc}") from exc
+
+                if row is None:
+                    raise StorageError(
+                        f"Image {image_id!r} was deleted while streaming "
+                        f"(delivered {delivered} of {total_size} bytes). "
+                        "Pass connection= with your own open transaction "
+                        "if you need a consistent read across concurrent "
+                        "writers."
+                    )
+
+                chunk = bytes(row[0])
+                yield chunk
+                offset += len(chunk)
+                remaining -= len(chunk)
+                delivered += len(chunk)
+
+        return generator()
+
     # ---- tier_to_object_storage ------------------------------------------
 
     def tier_to_object_storage(
@@ -702,6 +1069,14 @@ class MySQLBackend(StorageBackend):
         directly with a dedicated test, not assumed just because InnoDB
         is documented to support row locks.
         """
+        if self._dedup:
+            raise StorageError(
+                "tier_to_object_storage() is not supported in dedup mode "
+                "-- object_storage= and dedup=True are mutually exclusive "
+                "on this backend, same restriction as "
+                "PostgresBackend/SQLiteBackend, see this module's "
+                "docstring."
+            )
         if self._object_storage is None:
             raise StorageError(
                 "tier_to_object_storage() requires this backend to be "
@@ -750,6 +1125,8 @@ class MySQLBackend(StorageBackend):
         makes the image correctly "not found" from here on regardless
         of whether the S3 delete below succeeds; a failure here leaves
         a harmless orphaned object, not a data-integrity problem."""
+        if self._dedup:
+            return self._delete_dedup(image_id, connection=connection)
 
         def work(conn):
             with conn.cursor() as cur:
@@ -775,6 +1152,55 @@ class MySQLBackend(StorageBackend):
             self._object_storage.delete(object_storage_key)
         return True
 
+    def _delete_dedup(
+        self, image_id: str, *, connection: pymysql.connections.Connection | None
+    ) -> bool:
+        """Locks the ref row (FOR UPDATE), deletes it, then locks the
+        shared blob row (a SEPARATE FOR UPDATE -- no RETURNING to fold
+        the decrement into one statement, see module docstring),
+        decrements ref_count in Python, writes it back, and deletes the
+        blob only if the new count is <= 0. The blob-row lock closes the
+        same race a RETURNING-based atomic decrement would close: two
+        concurrent deletes of different refs to the same blob serialize
+        on that lock rather than both reading the same stale ref_count."""
+
+        def work(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT checksum_sha256 FROM zerobucket_image_refs "
+                    "WHERE id = %s FOR UPDATE;",
+                    (image_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                checksum = row[0]
+                cur.execute(
+                    "DELETE FROM zerobucket_image_refs WHERE id = %s;", (image_id,)
+                )
+                cur.execute(
+                    "SELECT ref_count FROM zerobucket_blobs WHERE checksum_sha256 = %s "
+                    "FOR UPDATE;",
+                    (checksum,),
+                )
+                new_ref_count = cur.fetchone()[0] - 1
+                cur.execute(
+                    "UPDATE zerobucket_blobs SET ref_count = %s WHERE checksum_sha256 = %s;",
+                    (new_ref_count, checksum),
+                )
+                if new_ref_count <= 0:
+                    cur.execute(
+                        "DELETE FROM zerobucket_blobs WHERE checksum_sha256 = %s "
+                        "AND ref_count <= 0;",
+                        (checksum,),
+                    )
+                return True
+
+        try:
+            return self._run(connection, work)
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to delete image: {exc}") from exc
+
     def delete_many(
         self,
         image_ids: list[str],
@@ -793,6 +1219,8 @@ class MySQLBackend(StorageBackend):
         as delete()."""
         if not image_ids:
             return []
+        if self._dedup:
+            return self._delete_many_dedup(image_ids, connection=connection)
         placeholders = ",".join(["%s"] * len(image_ids))
 
         def work(conn):
@@ -824,14 +1252,73 @@ class MySQLBackend(StorageBackend):
                 self._object_storage.delete(object_storage_key)
         return deleted_ids
 
+    def _delete_many_dedup(
+        self, image_ids: list[str], *, connection: pymysql.connections.Connection | None
+    ) -> list[str]:
+        """Same FOR-UPDATE-then-act shape as _delete_dedup(), extended
+        to a batch: locks every candidate ref row, deletes them, then
+        aggregates how many refs each distinct checksum lost (a batch
+        can delete several refs to the SAME blob) and applies each
+        checksum's decrement exactly once, locking that blob row before
+        writing -- not once per ref, which would double-decrement a
+        blob referenced twice in the same batch."""
+        placeholders = ",".join(["%s"] * len(image_ids))
+
+        def work(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, checksum_sha256 FROM zerobucket_image_refs "
+                    f"WHERE id IN ({placeholders}) FOR UPDATE;",
+                    image_ids,
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return []
+                deleted_ids = [str(row[0]) for row in rows]
+                existing_placeholders = ",".join(["%s"] * len(deleted_ids))
+                cur.execute(
+                    f"DELETE FROM zerobucket_image_refs WHERE id IN ({existing_placeholders});",
+                    deleted_ids,
+                )
+                checksum_counts = Counter(row[1] for row in rows)
+                empty_checksums = []
+                for checksum, count in checksum_counts.items():
+                    cur.execute(
+                        "SELECT ref_count FROM zerobucket_blobs WHERE checksum_sha256 = %s "
+                        "FOR UPDATE;",
+                        (checksum,),
+                    )
+                    new_ref_count = cur.fetchone()[0] - count
+                    cur.execute(
+                        "UPDATE zerobucket_blobs SET ref_count = %s WHERE checksum_sha256 = %s;",
+                        (new_ref_count, checksum),
+                    )
+                    if new_ref_count <= 0:
+                        empty_checksums.append(checksum)
+                if empty_checksums:
+                    empty_placeholders = ",".join(["%s"] * len(empty_checksums))
+                    cur.execute(
+                        f"DELETE FROM zerobucket_blobs WHERE checksum_sha256 IN "
+                        f"({empty_placeholders}) AND ref_count <= 0;",
+                        empty_checksums,
+                    )
+                return deleted_ids
+
+        try:
+            return self._run(connection, work)
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to delete image batch: {exc}") from exc
+
     # ---- exists -------------------------------------------------------------
 
     def exists(
         self, image_id: str, *, connection: pymysql.connections.Connection | None = None
     ) -> bool:
+        sql = _DEDUP_EXISTS if self._dedup else _EXISTS
+
         def work(conn):
             with conn.cursor() as cur:
-                cur.execute(_EXISTS, (image_id,))
+                cur.execute(sql, (image_id,))
                 return cur.fetchone() is not None
 
         try:
