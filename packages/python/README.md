@@ -239,7 +239,7 @@ Postgres. See the
 [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#sqlite-support)
 on GitHub for why, and what's still missing.
 
-### MySQL support (experimental, Phase 2)
+### MySQL support (experimental, Phase 3)
 
 ```python
 from zerobucket import ZeroBucket, MySQLBackend  # pip install zerobucket[mysql]
@@ -248,17 +248,21 @@ images = ZeroBucket(backend=MySQLBackend("mysql://user:pass@localhost:3306/mydb"
 image_id = images.put("photo.jpg")
 ```
 
-Core CRUD, `get_stream()` (ranged `SUBSTRING()` queries), and
+Core CRUD, `get_stream()` (ranged `SUBSTRING()` queries),
 `tier_to_object_storage()` (`object_storage=`, also needs
-`zerobucket[s3]`) all work as of 0.21.0 -- `dedup=True`, async support,
-and connection pooling are explicit follow-up phases, not silently
+`zerobucket[s3]`), and `dedup=True` (content-addressed storage with
+reference counting) all work as of 0.22.0 -- async support and
+connection pooling are explicit follow-up phases, not silently
 missing. No `RETURNING` (real MySQL 8.0 doesn't support it on any
 statement, unlike MariaDB 10.5+), so `delete_many()`/
-`tier_to_object_storage()` use `SELECT ... FOR UPDATE` then the
-following statement inside one transaction instead. A genuine
-improvement over SQLite's equivalent: InnoDB has real per-row locking,
-so tiering one image never blocks writes to any other row (SQLite has
-to lock the whole database file for the same guarantee). See the
+`tier_to_object_storage()`/dedup's ref-count decrement use `SELECT
+... FOR UPDATE` then the following statement inside one transaction
+instead. A genuine improvement over SQLite's tiering: InnoDB has real
+per-row locking, so tiering one image never blocks writes to any
+other row (SQLite has to lock the whole database file for the same
+guarantee). Dedup mode's blob upsert uses MySQL's `ON DUPLICATE KEY
+UPDATE` (not Postgres's/SQLite's `ON CONFLICT`) -- verified atomic
+under 20 concurrent threads, not just assumed. See the
 [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#mysql-support)
 on GitHub for every verified design divergence.
 

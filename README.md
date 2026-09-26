@@ -412,10 +412,10 @@ UPDATE`-based version has, but `BEGIN IMMEDIATE` is a coarser lock --
 
 ### MySQL support
 
-**Experimental, Phase 2 of a multi-phase build -- classic-mode core
-CRUD + streaming + tiering, not yet at feature parity with the
-Postgres or SQLite adapters.** `MySQLBackend` stores images in MySQL
-or MariaDB instead of Postgres. Requires the `zerobucket[mysql]`
+**Experimental, Phase 3 of a multi-phase build -- classic-mode core
+CRUD + streaming + tiering + dedup mode, not yet at feature parity
+with the Postgres or SQLite adapters.** `MySQLBackend` stores images in
+MySQL or MariaDB instead of Postgres. Requires the `zerobucket[mysql]`
 optional extra (PyMySQL, pure-Python, no compiled extension) -- plain
 `import zerobucket` and every other backend work fine without it, same
 rule as `boto3`/`aiosqlite`:
@@ -432,12 +432,13 @@ image_id = images.put("photo.jpg")
 image = images.get(image_id)
 ```
 
-What works today (as of 0.21.0): `put`/`put_many`/`get`/`get_many`/
+What works today (as of 0.22.0): `put`/`put_many`/`get`/`get_many`/
 `metadata`/`delete`/`delete_many`/`exists`, `get_stream()` (ranged
 `SUBSTRING()` queries -- MySQL/MariaDB's equivalent of Postgres's
 `substring()`-based streaming), `tier_to_object_storage()` (pass
 `object_storage=` to `MySQLBackend`, same as `PostgresBackend`/
-`SQLiteBackend` -- also requires `zerobucket[s3]`), `connection=`
+`SQLiteBackend` -- also requires `zerobucket[s3]`), `dedup=True`
+(content-addressed storage with reference counting), `connection=`
 transaction participation, and the `before_get`/`before_put`
 access-control hooks (client-layer, work identically regardless of
 backend).
@@ -448,14 +449,17 @@ from zerobucket import ObjectStorage
 store = ObjectStorage("my-bucket", region_name="us-east-1")
 images = ZeroBucket(backend=MySQLBackend("mysql://...", object_storage=store))
 images.tier_to_object_storage(image_id)   # or via the CLI's `zerobucket tier`
+
+# Dedup mode -- content-addressed storage, mutually exclusive with object_storage=
+dedup_images = ZeroBucket(backend=MySQLBackend("mysql://...", dedup=True))
 ```
 
 **Not yet implemented, tracked as explicit follow-up phases, same
 convention used throughout this project rather than a silent gap:**
-`dedup=True`, async support, connection pooling, and the
-`on_operation`/retry-backoff machinery `PostgresBackend` has.
+async support, connection pooling, and the `on_operation`/
+retry-backoff machinery `PostgresBackend` has.
 
-Four genuine, verified MySQL/MariaDB-specific design divergences,
+Five genuine, verified MySQL/MariaDB-specific design divergences,
 documented directly in `adapters/mysql.py` rather than left to be
 discovered:
 
@@ -466,7 +470,10 @@ discovered:
 UPDATE` immediately before the statement that follows, inside one
   transaction, instead -- the row lock closes the same race a
   `RETURNING`-based statement would close, just as two statements
-  instead of one.
+  instead of one. Dedup mode's ref-count decrement hits the same wall
+  a second way: `SELECT ref_count ... FOR UPDATE`, compute the new
+  value in Python, then `UPDATE`, rather than one atomic
+  RETURNING-based decrement.
 - **Indexes are declared inline inside `CREATE TABLE IF NOT EXISTS`**,
   not via a separate `CREATE INDEX IF NOT EXISTS`. Real MySQL 8.0 does
   not support `IF NOT EXISTS` on `CREATE INDEX` at all (MariaDB does).
@@ -477,10 +484,10 @@ UPDATE` immediately before the statement that follows, inside one
   reason, rather than relying on `ADD COLUMN IF NOT EXISTS`.
 - **No connection pool in this phase.** Unlike SQLite (a local file,
   where "no pool" is a permanent design choice), MySQL is a networked
-  database where connection setup has a real cost -- this is a Phase
-  1/2 scope decision, not a judgment that it's the right long-term
-  design. `pool_min_size`/`pool_max_size`/`pool_timeout` (matching
-  `PostgresBackend`'s own knobs) are explicit follow-up work.
+  database where connection setup has a real cost -- this is a scope
+  decision for phases 1 through 3, not a judgment that it's the right
+  long-term design. `pool_min_size`/`pool_max_size`/`pool_timeout`
+  (matching `PostgresBackend`'s own knobs) are explicit follow-up work.
 - **`tier_to_object_storage()`'s row lock is a REAL improvement over
   SQLite's equivalent, not just a different implementation of the same
   guarantee.** MySQL/MariaDB's InnoDB storage engine has genuine
@@ -491,6 +498,13 @@ UPDATE` immediately before the statement that follows, inside one
   safety guarantee (see [SQLite support](#sqlite-support) above).
   Confirmed with a dedicated, deterministic test, not assumed just
   because InnoDB is documented to support row locks.
+- **MySQL's UPSERT syntax is spelled differently but gives the same
+  atomicity guarantee.** Dedup mode's blob upsert uses `INSERT ... ON
+DUPLICATE KEY UPDATE ref_count = ref_count + 1` (not Postgres's/
+  SQLite's `ON CONFLICT ... DO UPDATE`) -- verified with 20 concurrent
+  threads upserting the same checksum producing `ref_count == 20`
+  exactly, not assumed correct just because the syntax is InnoDB's
+  documented UPSERT form.
 
 ### Serving from a web API
 
@@ -1067,7 +1081,7 @@ Not yet built, tracked honestly rather than implied:
 - [x] Optional HEIC/HEIF support (`pip install zerobucket[heic]`)
 - [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)
 - [x] Deduplication with reference counting (opt-in, `dedup=True`)
-- [ ] SQLite and MySQL adapters (in progress -- `SQLiteBackend`/`AsyncSQLiteBackend` at feature parity with `PostgresBackend`/`AsyncPostgresBackend` as of 0.19.0, see [SQLite support](#sqlite-support); `MySQLBackend` Phase 2 -- core CRUD + streaming + tiering -- as of 0.21.0, see [MySQL support](#mysql-support), dedup/async/pooling still to come)
+- [ ] SQLite and MySQL adapters (in progress -- `SQLiteBackend`/`AsyncSQLiteBackend` at feature parity with `PostgresBackend`/`AsyncPostgresBackend` as of 0.19.0, see [SQLite support](#sqlite-support); `MySQLBackend` Phase 3 -- core CRUD + streaming + tiering + dedup -- as of 0.22.0, see [MySQL support](#mysql-support), async/pooling still to come)
 - [x] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`, `zerobucket verify`)
 - [x] Optional object-storage backend for files that outgrow the database tier (`tier_to_object_storage()`, S3-compatible via `boto3` -- see [Object-storage tiering](#object-storage-tiering))
 - [x] Async client support (`AsyncZeroBucket`, via psycopg3's native async mode -- see [Async support](#async-support) for why this isn't literally the `asyncpg` package despite the name here historically)

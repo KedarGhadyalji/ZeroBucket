@@ -6,6 +6,72 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## [0.22.0] - 2026-09-25
+
+### Added -- MySQL/MariaDB adapter, Phase 3 (dedup mode)
+
+- `MySQLBackend(dedup=True)` -- content-addressed storage with
+  reference counting, mirroring the Postgres/SQLite adapters' dedup
+  schema exactly in shape: a `zerobucket_blobs` table keyed by
+  `checksum_sha256` with a `ref_count`, and a `zerobucket_image_refs`
+  table mapping ids to blobs. Every existing method
+  (`put`/`put_many`/`get`/`get_many`/`get_stream`/`delete`/
+  `delete_many`/`exists`/`metadata`) now branches correctly between
+  classic and dedup mode. Same `dedup=True` + `object_storage=`
+  rejection (raises `ValueError` immediately at construction) as
+  Postgres/SQLite -- dedup mode has no tiering path in this adapter at
+  all, not even a schema for it.
+- **MySQL's UPSERT syntax is genuinely different from Postgres's/
+  SQLite's, not just a different way of writing the same thing**:
+  `INSERT ... ON DUPLICATE KEY UPDATE ref_count = ref_count + 1`
+  instead of `ON CONFLICT ... DO UPDATE`. Verified this gives the
+  identical atomicity guarantee, not just assumed from the syntax: 20
+  concurrent threads (each its own connection, its own transaction)
+  upserting the SAME checksum produced `ref_count == 20` exactly, not
+  less -- InnoDB handling the increment at the row level, not this
+  code's own logic. See the dedicated concurrency test.
+- No `RETURNING` (see Phase 1/2 entries for the general reasoning)
+  means the ref-count decrement on delete can't be one atomic
+  statement here the way Postgres's `UPDATE ... RETURNING ref_count`
+  is: `delete()`/`delete_many()` instead `SELECT ref_count ... FOR
+UPDATE`, compute the new value in Python, then `UPDATE` -- all
+  inside the row lock, closing the same race a RETURNING-based atomic
+  decrement would close. `delete_many()`'s batch case aggregates how
+  many refs each distinct checksum lost (via `collections.Counter`,
+  same approach the SQLite adapter uses) and applies each checksum's
+  decrement exactly once, not once per ref -- covered by a test with
+  30 refs all sharing one blob deleted in a single call.
+- **A real bug caught by actually running the migration, not assumed
+  safe from the SQL being valid**: the dedup schema's two `CREATE
+TABLE` statements were originally one string, same shape as every
+  other adapter's schema constant -- but PyMySQL's `cursor.execute()`
+  only accepts ONE statement per call by default (no
+  `CLIENT.MULTI_STATEMENTS` flag set on the connection). The first
+  attempt at `test_dedup_schema_created` failed immediately with a SQL
+  syntax error pointing at the SECOND `CREATE TABLE`, not a passing
+  test giving false confidence. Fixed by splitting into two separate
+  constants (`_DEDUP_SCHEMA_BLOBS`, `_DEDUP_SCHEMA_REFS`) and two
+  `execute()` calls.
+- 19 new tests (54 total for the MySQL adapter now), all against a
+  real MariaDB 10.11 instance -- shared-blob round-trip correctness,
+  the within-one-batch ref-count accumulation claim verified directly
+  (3 identical `put_many()` items -> `ref_count == 3`, checked against
+  the DB, not just that the calls succeeded), correct decrement math
+  when `delete_many()` removes some-but-not-all refs to a shared blob,
+  blob cleanup happening exactly at `ref_count == 0` (confirmed both
+  that it happens and that a still-referenced blob survives), two
+  independent ids sharing one blob each streaming their own correct,
+  full content, `before_get` hook compatibility, a dedup-specific
+  `tier_to_object_storage()` rejection message, and the concurrency
+  test above.
+- Verified from a **genuinely fresh venv install of the actual built
+  wheel** (`zerobucket[mysql]`): a full
+  put -> put (identical content, shares the blob) -> get (both) ->
+  stream -> delete one ref (other survives) -> delete the other
+  (blob now gone) path, against real MariaDB. Full existing suite
+  re-verified alongside this: 123 passed (54 MySQL + all SQLite
+  sync/async + CLI), lint clean.
+
 ## [0.21.1] - 2026-09-24
 
 ### Fixed -- Python 3.10 compatibility bug breaking CI (and any real 3.10 install)
