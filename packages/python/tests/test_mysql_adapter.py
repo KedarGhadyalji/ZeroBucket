@@ -1,9 +1,9 @@
-"""Tests for MySQLBackend -- Phase 1 (classic-mode core CRUD) and
-Phase 2 (streaming reads + object-storage tiering), see the v0.20.0
-and v0.21.0 CHANGELOG entries. NOT yet implemented for MySQL, tracked
-as explicit follow-up: dedup mode, async support, connection pooling.
-See adapters/mysql.py's module docstring for the full reasoning behind
-each phase's design decisions.
+"""Tests for MySQLBackend -- Phase 1 (classic-mode core CRUD), Phase 2
+(streaming reads + object-storage tiering), and Phase 3 (dedup mode),
+see the v0.20.0, v0.21.0, and v0.22.0 CHANGELOG entries. NOT yet
+implemented for MySQL, tracked as explicit follow-up: async support,
+connection pooling. See adapters/mysql.py's module docstring for the
+full reasoning behind each phase's design decisions.
 
 Runs against a REAL MySQL/MariaDB instance -- set
 ZEROBUCKET_TEST_MYSQL_URL to point at a throwaway database, e.g.:
@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import os
 
+import pymysql
 import pytest
 
-from zerobucket import ImageNotFoundError, ZeroBucket
+from zerobucket import ImageNotFoundError, ObjectStorage, ZeroBucket
 from zerobucket.adapters.mysql import MySQLBackend
 from zerobucket.exceptions import StorageError
 
@@ -568,3 +569,271 @@ def test_connection_participates_in_callers_transaction(mysql_backend, jpeg_byte
 
     # Never committed -- must not exist from a fresh connection's view.
     assert mysql_backend.exists(image_id) is False
+
+
+# ---- dedup mode (Phase 3) -----------------------------------------------
+
+
+def _mysql_scalar(sql: str, params: tuple = ()):
+    """Small helper for assertions that need to look at
+    zerobucket_blobs/zerobucket_image_refs directly, bypassing the
+    ZeroBucket client. Reuses MySQLBackend's own URL parsing rather
+    than hardcoding connection kwargs a second time, so this stays in
+    sync with whatever ZEROBUCKET_TEST_MYSQL_URL actually points at."""
+    connect_kwargs = MySQLBackend(TEST_MYSQL_URL)._connect_kwargs.copy()  # noqa: SLF001
+    conn = pymysql.connect(**connect_kwargs, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            return row[0] if row else None
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def dedup_backend(_mysql_available):
+    backend = MySQLBackend(TEST_MYSQL_URL, dedup=True)
+    conn = backend._connect()  # noqa: SLF001
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
+            cur.execute("TRUNCATE TABLE zerobucket_image_refs;")
+            cur.execute("TRUNCATE TABLE zerobucket_blobs;")
+            cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
+        conn.commit()
+    finally:
+        conn.close()
+    yield backend
+    backend.close()
+
+
+@pytest.fixture
+def dedup_images(dedup_backend):
+    zb = ZeroBucket(backend=dedup_backend)
+    yield zb
+    zb.close()
+
+
+def test_dedup_plus_object_storage_rejected_at_construction(_mysql_available):
+    store = ObjectStorage.__new__(ObjectStorage)  # avoid needing boto3/real creds
+    with pytest.raises(ValueError, match="dedup"):
+        MySQLBackend(TEST_MYSQL_URL, dedup=True, object_storage=store)
+
+
+def test_dedup_schema_created(dedup_backend):
+    tables = set()
+    conn = dedup_backend._connect()  # noqa: SLF001
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT TABLE_NAME FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = DATABASE();"
+            )
+            tables = {row[0] for row in cur.fetchall()}
+    finally:
+        conn.close()
+    assert "zerobucket_blobs" in tables
+    assert "zerobucket_image_refs" in tables
+
+
+def test_dedup_put_identical_content_shares_one_blob(dedup_images, jpeg_bytes):
+    id_a = dedup_images.put(jpeg_bytes)
+    id_b = dedup_images.put(jpeg_bytes)
+    assert id_a != id_b
+
+    blob_count = _mysql_scalar("SELECT COUNT(*) FROM zerobucket_blobs;")
+    ref_count = _mysql_scalar("SELECT ref_count FROM zerobucket_blobs;")
+    assert blob_count == 1
+    assert ref_count == 2
+
+
+def test_dedup_get_both_refs_return_correct_bytes(dedup_images, jpeg_bytes):
+    id_a = dedup_images.put(jpeg_bytes)
+    id_b = dedup_images.put(jpeg_bytes)
+    assert dedup_images.get(id_a).data == jpeg_bytes
+    assert dedup_images.get(id_b).data == jpeg_bytes
+
+
+def test_dedup_different_content_gets_different_blobs(
+    dedup_images, jpeg_bytes, png_bytes
+):
+    dedup_images.put(jpeg_bytes)
+    dedup_images.put(png_bytes)
+    blob_count = _mysql_scalar("SELECT COUNT(*) FROM zerobucket_blobs;")
+    assert blob_count == 2
+
+
+def test_dedup_delete_one_ref_other_survives(dedup_images, jpeg_bytes):
+    id_a = dedup_images.put(jpeg_bytes)
+    id_b = dedup_images.put(jpeg_bytes)
+
+    assert dedup_images.delete(id_a) is True
+    assert dedup_images.exists(id_a) is False
+    assert dedup_images.exists(id_b) is True
+    assert dedup_images.get(id_b).data == jpeg_bytes
+
+
+def test_dedup_deleting_last_ref_removes_blob(dedup_images, jpeg_bytes):
+    id_a = dedup_images.put(jpeg_bytes)
+    dedup_images.delete(id_a)
+    blob_count = _mysql_scalar("SELECT COUNT(*) FROM zerobucket_blobs;")
+    assert blob_count == 0
+
+
+def test_dedup_delete_missing_id_returns_false(dedup_images):
+    assert dedup_images.delete("00000000-0000-0000-0000-000000000000") is False
+
+
+def test_dedup_put_many_repeated_content_accumulates_ref_count(
+    dedup_images, jpeg_bytes
+):
+    """Verifies the within-one-batch ref_count accumulation directly --
+    not just that put_many() succeeds, but that the resulting
+    ref_count is exactly 3, not 1, matching the same guarantee the
+    Postgres/SQLite adapters verified empirically for their own
+    implementations."""
+    results = dedup_images.put_many([jpeg_bytes, jpeg_bytes, jpeg_bytes])
+    assert all(r.success for r in results)
+    ids = [r.image_id for r in results]
+    assert len(set(ids)) == 3
+
+    ref_count = _mysql_scalar("SELECT ref_count FROM zerobucket_blobs;")
+    assert ref_count == 3
+
+
+def test_dedup_delete_many_decrements_correctly_for_shared_checksum(
+    dedup_images, jpeg_bytes
+):
+    """Confirms delete_many()'s Counter-based decrement handles multiple
+    ids sharing one checksum within a single call correctly, not just
+    one-at-a-time delete()."""
+    ids = [
+        r.image_id for r in dedup_images.put_many([jpeg_bytes, jpeg_bytes, jpeg_bytes])
+    ]
+
+    results = dedup_images.delete_many(ids[:2])  # delete 2 of 3 refs
+    assert all(r.deleted for r in results)
+
+    ref_count = _mysql_scalar("SELECT ref_count FROM zerobucket_blobs;")
+    assert ref_count == 1
+    assert dedup_images.exists(ids[2]) is True
+
+
+def test_dedup_delete_many_large_batch_with_repeats(dedup_images, jpeg_bytes):
+    """Same dynamically-sized IN (%s, %s, ...) concern as classic mode's
+    equivalent test, but for the dedup-specific ref+blob path: 30 refs
+    all sharing one blob, delete all of them in one call, confirm the
+    blob is gone too (not left behind with ref_count == 0)."""
+    ids = [dedup_images.put(jpeg_bytes) for _ in range(30)]
+    results = dedup_images.delete_many(ids)
+    assert all(r.deleted for r in results)
+    assert all(not dedup_images.exists(i) for i in ids)
+    assert _mysql_scalar("SELECT COUNT(*) FROM zerobucket_blobs;") == 0
+
+
+def test_dedup_get_many_mixed(dedup_images, jpeg_bytes):
+    id_a = dedup_images.put(jpeg_bytes)
+    results = dedup_images.get_many([id_a, "00000000-0000-0000-0000-000000000000"])
+    by_id = {r.image_id: r for r in results}
+    assert by_id[id_a].success
+    assert not by_id["00000000-0000-0000-0000-000000000000"].success
+
+
+def test_dedup_get_stream(dedup_images):
+    data = _bigger_jpeg_bytes()
+    image_id = dedup_images.put(data)
+    chunks = list(dedup_images.get_stream(image_id, chunk_size=1000))
+    assert b"".join(chunks) == data
+
+
+def test_dedup_get_stream_two_refs_same_blob_both_correct(dedup_images):
+    """Two ids referencing the SAME blob must each stream their own
+    full, correct content -- streaming shouldn't confuse state between
+    refs sharing one underlying blob."""
+    data = _bigger_jpeg_bytes()
+    id_a = dedup_images.put(data)
+    id_b = dedup_images.put(data)
+    assert b"".join(dedup_images.get_stream(id_a, chunk_size=333)) == data
+    assert b"".join(dedup_images.get_stream(id_b, chunk_size=333)) == data
+
+
+def test_dedup_get_stream_not_found_raises(dedup_images):
+    with pytest.raises(ImageNotFoundError):
+        dedup_images.get_stream("00000000-0000-0000-0000-000000000000")
+
+
+def test_dedup_metadata(dedup_images, jpeg_bytes):
+    image_id = dedup_images.put(jpeg_bytes)
+    meta = dedup_images.metadata(image_id)
+    assert meta.size_bytes == len(jpeg_bytes)
+
+
+def test_dedup_before_get_hook_still_works(dedup_backend, jpeg_bytes):
+    """Client-layer hooks (before_get/before_put) are backend-agnostic
+    -- confirms dedup mode doesn't accidentally bypass them."""
+    calls = []
+
+    def before_get(image_id, context):
+        calls.append(image_id)
+        return True
+
+    zb = ZeroBucket(backend=dedup_backend, before_get=before_get)
+    try:
+        image_id = zb.put(jpeg_bytes)
+        zb.get(image_id)
+        assert calls == [image_id]
+    finally:
+        zb.close()
+
+
+def test_dedup_tier_to_object_storage_raises(dedup_images, jpeg_bytes):
+    """Even though object_storage= can't be passed alongside dedup=True
+    at construction, tier_to_object_storage() itself should still fail
+    with a clear, dedup-specific message if somehow called on a dedup
+    backend -- not the generic "no object_storage configured" message,
+    which would be misleading about WHY."""
+    image_id = dedup_images.put(jpeg_bytes)
+    with pytest.raises(StorageError, match="dedup"):
+        dedup_images._backend.tier_to_object_storage(image_id)  # noqa: SLF001
+
+
+def test_dedup_upsert_is_race_safe_under_concurrency(dedup_backend, jpeg_bytes):
+    """Verifies the docstring's concurrency claim directly, not just
+    assumed from `ON DUPLICATE KEY UPDATE` being 'supposed to' be
+    atomic: 20 threads upserting the SAME checksum concurrently (each
+    via its own connection, its own transaction) must leave
+    ref_count == 20 exactly, not less -- InnoDB's row-level atomicity
+    handling the increments, not this code's own logic."""
+    import hashlib
+    import threading
+
+    checksum = hashlib.sha256(jpeg_bytes).hexdigest()
+    errors = []
+
+    def do_put():
+        try:
+            dedup_backend.put(
+                data=jpeg_bytes,
+                mime_type="image/jpeg",
+                original_filename=None,
+                size_bytes=len(jpeg_bytes),
+                width=1,
+                height=1,
+                checksum_sha256=checksum,
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=do_put) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, f"put() raised under concurrency: {errors}"
+    ref_count = _mysql_scalar(
+        "SELECT ref_count FROM zerobucket_blobs WHERE checksum_sha256 = %s;",
+        (checksum,),
+    )
+    assert ref_count == 20
