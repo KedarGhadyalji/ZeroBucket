@@ -1,13 +1,14 @@
 """MySQL / MariaDB storage adapter.
 
-PHASE 3 OF A MULTI-PHASE BUILD, stated directly rather than implied,
+PHASE 5 OF A MULTI-PHASE BUILD, stated directly rather than implied,
 same convention used for the SQLite adapter. Phase 1 (v0.20.0) shipped
 classic-mode core CRUD. Phase 2 (v0.21.0) added streaming reads and
-object-storage tiering. This phase adds dedup mode (`dedup=True`) --
-content-addressed storage with reference counting, mirroring the
-Postgres/SQLite adapters' dedup schema exactly in shape. NOT yet
-implemented, tracked as explicit follow-up phases rather than a silent
-gap: async support, connection pooling.
+object-storage tiering. Phase 3 (v0.22.0) added dedup mode. Phase 4
+(v0.23.0) added async support (adapters/mysql_async.py). This phase
+adds connection pooling (pool_min_size/pool_max_size/pool_timeout),
+matching PostgresBackend's own knobs and defaults exactly. NOT yet
+implemented, tracked as explicit follow-up work rather than a silent
+gap: the on_operation/retry-backoff machinery PostgresBackend has.
 
 Tested against MariaDB 10.11 (this project's sandbox); written against
 MySQL/MariaDB syntax common to both, and the specific divergences
@@ -55,16 +56,27 @@ unfamiliar code:
   ref_count ... FOR UPDATE`, computes the new value in Python, then
   `UPDATE`, all inside the row lock, rather than a single atomic
   RETURNING-based decrement.
-- No connection pool in this phase. Unlike SQLite (a local file, where
-  "no pool" is a deliberate, durable design choice -- see that
-  adapter's module docstring), MySQL is a genuinely networked database
-  where connection setup (TCP handshake + auth) has a real, non-trivial
-  cost. This phase still opens a fresh PyMySQL connection per operation
-  when connection=None purely to keep scope focused on correctness, not
-  because that's judged to be the right long-term design --
-  pool_min_size/pool_max_size/pool_timeout (matching PostgresBackend's
-  own knobs) are explicitly flagged as follow-up work, not silently
-  absent.
+- **Connection pooling uses DBUtils' `PooledDB`, not a hand-rolled
+  pool** -- PyMySQL itself ships no pool at all (unlike psycopg for
+  Postgres, which brings `psycopg_pool`). DBUtils is pure Python, zero
+  dependencies of its own, and a well-established, widely-used pooling
+  layer for exactly this DB-API-2-without-native-pooling situation --
+  writing a correct, thread-safe pool by hand was judged not worth
+  the risk when a mature library already solves it. Installed
+  alongside PyMySQL in the `zerobucket[mysql]` extra -- pooling is
+  core, default behavior here, not opt-in, same as PostgresBackend's
+  own pool.
+  **A real, verified gap in DBUtils, worked around deliberately, not
+  silently**: `PooledDB.connection()` has NO acquire-timeout at all --
+  `blocking=True` waits forever, `blocking=False` raises
+  `TooManyConnectionsError` immediately, with nothing in between.
+  Confirmed directly by reading `PooledDB`'s actual source, not
+  assumed from its docstring. `pool_timeout` is therefore implemented
+  as this adapter's OWN bounded poll-and-retry loop around
+  `blocking=False` (`_connect()`, with capped exponential backoff
+  between attempts) -- DBUtils provides the pool's connection
+  management and thread-safety; this adapter provides the timeout
+  semantics on top.
 - Tiering columns (storage_backend/object_storage_bucket/
   object_storage_key) were deliberately NOT baked into Phase 1's
   schema (see that phase's CHANGELOG entry for why -- it mirrors how
@@ -136,6 +148,7 @@ unfamiliar code:
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections import Counter
 from collections.abc import Iterator
@@ -388,6 +401,38 @@ def _migrate_tiering(cur) -> None:
         )
 
 
+def _never_fail_over(error: BaseException) -> bool:
+    """Passed to DBUtils' `PooledDB(isfatal=...)` to DISABLE its
+    statement-level failover entirely. A REAL hazard found by actually
+    running the existing test suite against the pooled implementation,
+    not by reading docs: DBUtils treats any `OperationalError` raised
+    by `cursor.execute()` as "the connection broke" and, unless it
+    knows a transaction is open (only via its own `begin()`, which
+    this adapter never calls), silently opens a fresh connection and
+    RE-RUNS that one statement. MySQL reports a lock-wait timeout
+    (error 1205) and a deadlock (1213) as `OperationalError` too, so
+    `test_tier_row_lock_blocks_writes_to_same_row_but_not_others`
+    stopped raising the timeout it asserts: DBUtils retried the
+    blocked UPDATE on a new connection (without the test's session
+    setting) until the lock cleared.
+
+    For a storage library that is not merely a test artifact. Every
+    method here runs several statements in ONE transaction (dedup
+    `put()`: upsert the blob, then insert the ref). If statement 2
+    failed with an OperationalError and DBUtils replayed only
+    statement 2 on a new connection, statement 1's work would already
+    be gone with the old connection, so the transaction would be
+    silently half-applied. Returning False here makes DBUtils re-raise
+    the original error instead, and `_run()` rolls back.
+
+    This loses nothing we need: stale idle connections are still
+    detected and replaced when they are checked out of the pool
+    (`ping=1`, DBUtils' default), which is the case pooling actually
+    has to handle.
+    """
+    return False
+
+
 def _now() -> datetime:
     # Naive UTC datetime -- PyMySQL binds Python datetime objects
     # directly to DATETIME columns; storing everything as UTC (and
@@ -430,10 +475,23 @@ class MySQLBackend(StorageBackend):
     immediately at construction -- same restriction, same reasoning, as
     PostgresBackend/SQLiteBackend.
 
+    pool_min_size/pool_max_size/pool_timeout: tune the internal
+    connection pool -- same three knobs, same names, same defaults
+    (1/5/10) as PostgresBackend's own. See module docstring's pooling
+    section for how this is actually implemented (DBUtils' PooledDB,
+    which has no native connections()-acquire timeout, so pool_timeout
+    is a bounded poll-and-retry loop this adapter builds around it, not
+    something DBUtils gives for free).
+
     `connection=` here means a `pymysql.connections.Connection` (not a
     Postgres or SQLite connection) -- the interface in base.py types
     this as `object` specifically so each adapter can narrow it to its
-    own driver's type, same pattern every other adapter uses.
+    own driver's type, same pattern every other adapter uses. A
+    connection acquired internally from the pool is actually a
+    `dbutils.pooled_db.PooledDedicatedDBConnection` wrapper, but it
+    proxies the full DB-API 2 surface (`.cursor()`, `.commit()`,
+    `.rollback()`, `.close()`) transparently, so nothing elsewhere in
+    this file needed to change to accommodate it.
     """
 
     def __init__(
@@ -442,6 +500,9 @@ class MySQLBackend(StorageBackend):
         *,
         auto_migrate: bool = True,
         dedup: bool = False,
+        pool_min_size: int = 1,
+        pool_max_size: int = 5,
+        pool_timeout: float = 10,
         object_storage: ObjectStorage | None = None,
     ) -> None:
         if object_storage is not None and dedup:
@@ -453,19 +514,48 @@ class MySQLBackend(StorageBackend):
         try:
             import pymysql
             import pymysql.cursors
+            from dbutils.pooled_db import PooledDB, TooManyConnectionsError
         except ImportError as exc:
             raise StorageError(
-                "MySQL/MariaDB support requires PyMySQL. Install it with "
-                "`pip install zerobucket[mysql]` (or `pip install pymysql` "
-                "directly). Plain `import zerobucket` and every other "
-                "backend work without it -- this is an optional extra, "
-                "same as boto3 for object-storage tiering or aiosqlite "
-                "for async SQLite."
+                "MySQL/MariaDB support requires PyMySQL and DBUtils "
+                "(DBUtils provides the connection pool -- PyMySQL itself "
+                "doesn't ship one, unlike psycopg for Postgres). Install "
+                "both with `pip install zerobucket[mysql]` (or `pip "
+                "install pymysql dbutils` directly). Plain `import "
+                "zerobucket` and every other backend work without either "
+                "-- this is an optional extra, same as boto3 for "
+                "object-storage tiering or aiosqlite for async SQLite."
             ) from exc
         self._pymysql = pymysql
+        self._too_many_connections_error = TooManyConnectionsError
         self._connect_kwargs = _parse_database_url(database_url)
         self._dedup = dedup
         self._object_storage = object_storage
+        self._pool_timeout = pool_timeout
+        self._pool_max_size = pool_max_size
+        self._closed = False
+
+        try:
+            self._pool = PooledDB(
+                pymysql,
+                mincached=pool_min_size,
+                maxcached=pool_max_size,
+                maxconnections=pool_max_size,
+                blocking=False,  # this adapter implements its own bounded
+                # wait (pool_timeout) around blocking=False -- see
+                # _connect() and the module/class docstrings for why
+                # DBUtils' own blocking=True has no timeout at all.
+                # NEVER let DBUtils silently reconnect-and-retry a failed
+                # statement -- see _never_fail_over()'s docstring.
+                isfatal=_never_fail_over,
+                autocommit=False,
+                charset="utf8mb4",
+                cursorclass=pymysql.cursors.Cursor,
+                **self._connect_kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Could not connect to MySQL/MariaDB: {exc}") from exc
+
         if auto_migrate:
             conn = self._connect()
             try:
@@ -478,26 +568,52 @@ class MySQLBackend(StorageBackend):
                         _migrate_tiering(cur)
                 conn.commit()
             except Exception as exc:  # noqa: BLE001
+                # Don't leak the pool's connections if setup fails
+                # partway through -- close it before propagating, same
+                # reasoning as PostgresBackend's equivalent cleanup.
+                self._pool.close()
                 raise StorageError(f"Migration failed: {exc}") from exc
             finally:
                 conn.close()
 
     def _connect(self) -> pymysql.connections.Connection:
-        try:
-            return self._pymysql.connect(
-                **self._connect_kwargs,
-                autocommit=False,
-                charset="utf8mb4",
-                cursorclass=self._pymysql.cursors.Cursor,
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise StorageError(f"Failed to connect to MySQL/MariaDB: {exc}") from exc
+        """Acquires a connection from the pool, waiting up to
+        pool_timeout seconds if the pool is fully checked out. DBUtils'
+        PooledDB has no native acquire-timeout (blocking=True waits
+        forever; blocking=False raises TooManyConnectionsError
+        immediately) -- this bounded poll-and-retry loop is what
+        actually implements pool_timeout's documented meaning, not
+        something the library provides directly. See class docstring."""
+        if self._closed:
+            raise StorageError("This MySQLBackend has been closed.")
+        deadline = time.monotonic() + self._pool_timeout
+        delay = 0.01
+        while True:
+            try:
+                return self._pool.connection()
+            except self._too_many_connections_error as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise StorageError(
+                        f"Timed out after {self._pool_timeout}s waiting for "
+                        f"a MySQL/MariaDB connection pool slot "
+                        f"(pool_max_size={self._pool_max_size} all in use)."
+                    ) from exc
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, 0.25)  # capped exponential backoff
+            except Exception as exc:  # noqa: BLE001
+                raise StorageError(
+                    f"Failed to connect to MySQL/MariaDB: {exc}"
+                ) from exc
 
     def _run(self, connection, work):
         """Mirrors every other adapter's `_run()` shape (a `work(conn)`
         callable, connection=None vs connection=provided). No retry
-        loop, no on_operation metrics, no pool -- none are implemented
-        in this phase (see module docstring)."""
+        loop, no on_operation metrics in this phase (see module
+        docstring) -- pooling is the one Stage-4-equivalent feature
+        this adapter now has, matching PostgresBackend's own pooling
+        (retry/metrics remain explicit follow-up work, same as
+        before)."""
         if connection is not None:
             return work(connection)
         conn = self._connect()
@@ -509,7 +625,8 @@ class MySQLBackend(StorageBackend):
             conn.rollback()
             raise
         finally:
-            conn.close()
+            conn.close()  # returns the connection to the pool, does not
+            # actually disconnect -- see class docstring.
 
     def _fetch_tiered_bytes(self, object_storage_key: str, *, image_id: str) -> bytes:
         """Shared by get()/get_many() for a row with
@@ -1327,7 +1444,18 @@ class MySQLBackend(StorageBackend):
             raise StorageError(f"Failed to check image existence: {exc}") from exc
 
     def close(self) -> None:
-        """No-op: this backend holds no persistent connection/pool to
-        release in this phase (see module docstring -- a fresh
-        connection is opened and closed per operation). Exists only to
-        satisfy StorageBackend's interface."""
+        """Closes the connection pool and marks this backend closed.
+        Connections currently checked out by other in-flight operations
+        finish normally and are discarded on return. Idempotent.
+
+        The explicit `_closed` flag is NOT redundant with
+        `PooledDB.close()`, verified by a test that failed without it:
+        DBUtils' `close()` only drops the IDLE cached connections and
+        the pool keeps handing out fresh ones afterward, unlike
+        psycopg_pool (which raises PoolClosed). Without the flag, using
+        a closed backend would silently keep working and quietly leak a
+        new connection per call."""
+        if self._closed:
+            return
+        self._closed = True
+        self._pool.close()
