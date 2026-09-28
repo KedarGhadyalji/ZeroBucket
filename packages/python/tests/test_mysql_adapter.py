@@ -837,3 +837,208 @@ def test_dedup_upsert_is_race_safe_under_concurrency(dedup_backend, jpeg_bytes):
         (checksum,),
     )
     assert ref_count == 20
+
+
+# ---- connection pooling (Phase 5) ---------------------------------------
+
+
+def _server_connection_count() -> int:
+    """Total connections the SERVER has ever accepted (not currently
+    open) -- lets a test prove connections are being reused, not just
+    that operations succeed."""
+    return int(
+        _mysql_scalar(
+            "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS "
+            "WHERE VARIABLE_NAME = 'CONNECTIONS';"
+        )
+    )
+
+
+def test_pool_reuses_connections_instead_of_opening_one_per_operation(
+    _mysql_available, jpeg_bytes
+):
+    """The whole point of pooling, verified against the server's own
+    counter: 40 operations through a pool of at most 2 must open
+    nowhere near 40 connections (the pre-pooling behavior)."""
+    backend = MySQLBackend(TEST_MYSQL_URL, pool_min_size=1, pool_max_size=2)
+    zb = ZeroBucket(backend=backend)
+    try:
+        before = _server_connection_count()
+        ids = [zb.put(jpeg_bytes) for _ in range(20)]
+        for image_id in ids:
+            zb.get(image_id)
+        opened = _server_connection_count() - before
+        # +1 slack for the counter query's own connection.
+        assert opened <= 2 + 1, f"opened {opened} connections for 40 operations"
+    finally:
+        zb.close()
+
+
+def test_pool_exhaustion_times_out_with_clear_error(_mysql_available):
+    """pool_timeout is this adapter's OWN bounded wait around DBUtils'
+    blocking=False (DBUtils has no acquire-timeout of its own -- see
+    the module docstring), so it needs a direct test: a fully
+    checked-out pool must raise a clear StorageError after roughly
+    pool_timeout seconds, not hang forever and not fail instantly."""
+    import time
+
+    backend = MySQLBackend(
+        TEST_MYSQL_URL, pool_min_size=1, pool_max_size=2, pool_timeout=0.6
+    )
+    held = [backend._connect(), backend._connect()]  # noqa: SLF001
+    try:
+        start = time.monotonic()
+        with pytest.raises(StorageError, match="Timed out"):
+            backend._connect()  # noqa: SLF001
+        elapsed = time.monotonic() - start
+        assert 0.5 <= elapsed < 3.0, f"waited {elapsed:.2f}s, expected ~0.6s"
+    finally:
+        for conn in held:
+            conn.close()
+        backend.close()
+
+
+def test_pool_waiter_is_served_when_a_connection_is_released(_mysql_available):
+    """The other half of the bounded wait: a caller blocked on an
+    exhausted pool must succeed as soon as a slot frees up, well before
+    pool_timeout expires."""
+    import threading
+    import time
+
+    backend = MySQLBackend(
+        TEST_MYSQL_URL, pool_min_size=1, pool_max_size=1, pool_timeout=5
+    )
+    first = backend._connect()  # noqa: SLF001
+    threading.Timer(0.3, first.close).start()
+    try:
+        start = time.monotonic()
+        second = backend._connect()  # noqa: SLF001
+        elapsed = time.monotonic() - start
+        second.close()
+        assert 0.2 <= elapsed < 2.0
+    finally:
+        backend.close()
+
+
+def test_pool_handles_more_threads_than_pool_slots(mysql_backend, jpeg_bytes):
+    """30 concurrent puts through a 3-slot pool must all succeed --
+    excess callers wait their turn rather than erroring."""
+    import threading
+
+    backend = MySQLBackend(
+        TEST_MYSQL_URL, pool_min_size=1, pool_max_size=3, pool_timeout=20
+    )
+    errors: list[Exception] = []
+    ids: list[str] = []
+
+    def do_put():
+        try:
+            ids.append(
+                backend.put(
+                    data=jpeg_bytes,
+                    mime_type="image/jpeg",
+                    original_filename=None,
+                    size_bytes=len(jpeg_bytes),
+                    width=1,
+                    height=1,
+                    checksum_sha256="0" * 64,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=do_put) for _ in range(30)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    backend.close()
+
+    assert not errors, errors
+    assert len(set(ids)) == 30
+
+
+def test_failed_operation_does_not_poison_the_pool(_mysql_available, jpeg_bytes):
+    """An operation that fails mid-transaction must roll back and hand
+    a clean connection back -- the next operation on the same
+    single-slot pool must work normally."""
+    backend = MySQLBackend(TEST_MYSQL_URL, pool_min_size=1, pool_max_size=1)
+    try:
+        with pytest.raises(StorageError):
+            backend.put(
+                data=jpeg_bytes,
+                mime_type="image/jpeg",
+                original_filename=None,
+                size_bytes=len(jpeg_bytes),
+                width=1,
+                height=1,
+                checksum_sha256="x" * 200,  # too long for CHAR(64)
+            )
+        image_id = backend.put(
+            data=jpeg_bytes,
+            mime_type="image/jpeg",
+            original_filename=None,
+            size_bytes=len(jpeg_bytes),
+            width=1,
+            height=1,
+            checksum_sha256="0" * 64,
+        )
+        assert backend.exists(image_id) is True
+    finally:
+        backend.close()
+
+
+def test_never_replays_a_statement_after_an_operational_error(
+    mysql_backend, jpeg_bytes
+):
+    """Regression guard for the DBUtils failover hazard documented on
+    `_never_fail_over()`: a lock-wait timeout (an OperationalError) must
+    surface to the caller, NOT be silently retried on a fresh
+    connection. Holds a row lock from a raw connection and confirms a
+    pooled UPDATE that hits it raises promptly instead of waiting the
+    lock out and then succeeding."""
+    import time
+
+    import pymysql
+
+    zb = ZeroBucket(backend=mysql_backend)
+    image_id = zb.put(jpeg_bytes)
+
+    holder = pymysql.connect(
+        **mysql_backend._connect_kwargs, autocommit=False
+    )  # noqa: SLF001
+    with holder.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM zerobucket_images WHERE id = %s FOR UPDATE;", (image_id,)
+        )
+
+    conn = mysql_backend._connect()  # noqa: SLF001
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET SESSION innodb_lock_wait_timeout = 1;")
+            start = time.monotonic()
+            with pytest.raises(pymysql.err.OperationalError, match="Lock wait timeout"):
+                cur.execute(
+                    "UPDATE zerobucket_images SET original_filename = 'y' WHERE id = %s;",
+                    (image_id,),
+                )
+            assert time.monotonic() - start < 3
+        conn.rollback()
+    finally:
+        conn.close()
+        holder.rollback()
+        holder.close()
+
+
+def test_unreachable_server_raises_storage_error_at_construction():
+    """Pool creation connects eagerly (min_size=1), so a bad address
+    fails at construction with StorageError, not confusingly later."""
+    with pytest.raises(StorageError, match="Could not connect"):
+        MySQLBackend("mysql://nobody:nothing@127.0.0.1:1/none", pool_timeout=1)
+
+
+def test_operations_after_close_fail_cleanly(_mysql_available):
+    backend = MySQLBackend(TEST_MYSQL_URL)
+    backend.close()
+    with pytest.raises(StorageError):
+        backend.exists("00000000-0000-0000-0000-000000000000")
