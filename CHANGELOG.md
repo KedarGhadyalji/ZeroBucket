@@ -6,6 +6,175 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## [0.24.0] - 2026-09-28
+
+### Added -- MySQL/MariaDB connection pooling (sync and async)
+
+- `MySQLBackend` and `AsyncMySQLBackend` now pool connections, with
+  the same three knobs, names and defaults as `PostgresBackend`:
+  `pool_min_size=1`, `pool_max_size=5`, `pool_timeout=10`. Before this,
+  every operation opened and closed its own connection. Verified
+  against the server's own connection counter, not just that calls
+  succeed: 40 operations through a 2-slot pool open at most 2
+  connections. Pool creation connects eagerly, so a bad address fails
+  at construction with `StorageError`, same as Postgres.
+- **Where the pool comes from differs by side.** PyMySQL ships no pool
+  (psycopg does), so the sync backend uses **DBUtils' `PooledDB`**, now
+  part of the `zerobucket[mysql]` extra (pure Python, no dependencies
+  of its own). aiomysql ships its own (`aiomysql.create_pool`), so
+  `AsyncMySQLBackend` needs nothing new. Pooling is default behavior
+  here, not opt-in, like Postgres.
+- **`pool_timeout` is this library's own code on both sides**, because
+  neither pool has an acquire timeout. Confirmed by reading DBUtils'
+  source: `blocking=True` waits forever, `blocking=False` raises
+  immediately, nothing in between. Sync: a bounded retry loop with
+  capped exponential backoff around `blocking=False`. Async:
+  `asyncio.wait_for()` around `pool.acquire()`. Both raise a clear
+  `StorageError` after roughly `pool_timeout` seconds, and both are
+  tested in both directions (times out when exhausted; a waiter is
+  served promptly when a slot frees).
+- **Two real problems in DBUtils, found by running the tests, not by
+  reading its docs:**
+  1. **It silently re-runs failed statements.** The existing
+     row-lock test (`test_tier_row_lock_blocks_writes...`) started
+     failing with "DID NOT RAISE" once the pool was in. DBUtils treats
+     any `OperationalError` from `execute()` as "the connection broke"
+     and, unless told a transaction is open (only through its own
+     `begin()`, which this code never calls), reconnects and replays
+     that one statement. MySQL reports lock-wait timeouts (1205) and
+     deadlocks (1213) as `OperationalError`, so the blocked UPDATE was
+     retried on a new connection until the lock cleared. Beyond the
+     test, this is a correctness hazard: dedup `put()` runs two
+     statements in one transaction, and replaying only the second on a
+     fresh connection would silently half-apply it. Fixed by passing
+     `isfatal=_never_fail_over` so the original error always
+     propagates and `_run()` rolls back. Stale idle connections are
+     still detected at checkout (`ping=1`), which is the case pooling
+     actually needs. A dedicated regression test now guards this.
+  2. **`PooledDB.close()` leaves the pool usable.** A new test
+     asserting that a closed backend raises failed: DBUtils only drops
+     idle connections and keeps handing out new ones (psycopg_pool
+     raises instead). My first draft of the `close()` docstring claimed
+     the opposite. Fixed with an explicit `_closed` flag; `close()` is
+     idempotent.
+- One real difference from DBUtils on the async side: aiomysql's pool
+  needs an explicit `pool.release(conn)`; `conn.close()` would
+  disconnect. `_run()` releases in a `finally`, so a failed operation
+  (which rolls back) never loses its slot; covered by a single-slot
+  pool test.
+- 14 new tests (88 for the MySQL adapters now), all against real
+  MariaDB 10.11: reuse counted at the server, exhaustion timeout,
+  waiter served on release, 30 threads / 30 tasks through a 3-slot
+  pool, failed operation not poisoning the pool, no statement replay
+  after an `OperationalError`, unreachable server, close semantics.
+  The whole MySQL suite was run three times back to back to check for
+  flakiness (88 passed each time). Also re-verified: SQLite sync/async
+  and CLI suites, lint clean.
+- Verified from three fresh venvs of the built wheel: no extra
+  (import works, `MySQLBackend` raises a clear `StorageError` naming
+  PyMySQL and DBUtils); `[mysql]` (DBUtils installed, PyMySQL resolves
+  to the latest 1.2.3, 20 threads through a 3-slot pool all
+  round-trip); `[mysql,mysql-async]` (PyMySQL pinned to 1.1.3 by the
+  async extra, 20 tasks through a 3-slot pool all round-trip).
+- Not done, still explicit follow-up: `on_operation` metrics and
+  retry/backoff for the MySQL adapters (Postgres has both). Note that
+  the retry decision now has a real reason to be deliberate: a naive
+  "retry on OperationalError" is exactly the hazard described above.
+
+## [0.23.0] - 2026-09-27
+
+### Added -- MySQL/MariaDB adapter, Phase 4 (async support) -- closes the MySQL effort
+
+- `AsyncMySQLBackend` (`zerobucket.adapters.mysql_async`). Scope
+  matches `AsyncPostgresBackend`/`AsyncSQLiteBackend` exactly, not by
+  accident: core CRUD + streaming, classic mode only -- no
+  `dedup=True`, no `tier_to_object_storage()` as a caller-facing
+  operation, no `connection=`, no `on_operation`/retry-backoff.
+  Consistency across all three async adapters was judged more valuable
+  than matching sync MySQL's fuller (Phase 1-3) feature set.
+- **Driver choice, stated directly: `aiomysql`, not `asyncmy`.**
+  asyncmy is faster (Cython-accelerated) but ships as a compiled
+  extension -- that would break this project's consistent
+  "no-compiled-dependency" choice for every optional extra so far
+  (PyMySQL itself was chosen over mysqlclient for exactly this
+  reason). aiomysql is pure Python, built directly on PyMySQL's own
+  protocol implementation -- confirmed via `pip show aiomysql`: its
+  only dependency is PyMySQL, already required by the sync adapter, so
+  zero new transitive dependencies. Installed via the new
+  `zerobucket[mysql-async]` optional extra, never required by the sync
+  `MySQLBackend`.
+- **A real, verified version-compatibility bug, hit twice while
+  building this, not assumed safe from aiomysql's description**:
+  aiomysql 0.3.2 (effectively unmaintained since 2023) imports
+  `escape_dict`/`escape_bytes_prefixed` directly from
+  `pymysql.converters` -- internal names PyMySQL has been actively
+  removing. PyMySQL 1.2.1 removed `escape_dict` outright (aiomysql
+  fails immediately with `ImportError` on `import aiomysql`); PyMySQL
+  1.2.2+ replaced it with a loud poison-pill string, `escape_dict =
+escape_bytes_prefixed = "DO NOT IMPORT THIS!!!"` (aiomysql then fails
+  later, on the first `bytes`-binding query, with `TypeError: 'str'
+object is not callable`). Both failure modes were hit directly: the
+  first real test run against PyMySQL 1.2.3 hit the `TypeError`;
+  tightening the pin to the seemingly-obvious `<1.2.2` boundary then
+  resolved to 1.2.1 in a fresh install and hit the _different_
+  `ImportError` instead. Root-caused by inspecting
+  `pymysql.converters` directly across PyMySQL 1.1.1 through 1.2.3 to
+  find exactly where each name disappeared, not guessed at from either
+  error message alone. Fix: `zerobucket[mysql-async]` pins
+  `PyMySQL<1.2.0` explicitly (aiomysql itself declares no useful upper
+  bound) -- `pip install "zerobucket[mysql,mysql-async]"` together
+  resolves to a PyMySQL version satisfying both `>=1.1` and `<1.2.0`, a
+  real, stable, previous minor release.
+- **A second real bug, unrelated to the above**: aiomysql's
+  `connect()` takes `db=`, not `database=` -- a genuine difference
+  from both PyMySQL's own `connect()` (which accepts `database=` as an
+  alias) and from this adapter's connection kwargs, reused as-is from
+  sync `MySQLBackend`'s URL parser. Caught immediately by actually
+  running it, not assumed compatible just because aiomysql wraps
+  PyMySQL's wire protocol; fixed with a one-key remap in `_connect()`.
+- **A real, inherited, documented limitation, not new to this
+  adapter**: `get()`/`get_many()` reuse sync `MySQLBackend`'s
+  tiering-aware `_SELECT_FULL` query, the same thing
+  `AsyncPostgresBackend` does for Postgres's equivalent. Fetching a
+  row that was tiered via the SYNC client through this async adapter
+  will fail with an unhelpful `bytes(None)`-shaped error rather than a
+  clean message -- this adapter has no `ObjectStorage` to resolve
+  tiered bytes with. Deliberately not special-cased away in this pass
+  (would make MySQL's async adapter diverge from the other two for no
+  caller-visible benefit); `get_stream()` DOES check explicitly and
+  raises a clear, specific `StorageError` for this case, since its
+  metadata lookup already reads `storage_backend` for the not-found
+  check anyway.
+- `_ensure_ready()` applies BOTH the base schema and the tiering
+  migration (same two steps sync `MySQLBackend.__init__` runs), so a
+  table this adapter creates/migrates is immediately
+  schema-compatible with the sync backend on the same database --
+  verified directly with a dedicated test, not assumed from the code
+  reusing the same migration logic.
+- 20 new tests, all against a real MariaDB 10.11 instance -- full
+  round-trip and batch-operation coverage matching the SQLite/Postgres
+  async suites' own scope, the concurrent-delete-mid-stream behavior
+  (matches `AsyncPostgresBackend`, not sync SQLite's WAL-survives-it
+  exception), lazy migrate-once-under-concurrency (20 concurrent first
+  calls), the sync/async schema-compatibility guarantee above, and the
+  tiered-row error-clarity guarantee for `get_stream()`.
+- Verified from **two separate, genuinely fresh venv installs of the
+  actual built wheel**: one with only `[mysql]` confirming
+  `AsyncMySQLBackend` is importable but `aiomysql` stays completely
+  absent (and the constructor raises a clear `StorageError`, not an
+  `ImportError`, if used without it), one with `[mysql,mysql-async]`
+  confirming PyMySQL resolves to the pinned-compatible 1.1.3 and a
+  full `put -> get -> stream -> delete` round trip works for real
+  against real MariaDB. Full existing suite re-verified alongside
+  this: 143 passed (74 MySQL sync+async + all SQLite sync/async +
+  CLI), lint clean.
+- **This closes the entire MySQL/MariaDB adapter effort** (roadmap
+  item #1's second half) -- `MySQLBackend`/`AsyncMySQLBackend` now
+  cover core CRUD, streaming, tiering, dedup mode, and async, matching
+  `SQLiteBackend`/`AsyncSQLiteBackend`'s own scope. Connection pooling
+  for both sync and async MySQL remains explicit follow-up work,
+  tracked the same way in both places.
+
 ## [0.22.0] - 2026-09-25
 
 ### Added -- MySQL/MariaDB adapter, Phase 3 (dedup mode)

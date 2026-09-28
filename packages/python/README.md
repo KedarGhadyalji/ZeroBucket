@@ -239,7 +239,7 @@ Postgres. See the
 [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#sqlite-support)
 on GitHub for why, and what's still missing.
 
-### MySQL support (experimental, Phase 3)
+### MySQL support
 
 ```python
 from zerobucket import ZeroBucket, MySQLBackend  # pip install zerobucket[mysql]
@@ -248,21 +248,39 @@ images = ZeroBucket(backend=MySQLBackend("mysql://user:pass@localhost:3306/mydb"
 image_id = images.put("photo.jpg")
 ```
 
+```python
+from zerobucket import AsyncZeroBucket, AsyncMySQLBackend  # pip install zerobucket[mysql,mysql-async]
+
+images = AsyncZeroBucket(backend=AsyncMySQLBackend("mysql://user:pass@localhost:3306/mydb"))
+image_id = await images.put("photo.jpg")
+```
+
 Core CRUD, `get_stream()` (ranged `SUBSTRING()` queries),
 `tier_to_object_storage()` (`object_storage=`, also needs
-`zerobucket[s3]`), and `dedup=True` (content-addressed storage with
-reference counting) all work as of 0.22.0 -- async support and
-connection pooling are explicit follow-up phases, not silently
-missing. No `RETURNING` (real MySQL 8.0 doesn't support it on any
-statement, unlike MariaDB 10.5+), so `delete_many()`/
-`tier_to_object_storage()`/dedup's ref-count decrement use `SELECT
-... FOR UPDATE` then the following statement inside one transaction
-instead. A genuine improvement over SQLite's tiering: InnoDB has real
-per-row locking, so tiering one image never blocks writes to any
-other row (SQLite has to lock the whole database file for the same
-guarantee). Dedup mode's blob upsert uses MySQL's `ON DUPLICATE KEY
-UPDATE` (not Postgres's/SQLite's `ON CONFLICT`) -- verified atomic
-under 20 concurrent threads, not just assumed. See the
+`zerobucket[s3]`), `dedup=True` (content-addressed storage with
+reference counting), async support, and connection pooling (`pool_min_size`/
+`pool_max_size`/`pool_timeout`, same as Postgres) all work as of 0.24.0 --
+`AsyncMySQLBackend` matches `AsyncPostgresBackend`/`AsyncSQLiteBackend`'s
+scope (core CRUD + streaming, classic mode only). The sync pool is
+DBUtils' (PyMySQL has none; installed with `zerobucket[mysql]`), the
+async pool is aiomysql's own; `pool_timeout` is this library's own
+bounded wait since neither pool has one, and DBUtils' silent
+statement-retry is disabled because it would half-apply
+multi-statement transactions. No
+`RETURNING` (real MySQL 8.0 doesn't support it on any statement,
+unlike MariaDB 10.5+), so `delete_many()`/`tier_to_object_storage()`/
+dedup's ref-count decrement use `SELECT ... FOR UPDATE` then the
+following statement inside one transaction instead. A genuine
+improvement over SQLite's tiering: InnoDB has real per-row locking, so
+tiering one image never blocks writes to any other row (SQLite has to
+lock the whole database file for the same guarantee). Dedup mode's
+blob upsert uses MySQL's `ON DUPLICATE KEY UPDATE` (not Postgres's/
+SQLite's `ON CONFLICT`) -- verified atomic under 20 concurrent
+threads, not just assumed. `AsyncMySQLBackend` uses `aiomysql`, pinned
+against `PyMySQL<1.2.0` in the `zerobucket[mysql-async]` extra to work
+around a real, verified incompatibility in the (unmaintained) aiomysql
+library with newer PyMySQL releases -- see the full explanation for
+what was actually hit and how it was root-caused. See the
 [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#mysql-support)
 on GitHub for every verified design divergence.
 

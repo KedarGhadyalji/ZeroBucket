@@ -412,16 +412,17 @@ UPDATE`-based version has, but `BEGIN IMMEDIATE` is a coarser lock --
 
 ### MySQL support
 
-**Experimental, Phase 3 of a multi-phase build -- classic-mode core
-CRUD + streaming + tiering + dedup mode, not yet at feature parity
-with the Postgres or SQLite adapters.** `MySQLBackend` stores images in
-MySQL or MariaDB instead of Postgres. Requires the `zerobucket[mysql]`
-optional extra (PyMySQL, pure-Python, no compiled extension) -- plain
-`import zerobucket` and every other backend work fine without it, same
-rule as `boto3`/`aiosqlite`:
+**MySQL/MariaDB support is now complete for the roadmap's original
+scope** -- `MySQLBackend` (sync) covers core CRUD, streaming, tiering,
+and dedup mode; `AsyncMySQLBackend` covers core CRUD + streaming,
+classic mode only (matching `AsyncPostgresBackend`/
+`AsyncSQLiteBackend`'s own scope). Both are connection-pooled
+(`pool_min_size`/`pool_max_size`/`pool_timeout`, same knobs and
+defaults as `PostgresBackend`) as of 0.24.0.
 
 ```bash
-pip install zerobucket[mysql]
+pip install zerobucket[mysql]          # sync
+pip install zerobucket[mysql-async]    # + async (also needs zerobucket[mysql])
 ```
 
 ```python
@@ -432,16 +433,13 @@ image_id = images.put("photo.jpg")
 image = images.get(image_id)
 ```
 
-What works today (as of 0.22.0): `put`/`put_many`/`get`/`get_many`/
-`metadata`/`delete`/`delete_many`/`exists`, `get_stream()` (ranged
-`SUBSTRING()` queries -- MySQL/MariaDB's equivalent of Postgres's
-`substring()`-based streaming), `tier_to_object_storage()` (pass
-`object_storage=` to `MySQLBackend`, same as `PostgresBackend`/
-`SQLiteBackend` -- also requires `zerobucket[s3]`), `dedup=True`
-(content-addressed storage with reference counting), `connection=`
-transaction participation, and the `before_get`/`before_put`
-access-control hooks (client-layer, work identically regardless of
-backend).
+```python
+from zerobucket import AsyncZeroBucket, AsyncMySQLBackend
+
+images = AsyncZeroBucket(backend=AsyncMySQLBackend("mysql://user:pass@localhost:3306/mydb"))
+image_id = await images.put("photo.jpg")
+image = await images.get(image_id)
+```
 
 ```python
 from zerobucket import ObjectStorage
@@ -454,14 +452,9 @@ images.tier_to_object_storage(image_id)   # or via the CLI's `zerobucket tier`
 dedup_images = ZeroBucket(backend=MySQLBackend("mysql://...", dedup=True))
 ```
 
-**Not yet implemented, tracked as explicit follow-up phases, same
-convention used throughout this project rather than a silent gap:**
-async support, connection pooling, and the `on_operation`/
-retry-backoff machinery `PostgresBackend` has.
-
-Five genuine, verified MySQL/MariaDB-specific design divergences,
-documented directly in `adapters/mysql.py` rather than left to be
-discovered:
+Six genuine, verified MySQL/MariaDB-specific design divergences,
+documented directly in `adapters/mysql.py`/`adapters/mysql_async.py`
+rather than left to be discovered:
 
 - **No `RETURNING`.** MariaDB 10.5+ supports it; real MySQL 8.0 does
   not, on any statement. `put()`/`put_many()` don't need it (the id is
@@ -482,12 +475,21 @@ UPDATE` immediately before the statement that follows, inside one
   `CREATE TABLE IF NOT EXISTS` unit on both engines. The tiering
   migration itself checks `information_schema` directly for the same
   reason, rather than relying on `ADD COLUMN IF NOT EXISTS`.
-- **No connection pool in this phase.** Unlike SQLite (a local file,
-  where "no pool" is a permanent design choice), MySQL is a networked
-  database where connection setup has a real cost -- this is a scope
-  decision for phases 1 through 3, not a judgment that it's the right
-  long-term design. `pool_min_size`/`pool_max_size`/`pool_timeout`
-  (matching `PostgresBackend`'s own knobs) are explicit follow-up work.
+- **Pooling comes from different places on each side, and neither
+  gives you `pool_timeout` for free.** PyMySQL ships no pool (unlike
+  psycopg), so sync `MySQLBackend` uses DBUtils' `PooledDB`
+  (installed with `zerobucket[mysql]`); aiomysql ships its own, so
+  `AsyncMySQLBackend` needs nothing extra. Neither library has an
+  acquire timeout: DBUtils blocks forever or fails instantly, with
+  nothing between. `pool_timeout` is therefore this library's own
+  bounded wait (a capped-backoff retry loop on the sync side,
+  `asyncio.wait_for` on the async side). Two DBUtils traps found by
+  running the tests, both handled: it **silently re-runs a failed
+  statement on a fresh connection** (it treats MySQL's lock-wait
+  timeout and deadlock errors as "connection broke"), which would
+  half-apply a multi-statement transaction, so that failover is
+  disabled; and `PooledDB.close()` leaves the pool usable, so
+  `close()` also sets a flag that makes later calls fail cleanly.
 - **`tier_to_object_storage()`'s row lock is a REAL improvement over
   SQLite's equivalent, not just a different implementation of the same
   guarantee.** MySQL/MariaDB's InnoDB storage engine has genuine
@@ -505,6 +507,18 @@ DUPLICATE KEY UPDATE ref_count = ref_count + 1` (not Postgres's/
   threads upserting the same checksum producing `ref_count == 20`
   exactly, not assumed correct just because the syntax is InnoDB's
   documented UPSERT form.
+- **`AsyncMySQLBackend` uses `aiomysql`, not `asyncmy`** -- pure
+  Python (consistent with PyMySQL being chosen over mysqlclient for
+  the sync side), but a genuinely unmaintained library with a real
+  version-compatibility landmine: aiomysql 0.3.2 imports internal
+  PyMySQL names that PyMySQL 1.2.x has removed/poisoned. The
+  `zerobucket[mysql-async]` extra pins `PyMySQL<1.2.0` explicitly to
+  work around this -- confirmed necessary by hitting two different
+  failure modes while narrowing the correct version boundary, not
+  guessed at from a changelog. A tiered image fetched via the async
+  client also fails with an unhelpful error (no `ObjectStorage` to
+  resolve it with) -- the same inherited limitation
+  `AsyncPostgresBackend` has for Postgres, not new to MySQL.
 
 ### Serving from a web API
 
@@ -1081,7 +1095,7 @@ Not yet built, tracked honestly rather than implied:
 - [x] Optional HEIC/HEIF support (`pip install zerobucket[heic]`)
 - [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)
 - [x] Deduplication with reference counting (opt-in, `dedup=True`)
-- [ ] SQLite and MySQL adapters (in progress -- `SQLiteBackend`/`AsyncSQLiteBackend` at feature parity with `PostgresBackend`/`AsyncPostgresBackend` as of 0.19.0, see [SQLite support](#sqlite-support); `MySQLBackend` Phase 3 -- core CRUD + streaming + tiering + dedup -- as of 0.22.0, see [MySQL support](#mysql-support), async/pooling still to come)
+- [x] SQLite and MySQL adapters -- `SQLiteBackend`/`AsyncSQLiteBackend` at feature parity with `PostgresBackend`/`AsyncPostgresBackend` as of 0.19.0 (see [SQLite support](#sqlite-support)); `MySQLBackend`/`AsyncMySQLBackend` at the same scope, plus connection pooling, as of 0.24.0 (see [MySQL support](#mysql-support)). SQLite has no pool by design (local file).
 - [x] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`, `zerobucket verify`)
 - [x] Optional object-storage backend for files that outgrow the database tier (`tier_to_object_storage()`, S3-compatible via `boto3` -- see [Object-storage tiering](#object-storage-tiering))
 - [x] Async client support (`AsyncZeroBucket`, via psycopg3's native async mode -- see [Async support](#async-support) for why this isn't literally the `asyncpg` package despite the name here historically)
