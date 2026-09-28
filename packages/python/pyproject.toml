@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zerobucket"
-version = "0.22.0"
+version = "0.24.0"
 description = "Database-native image storage. Your database. Your images. Zero buckets."
 readme = "README.md"
 license = "MIT"
@@ -42,6 +42,11 @@ sqlite-async = [
 ]
 mysql = [
     "PyMySQL>=1.1",
+    "DBUtils>=3.0",
+]
+mysql-async = [
+    "aiomysql>=0.2",
+    "PyMySQL<1.2.0",
 ]
 dev = [
     "pytest>=8.0",
@@ -55,7 +60,9 @@ dev = [
     "boto3>=1.34",
     "moto[s3]>=5.0",
     "aiosqlite>=0.19",
-    "PyMySQL>=1.1",
+    "PyMySQL>=1.1,<1.2.0",
+    "DBUtils>=3.0",
+    "aiomysql>=0.2",
 ]
 
 [project.scripts]
