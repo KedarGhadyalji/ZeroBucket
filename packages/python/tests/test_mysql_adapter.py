@@ -1042,3 +1042,272 @@ def test_operations_after_close_fail_cleanly(_mysql_available):
     backend.close()
     with pytest.raises(StorageError):
         backend.exists("00000000-0000-0000-0000-000000000000")
+
+
+# ---- on_operation metrics + retry/backoff (Phase 6) ----------------------
+
+
+def test_is_retryable_classification(mysql_backend):
+    """Empirical classification, matching the module docstring's claim
+    directly: PyMySQL bundles connection failures, lock-wait-timeout
+    (1205), and deadlock (1213) all under OperationalError, while
+    IntegrityError/ProgrammingError (won't succeed on retry) are
+    separate classes untouched by this check."""
+    import pymysql
+
+    assert (
+        mysql_backend._is_retryable(pymysql.err.OperationalError(2013, "gone away"))
+        is True
+    )
+    assert (
+        mysql_backend._is_retryable(
+            pymysql.err.OperationalError(1205, "Lock wait timeout exceeded")
+        )
+        is True
+    )
+    assert (
+        mysql_backend._is_retryable(
+            pymysql.err.OperationalError(1213, "Deadlock found")
+        )
+        is True
+    )
+    assert mysql_backend._is_retryable(pymysql.err.IntegrityError(1062, "dup")) is False
+    assert (
+        mysql_backend._is_retryable(pymysql.err.ProgrammingError(1064, "syntax"))
+        is False
+    )
+
+
+def test_retry_recovers_from_injected_operational_error(mysql_backend):
+    """Direct exercise of the retry loop with a real PyMySQL exception
+    instance (not a real network flake, which isn't reproducible on
+    demand) -- confirms _run() actually re-runs `work` in full on a
+    fresh connection rather than giving up after one failure."""
+    attempts = []
+
+    def flaky_work(conn):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise mysql_backend._pymysql.err.OperationalError(  # noqa: SLF001
+                2013, "Lost connection to MySQL server during query"
+            )
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+            return cur.fetchone()
+
+    result = mysql_backend._run(None, flaky_work, operation="test_op")  # noqa: SLF001
+    assert result == (1,)
+    assert len(attempts) == 3
+
+
+def test_retry_exhausts_and_raises_after_max_retries(_mysql_available):
+    backend = MySQLBackend(TEST_MYSQL_URL, max_retries=2, retry_base_delay=0.01)
+    attempts = []
+
+    def always_flaky(conn):
+        attempts.append(1)
+        raise backend._pymysql.err.OperationalError(2013, "gone")  # noqa: SLF001
+
+    try:
+        with pytest.raises(pymysql.err.OperationalError):
+            backend._run(None, always_flaky, operation="test_op")  # noqa: SLF001
+        assert len(attempts) == 3  # initial + 2 retries
+    finally:
+        backend.close()
+
+
+def test_non_retryable_error_is_not_retried(mysql_backend):
+    attempts = []
+
+    def bad_work(conn):
+        attempts.append(1)
+        raise mysql_backend._pymysql.err.IntegrityError(
+            1062, "Duplicate entry"
+        )  # noqa: SLF001
+
+    with pytest.raises(pymysql.err.IntegrityError):
+        mysql_backend._run(None, bad_work, operation="test_op")  # noqa: SLF001
+    assert len(attempts) == 1
+
+
+def test_connection_participation_never_retries(mysql_backend):
+    """Matches the class docstring's stated restriction (same as
+    PostgresBackend): a caller-supplied connection= is NEVER
+    automatically retried, even for an error that would otherwise
+    qualify."""
+    attempts = []
+    conn = mysql_backend._connect()  # noqa: SLF001
+
+    def flaky(c):
+        attempts.append(1)
+        raise mysql_backend._pymysql.err.OperationalError(2013, "flaky")  # noqa: SLF001
+
+    try:
+        with pytest.raises(pymysql.err.OperationalError):
+            mysql_backend._run(conn, flaky, operation="test_op")  # noqa: SLF001
+        assert len(attempts) == 1
+    finally:
+        conn.close()
+
+
+def test_retry_recovers_from_a_real_lock_wait_timeout(_mysql_available, jpeg_bytes):
+    """End-to-end, not synthetic: a REAL InnoDB lock-wait-timeout,
+    forced by holding a row lock from a separate connection for longer
+    than the retried attempt's own session lock_wait_timeout, must be
+    retried and succeed once the lock is released -- not just the
+    injected-exception unit test above."""
+    import threading
+
+    setup_backend = MySQLBackend(TEST_MYSQL_URL)
+    image_id = setup_backend.put(
+        data=jpeg_bytes,
+        mime_type="image/jpeg",
+        original_filename=None,
+        size_bytes=len(jpeg_bytes),
+        width=1,
+        height=1,
+        checksum_sha256="0" * 64,
+    )
+
+    holder = setup_backend._connect()  # noqa: SLF001
+    with holder.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM zerobucket_images WHERE id = %s FOR UPDATE;", (image_id,)
+        )
+    threading.Timer(1.2, holder.commit).start()  # releases the lock later
+
+    attempts = []
+
+    def work(conn):
+        attempts.append(1)
+        with conn.cursor() as cur:
+            cur.execute("SET SESSION innodb_lock_wait_timeout = 1;")
+            cur.execute(
+                "UPDATE zerobucket_images SET original_filename = %s WHERE id = %s;",
+                ("locked-test", image_id),
+            )
+
+    setup_backend._run(None, work, operation="test_lock")  # noqa: SLF001
+    assert (
+        len(attempts) >= 2
+    ), "expected at least one retry (first attempt should time out)"
+    setup_backend.close()
+
+
+def test_on_operation_receives_success_events(_mysql_available, jpeg_bytes):
+    events = []
+    backend = MySQLBackend(TEST_MYSQL_URL, on_operation=events.append)
+    zb = ZeroBucket(backend=backend)
+    try:
+        events.clear()  # drop the migrate event
+        image_id = zb.put(jpeg_bytes)
+        zb.get(image_id)
+        zb.exists(image_id)
+        zb.delete(image_id)
+
+        by_op = {e.operation: e for e in events}
+        for op in ("put", "get", "exists", "delete"):
+            assert by_op[op].success is True
+            assert by_op[op].error is None
+            assert by_op[op].retry_count == 0
+            assert by_op[op].duration_seconds >= 0
+    finally:
+        zb.close()
+
+
+def test_on_operation_receives_failure_events(_mysql_available):
+    events = []
+    backend = MySQLBackend(TEST_MYSQL_URL, on_operation=events.append)
+    try:
+        events.clear()
+        with pytest.raises(StorageError):
+            backend.put(
+                data=b"x",
+                mime_type="image/jpeg",
+                original_filename=None,
+                size_bytes=1,
+                width=1,
+                height=1,
+                checksum_sha256="x" * 200,  # too long for CHAR(64) -> DataError
+            )
+        put_events = [e for e in events if e.operation == "put"]
+        assert len(put_events) == 1
+        assert put_events[0].success is False
+        assert put_events[0].error is not None
+        assert put_events[0].retry_count == 0
+    finally:
+        backend.close()
+
+
+def test_on_operation_exception_does_not_break_real_operation(
+    _mysql_available, jpeg_bytes
+):
+    def bad_callback(event):
+        raise RuntimeError("boom")
+
+    backend = MySQLBackend(TEST_MYSQL_URL, on_operation=bad_callback)
+    zb = ZeroBucket(backend=backend)
+    try:
+        image_id = zb.put(jpeg_bytes)  # must not raise despite the callback failing
+        assert zb.exists(image_id) is True
+    finally:
+        zb.close()
+
+
+def test_migrate_emits_operation_event(_mysql_available):
+    events = []
+    backend = MySQLBackend(TEST_MYSQL_URL, on_operation=events.append)
+    try:
+        migrate_events = [e for e in events if e.operation == "migrate"]
+        assert len(migrate_events) == 1
+        assert migrate_events[0].success is True
+        assert migrate_events[0].retry_count == 0
+    finally:
+        backend.close()
+
+
+def test_dedup_operations_report_same_operation_name_as_classic(
+    _mysql_available, jpeg_bytes
+):
+    """Matches OperationEvent's documented convention exactly: a dedup
+    put() reports "put", not some dedup-specific name."""
+    events = []
+    backend = MySQLBackend(TEST_MYSQL_URL, dedup=True, on_operation=events.append)
+    conn = backend._connect()  # noqa: SLF001
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET FOREIGN_KEY_CHECKS = 0;")
+            cur.execute("TRUNCATE TABLE zerobucket_image_refs;")
+            cur.execute("TRUNCATE TABLE zerobucket_blobs;")
+            cur.execute("SET FOREIGN_KEY_CHECKS = 1;")
+        conn.commit()
+    finally:
+        conn.close()
+
+    zb = ZeroBucket(backend=backend)
+    try:
+        events.clear()
+        image_id = zb.put(jpeg_bytes)
+        zb.get(image_id)
+        zb.delete(image_id)
+        ops = {e.operation for e in events}
+        assert ops == {"put", "get", "delete"}
+        assert "put_dedup" not in ops  # exact names, not variants
+    finally:
+        zb.close()
+
+
+def test_get_stream_emits_one_event_per_chunk_plus_metadata_lookup(_mysql_available):
+    events = []
+    backend = MySQLBackend(TEST_MYSQL_URL, on_operation=events.append)
+    zb = ZeroBucket(backend=backend)
+    try:
+        data = _bigger_jpeg_bytes()
+        image_id = zb.put(data)
+        events.clear()
+        chunks = list(zb.get_stream(image_id, chunk_size=1000))
+        stream_events = [e for e in events if e.operation == "get_stream"]
+        assert len(stream_events) == 1 + len(chunks)  # metadata lookup + one per chunk
+        assert all(e.success for e in stream_events)
+    finally:
+        zb.close()
