@@ -412,13 +412,14 @@ UPDATE`-based version has, but `BEGIN IMMEDIATE` is a coarser lock --
 
 ### MySQL support
 
-**MySQL/MariaDB support is now complete for the roadmap's original
-scope** -- `MySQLBackend` (sync) covers core CRUD, streaming, tiering,
-and dedup mode; `AsyncMySQLBackend` covers core CRUD + streaming,
-classic mode only (matching `AsyncPostgresBackend`/
-`AsyncSQLiteBackend`'s own scope). Both are connection-pooled
-(`pool_min_size`/`pool_max_size`/`pool_timeout`, same knobs and
-defaults as `PostgresBackend`) as of 0.24.0.
+**`MySQLBackend` (sync) is now at full feature parity with
+`PostgresBackend`**: core CRUD, streaming, tiering, dedup mode,
+connection pooling, `on_operation` metrics, and automatic retry/backoff
+(same knobs and defaults as Postgres throughout). `AsyncMySQLBackend`
+covers core CRUD + streaming + pooling, classic mode only -- matching
+`AsyncPostgresBackend`/`AsyncSQLiteBackend`'s own scope, which
+deliberately does not include retry/metrics either (see
+`AsyncPostgresBackend`'s own docstring).
 
 ```bash
 pip install zerobucket[mysql]          # sync
@@ -452,7 +453,7 @@ images.tier_to_object_storage(image_id)   # or via the CLI's `zerobucket tier`
 dedup_images = ZeroBucket(backend=MySQLBackend("mysql://...", dedup=True))
 ```
 
-Six genuine, verified MySQL/MariaDB-specific design divergences,
+Seven genuine, verified MySQL/MariaDB-specific design divergences,
 documented directly in `adapters/mysql.py`/`adapters/mysql_async.py`
 rather than left to be discovered:
 
@@ -490,6 +491,20 @@ UPDATE` immediately before the statement that follows, inside one
   half-apply a multi-statement transaction, so that failover is
   disabled; and `PooledDB.close()` leaves the pool usable, so
   `close()` also sets a flag that makes later calls fail cleanly.
+- **Retry classification is simpler than Postgres's needs to be, for a
+  genuine driver-design reason.** Postgres checks `OperationalError`
+  for connection loss PLUS a SQLSTATE set for deadlock/serialization
+  failure, because psycopg raises those as separate exception classes.
+  PyMySQL bundles connection loss, lock-wait-timeout, AND deadlock all
+  under the single `OperationalError` class -- confirmed empirically
+  (a genuine two-transaction deadlock, a genuine held-lock timeout),
+  not assumed -- so one `isinstance` check is correct and sufficient.
+  Retry happens at the whole-operation boundary (a retried attempt
+  re-runs a multi-statement `work()` closure from scratch on a fresh
+  connection), which is what makes it safe for dedup `put()`/
+  `tier_to_object_storage()` and is NOT the same thing as the DBUtils
+  statement-replay hazard disabled above -- deliberately not added to
+  `AsyncMySQLBackend`, matching `AsyncPostgresBackend`'s own scope.
 - **`tier_to_object_storage()`'s row lock is a REAL improvement over
   SQLite's equivalent, not just a different implementation of the same
   guarantee.** MySQL/MariaDB's InnoDB storage engine has genuine
@@ -1095,7 +1110,7 @@ Not yet built, tracked honestly rather than implied:
 - [x] Optional HEIC/HEIF support (`pip install zerobucket[heic]`)
 - [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)
 - [x] Deduplication with reference counting (opt-in, `dedup=True`)
-- [x] SQLite and MySQL adapters -- `SQLiteBackend`/`AsyncSQLiteBackend` at feature parity with `PostgresBackend`/`AsyncPostgresBackend` as of 0.19.0 (see [SQLite support](#sqlite-support)); `MySQLBackend`/`AsyncMySQLBackend` at the same scope, plus connection pooling, as of 0.24.0 (see [MySQL support](#mysql-support)). SQLite has no pool by design (local file).
+- [x] SQLite and MySQL adapters -- `SQLiteBackend`/`AsyncSQLiteBackend` at feature parity with `PostgresBackend`/`AsyncPostgresBackend` as of 0.19.0 (see [SQLite support](#sqlite-support)); `MySQLBackend` at full feature parity with `PostgresBackend` (including pooling and retry/metrics) as of 0.25.0, `AsyncMySQLBackend` matching `AsyncPostgresBackend`'s scope (see [MySQL support](#mysql-support)). SQLite has no pool by design (local file).
 - [x] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`, `zerobucket verify`)
 - [x] Optional object-storage backend for files that outgrow the database tier (`tier_to_object_storage()`, S3-compatible via `boto3` -- see [Object-storage tiering](#object-storage-tiering))
 - [x] Async client support (`AsyncZeroBucket`, via psycopg3's native async mode -- see [Async support](#async-support) for why this isn't literally the `asyncpg` package despite the name here historically)

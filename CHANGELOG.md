@@ -6,6 +6,83 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## [0.25.0] - 2026-09-29
+
+### Added -- MySQL/MariaDB on_operation metrics and automatic retry/backoff
+
+- `MySQLBackend` (sync only -- see below) now supports `on_operation`,
+  `max_retries`, and `retry_base_delay`, same names and defaults
+  (`None`/3/0.1) as `PostgresBackend`. Same restriction, stated in the
+  class docstring: retry and the metrics hook apply only to
+  ZeroBucket's own internally-pooled connections; a call made with
+  your own `connection=` is never retried automatically, so it can't
+  silently interfere with a transaction you're managing yourself.
+- **Retry classification is simpler than Postgres's, for a genuine
+  driver-design reason, not laziness.** Postgres needs two checks
+  (`OperationalError` for connection loss, plus a SQLSTATE set for
+  deadlock/serialization failure, which psycopg raises as separate
+  exception classes). PyMySQL bundles connection loss, lock-wait
+  -timeout (1205), AND deadlock (1213) all under the single
+  `OperationalError` class -- confirmed empirically against a real
+  MariaDB instance (a genuine two-transaction deadlock, and a genuine
+  lock-wait-timeout via a held `SELECT ... FOR UPDATE`), not assumed
+  from documentation. One `isinstance` check is correct and
+  sufficient.
+- Retry happens at the whole-`work()`-closure boundary, not
+  statement-by-statement -- a retried attempt re-runs a multi-statement
+  operation (dedup `put()`, `tier_to_object_storage()`) from scratch on
+  a fresh connection after a full rollback, never assuming partial
+  progress survived. Worth being explicit about since it looks
+  superficially similar to, but is fundamentally different from, the
+  DBUtils failover hazard this adapter disabled last release
+  (`_never_fail_over()`) -- that hazard replayed a single statement
+  assuming the rest of the transaction was intact elsewhere; this
+  retry always restarts the whole logical operation.
+- Migration is now routed through `_run()` (previously a one-off
+  connect/commit) specifically so it gets the same retry treatment as
+  every other operation, matching `PostgresBackend.migrate()`'s own
+  choice, and emits an `operation="migrate"` event when `on_operation`
+  is set at construction.
+- Dedup-mode operations report the SAME operation name as their
+  classic-mode counterpart (`put`, not `put_dedup`) -- verified
+  directly with a test asserting the exact set of names seen, not just
+  that events fire.
+- 12 new tests, all against real MariaDB 10.11: the retry
+  classification itself (lock-wait-timeout and deadlock both
+  `OperationalError`, `IntegrityError`/`ProgrammingError` are not),
+  recovery from an injected transient error, exhaustion after
+  `max_retries`, non-retryable errors never retried, `connection=`
+  never retried, success/failure event shape, callback-exception
+  isolation (a broken `on_operation` callback must never break the
+  real operation), the migrate event, dedup naming, and
+  `get_stream()` emitting one event per chunk plus the metadata
+  lookup. **Plus one real, end-to-end (not synthetic) test**: a
+  genuine InnoDB lock-wait-timeout forced by holding a row lock from a
+  separate connection longer than the retried attempt's own session
+  timeout, confirming the retry actually recovers once the lock
+  clears -- not just that an injected exception gets retried. The full
+  MySQL suite (74 tests) and this specific timing-sensitive test were
+  each run multiple times back to back with no flakiness observed.
+  SQLite sync/async and CLI suites re-verified alongside this, lint
+  clean.
+- Verified from a fresh venv install of the built wheel: real
+  `on_operation` events collected from a genuine
+  `put`/`get`/`delete`/`migrate` sequence against real MariaDB, plus a
+  real retry-loop exercise against the actual pooled connection
+  showing `retry_count == 2` on the returned event.
+- **Deliberately NOT added to `AsyncMySQLBackend`.** Matches
+  `AsyncPostgresBackend`'s own scope decision exactly, stated in its
+  docstring as "no automatic retry ... and no on_operation metrics
+  hook in this first pass" -- MySQL's async adapter has consistently
+  matched `AsyncPostgresBackend`'s scope rather than sync MySQL's
+  fuller one throughout this whole effort (dedup, tiering-as-a
+  -caller-facing-feature, and now retry/metrics), and this round
+  keeps that consistent rather than making MySQL's async adapter the
+  first to diverge from it.
+- This closes the gap between `MySQLBackend` and `PostgresBackend`:
+  the two things Postgres had that MySQL didn't (connection pooling,
+  retry/metrics) are both done as of this release and last.
+
 ## [0.24.0] - 2026-09-28
 
 ### Added -- MySQL/MariaDB connection pooling (sync and async)

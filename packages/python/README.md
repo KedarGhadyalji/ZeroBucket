@@ -258,15 +258,23 @@ image_id = await images.put("photo.jpg")
 Core CRUD, `get_stream()` (ranged `SUBSTRING()` queries),
 `tier_to_object_storage()` (`object_storage=`, also needs
 `zerobucket[s3]`), `dedup=True` (content-addressed storage with
-reference counting), async support, and connection pooling (`pool_min_size`/
-`pool_max_size`/`pool_timeout`, same as Postgres) all work as of 0.24.0 --
-`AsyncMySQLBackend` matches `AsyncPostgresBackend`/`AsyncSQLiteBackend`'s
-scope (core CRUD + streaming, classic mode only). The sync pool is
+reference counting), async support, connection pooling
+(`pool_min_size`/`pool_max_size`/`pool_timeout`), and `on_operation`
+metrics + automatic retry/backoff (`max_retries`/`retry_base_delay`)
+all work as of 0.25.0 -- `MySQLBackend` is now at full feature parity
+with `PostgresBackend`. `AsyncMySQLBackend` matches
+`AsyncPostgresBackend`/`AsyncSQLiteBackend`'s own scope (core CRUD +
+streaming + pooling, classic mode only, deliberately no retry/metrics
+-- `AsyncPostgresBackend` doesn't have those either). The sync pool is
 DBUtils' (PyMySQL has none; installed with `zerobucket[mysql]`), the
 async pool is aiomysql's own; `pool_timeout` is this library's own
 bounded wait since neither pool has one, and DBUtils' silent
 statement-retry is disabled because it would half-apply
-multi-statement transactions. No
+multi-statement transactions. Retry classification is simpler than
+Postgres's for a genuine reason: PyMySQL bundles connection loss,
+lock-wait-timeout, and deadlock all under one `OperationalError` class
+(verified empirically), so one `isinstance` check suffices where
+Postgres needs two. No
 `RETURNING` (real MySQL 8.0 doesn't support it on any statement,
 unlike MariaDB 10.5+), so `delete_many()`/`tier_to_object_storage()`/
 dedup's ref-count decrement use `SELECT ... FOR UPDATE` then the
