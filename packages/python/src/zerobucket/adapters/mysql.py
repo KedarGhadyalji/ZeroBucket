@@ -1,14 +1,20 @@
 """MySQL / MariaDB storage adapter.
 
-PHASE 5 OF A MULTI-PHASE BUILD, stated directly rather than implied,
+PHASE 6 OF A MULTI-PHASE BUILD, stated directly rather than implied,
 same convention used for the SQLite adapter. Phase 1 (v0.20.0) shipped
 classic-mode core CRUD. Phase 2 (v0.21.0) added streaming reads and
 object-storage tiering. Phase 3 (v0.22.0) added dedup mode. Phase 4
-(v0.23.0) added async support (adapters/mysql_async.py). This phase
-adds connection pooling (pool_min_size/pool_max_size/pool_timeout),
-matching PostgresBackend's own knobs and defaults exactly. NOT yet
-implemented, tracked as explicit follow-up work rather than a silent
-gap: the on_operation/retry-backoff machinery PostgresBackend has.
+(v0.23.0) added async support (adapters/mysql_async.py). Phase 5
+(v0.24.0) added connection pooling (pool_min_size/pool_max_size/
+pool_timeout). This phase adds the on_operation metrics hook and
+automatic retry/backoff (max_retries/retry_base_delay), matching
+PostgresBackend's own knobs, defaults, and the same connection=
+restriction (see class docstring). This closes out MySQLBackend's own
+feature set relative to PostgresBackend -- connection pooling and
+retry/metrics were the two things Postgres had that MySQL didn't;
+async MySQL support deliberately does NOT get retry/metrics in this
+pass, matching AsyncPostgresBackend's own scope decision exactly (see
+adapters/mysql_async.py's module docstring).
 
 Tested against MariaDB 10.11 (this project's sandbox); written against
 MySQL/MariaDB syntax common to both, and the specific divergences
@@ -77,6 +83,36 @@ unfamiliar code:
   between attempts) -- DBUtils provides the pool's connection
   management and thread-safety; this adapter provides the timeout
   semantics on top.
+- **Retry classification is SIMPLER than Postgres's, for a genuine
+  driver-design reason, not laziness**: Postgres's `_is_retryable()`
+  needs two checks -- `isinstance(exc, psycopg.OperationalError)` for
+  connection-level failures, PLUS a SQLSTATE-code set-membership check,
+  because psycopg raises deadlock/serialization-failure as their OWN
+  exception subclasses (`psycopg.errors.DeadlockDetected`,
+  `SerializationFailure`), not as `OperationalError`. PyMySQL does it
+  differently: connection loss (codes 2003/2006/2013/...), lock-wait
+  -timeout (1205), AND deadlock (1213) are ALL raised as the single
+  `pymysql.err.OperationalError` class -- confirmed empirically against
+  a real MariaDB instance (a genuine deadlock triggered with two
+  concurrent transactions updating two rows in opposite order, and a
+  genuine lock-wait-timeout via `SELECT ... FOR UPDATE` held past
+  another session's `innodb_lock_wait_timeout`), not assumed from
+  PyMySQL's docs. So a single `isinstance` check is both correct and
+  sufficient here -- no error-code set needed.
+- **Retrying at the `_run()`/whole-work-unit boundary is what makes
+  this safe for multi-statement operations, and is NOT the same thing
+  as the DBUtils failover hazard this adapter deliberately disables
+  elsewhere** (see `_never_fail_over()`). DBUtils' hazard was replaying
+  ONE statement on a fresh connection while assuming the rest of a
+  multi-statement transaction was still intact on the old, discarded
+  connection -- silently half-applying it. This adapter's retry instead
+  re-runs the ENTIRE `work(conn)` closure from scratch on a fresh
+  connection after a full rollback -- for dedup `put()` (upsert blob +
+  insert ref) or `tier_to_object_storage()` (select + upload + update),
+  a retried attempt starts over from nothing, never assumes partial
+  progress survived. The two behaviors look superficially similar
+  (both involve "an operation failed, try again on a new connection")
+  but differ in exactly the dimension that matters for correctness.
 - Tiering columns (storage_backend/object_storage_bucket/
   object_storage_key) were deliberately NOT baked into Phase 1's
   schema (see that phase's CHANGELOG entry for why -- it mirrors how
@@ -148,10 +184,11 @@ unfamiliar code:
 
 from __future__ import annotations
 
+import random
 import time
 import uuid
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlparse
@@ -159,6 +196,7 @@ from urllib.parse import unquote, urlparse
 from ..exceptions import StorageError
 from ..object_storage import ObjectStorage
 from .base import StorageBackend, StoredRecord, StoredRecordMetadata
+from .postgres import OperationEvent
 
 if TYPE_CHECKING:
     import pymysql
@@ -401,6 +439,24 @@ def _migrate_tiering(cur) -> None:
         )
 
 
+# Cap on backoff delay so a misconfigured high retry count can't make a
+# single failing call hang for an unreasonable amount of time. Same
+# value as PostgresBackend's own cap.
+_MAX_BACKOFF_SECONDS = 2.0
+
+
+def _backoff_delay(attempt: int, base_delay: float) -> float:
+    """Exponential backoff with jitter, capped -- identical formula to
+    PostgresBackend's own `_backoff_delay()` (deliberately not
+    reimported from there, since it's a two-line pure function with no
+    MySQL/Postgres-specific behavior; duplicating it here keeps this
+    module's retry machinery self-contained). `attempt` is 1-indexed
+    (the delay before the 2nd try, 3rd try, etc.)."""
+    exponential = base_delay * (2 ** (attempt - 1))
+    jitter = random.uniform(0, base_delay)
+    return min(exponential + jitter, _MAX_BACKOFF_SECONDS)
+
+
 def _never_fail_over(error: BaseException) -> bool:
     """Passed to DBUtils' `PooledDB(isfatal=...)` to DISABLE its
     statement-level failover entirely. A REAL hazard found by actually
@@ -483,6 +539,17 @@ class MySQLBackend(StorageBackend):
     is a bounded poll-and-retry loop this adapter builds around it, not
     something DBUtils gives for free).
 
+    max_retries/retry_base_delay/on_operation: same three knobs, same
+    names, same defaults (3/0.1/None) as PostgresBackend's own. Applies
+    ONLY to ZeroBucket's own internally-pooled connections
+    (connection=None) -- a call using your own connection= is never
+    retried automatically, same reasoning and same restriction as
+    PostgresBackend's docstring gives (retrying a statement on a
+    connection you're managing yourself could silently corrupt your
+    own transaction's semantics). See module docstring's retry section
+    for exactly what's classified as retryable on MySQL and why that
+    classification is simpler than Postgres's.
+
     `connection=` here means a `pymysql.connections.Connection` (not a
     Postgres or SQLite connection) -- the interface in base.py types
     this as `object` specifically so each adapter can narrow it to its
@@ -503,6 +570,9 @@ class MySQLBackend(StorageBackend):
         pool_min_size: int = 1,
         pool_max_size: int = 5,
         pool_timeout: float = 10,
+        max_retries: int = 3,
+        retry_base_delay: float = 0.1,
+        on_operation: Callable[[OperationEvent], None] | None = None,
         object_storage: ObjectStorage | None = None,
     ) -> None:
         if object_storage is not None and dedup:
@@ -533,6 +603,9 @@ class MySQLBackend(StorageBackend):
         self._object_storage = object_storage
         self._pool_timeout = pool_timeout
         self._pool_max_size = pool_max_size
+        self._max_retries = max_retries
+        self._retry_base_delay = retry_base_delay
+        self._on_operation = on_operation
         self._closed = False
 
         try:
@@ -557,8 +630,8 @@ class MySQLBackend(StorageBackend):
             raise StorageError(f"Could not connect to MySQL/MariaDB: {exc}") from exc
 
         if auto_migrate:
-            conn = self._connect()
-            try:
+
+            def migrate_work(conn):
                 with conn.cursor() as cur:
                     if dedup:
                         cur.execute(_DEDUP_SCHEMA_BLOBS)
@@ -566,15 +639,21 @@ class MySQLBackend(StorageBackend):
                     else:
                         cur.execute(_SCHEMA)
                         _migrate_tiering(cur)
-                conn.commit()
+
+            try:
+                # Routed through _run() (not a one-off connect/commit)
+                # specifically so migration gets the SAME transient
+                # -failure retry as every other operation, matching
+                # PostgresBackend.migrate()'s own equivalent choice --
+                # a connection blip during startup shouldn't need a
+                # separate retry story from everything after it.
+                self._run(None, migrate_work, operation="migrate")
             except Exception as exc:  # noqa: BLE001
                 # Don't leak the pool's connections if setup fails
                 # partway through -- close it before propagating, same
                 # reasoning as PostgresBackend's equivalent cleanup.
                 self._pool.close()
                 raise StorageError(f"Migration failed: {exc}") from exc
-            finally:
-                conn.close()
 
     def _connect(self) -> pymysql.connections.Connection:
         """Acquires a connection from the pool, waiting up to
@@ -606,27 +685,105 @@ class MySQLBackend(StorageBackend):
                     f"Failed to connect to MySQL/MariaDB: {exc}"
                 ) from exc
 
-    def _run(self, connection, work):
-        """Mirrors every other adapter's `_run()` shape (a `work(conn)`
-        callable, connection=None vs connection=provided). No retry
-        loop, no on_operation metrics in this phase (see module
-        docstring) -- pooling is the one Stage-4-equivalent feature
-        this adapter now has, matching PostgresBackend's own pooling
-        (retry/metrics remain explicit follow-up work, same as
-        before)."""
-        if connection is not None:
-            return work(connection)
-        conn = self._connect()
+    def _is_retryable(self, exc: BaseException) -> bool:
+        """See module docstring's retry section: PyMySQL raises
+        `OperationalError` for connection-level failures AND for
+        lock-wait-timeout (1205) AND deadlock (1213) alike -- confirmed
+        empirically against a real MariaDB instance during development,
+        not assumed from the class name. Bound to `self` (rather than a
+        bare module function like Postgres's `_is_retryable`) because
+        `pymysql` itself is only available once lazily imported into
+        `self._pymysql` -- this module has no unconditional `import
+        pymysql` at all (see module docstring's optional-dependency
+        rule)."""
+        return isinstance(exc, self._pymysql.err.OperationalError)
+
+    def _emit(
+        self,
+        operation: str,
+        start_time: float,
+        success: bool,
+        error: str | None,
+        retry_count: int,
+    ) -> None:
+        if self._on_operation is None:
+            return
+        event = OperationEvent(
+            operation=operation,
+            duration_seconds=time.monotonic() - start_time,
+            success=success,
+            error=error,
+            retry_count=retry_count,
+        )
         try:
-            result = work(conn)
-            conn.commit()
-            return result
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()  # returns the connection to the pool, does not
-            # actually disconnect -- see class docstring.
+            self._on_operation(event)
+        except Exception:  # noqa: BLE001
+            pass  # never let a metrics callback break a real operation
+
+    def _run(self, connection, work, *, operation: str):
+        """Mirrors every other adapter's `_run()` shape (a `work(conn)`
+        callable, connection=None vs connection=provided) -- kept as-is
+        rather than switched to Postgres's `work(cur)` shape, since
+        every closure in this file already opens its own cursor and
+        converging the two shapes would be pure churn with no behavior
+        change.
+
+        connection provided -> run once, on that exact connection, no
+        retry (see class docstring for why). Still emits an
+        OperationEvent (retry_count always 0 on this path).
+
+        connection is None -> acquire from the pool; retry transient
+        failures (see _is_retryable) up to max_retries times with
+        exponential backoff + jitter, EACH retry re-running `work` in
+        full on a FRESH connection -- this is retry at the whole
+        -logical-operation boundary, not statement-by-statement replay,
+        which is exactly what makes it safe for multi-statement work
+        (dedup put(), tier_to_object_storage()) unlike the DBUtils
+        failover hazard this adapter deliberately disables elsewhere
+        (see _never_fail_over()). Emits exactly one OperationEvent per
+        call, after the final attempt -- duration_seconds covers the
+        whole call including any backoff delays."""
+        start_time = time.monotonic()
+
+        if connection is not None:
+            try:
+                result = work(connection)
+                self._emit(operation, start_time, True, None, 0)
+                return result
+            except Exception as exc:  # noqa: BLE001
+                self._emit(operation, start_time, False, str(exc), 0)
+                raise
+
+        attempt = 0
+        while True:
+            try:
+                conn = self._connect()
+            except Exception as exc:  # noqa: BLE001
+                # Pool-acquire failures (including pool_timeout) are
+                # never retried here -- _connect() already IS a bounded
+                # wait; retrying it again would just repeat that same
+                # wait for no benefit.
+                self._emit(operation, start_time, False, str(exc), attempt)
+                raise
+            try:
+                result = work(conn)
+                conn.commit()
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    conn.rollback()
+                except Exception:  # noqa: BLE001, S110
+                    pass  # connection is likely already dead -- nothing to roll back
+                conn.close()
+                attempt += 1
+                if attempt > self._max_retries or not self._is_retryable(exc):
+                    self._emit(operation, start_time, False, str(exc), attempt - 1)
+                    raise
+                time.sleep(_backoff_delay(attempt, self._retry_base_delay))
+            else:
+                conn.close()  # returns the connection to the pool, does
+                # not actually disconnect -- see class docstring.
+                self._emit(operation, start_time, True, None, attempt)
+                return result
 
     def _fetch_tiered_bytes(self, object_storage_key: str, *, image_id: str) -> bytes:
         """Shared by get()/get_many() for a row with
@@ -690,7 +847,7 @@ class MySQLBackend(StorageBackend):
             return image_id
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="put")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -729,7 +886,7 @@ class MySQLBackend(StorageBackend):
             return image_id
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="put")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -775,7 +932,7 @@ class MySQLBackend(StorageBackend):
             return [image_id for image_id, _ in prepared]
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="put_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -815,7 +972,7 @@ class MySQLBackend(StorageBackend):
             return [image_id for image_id, _ in prepared]
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="put_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -835,7 +992,7 @@ class MySQLBackend(StorageBackend):
                 return cur.fetchone()
 
         try:
-            row = self._run(connection, work)
+            row = self._run(connection, work, operation="get")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image: {exc}") from exc
         if row is None:
@@ -876,7 +1033,7 @@ class MySQLBackend(StorageBackend):
                 return cur.fetchone()
 
         try:
-            row = self._run(connection, work)
+            row = self._run(connection, work, operation="get")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image: {exc}") from exc
         if row is None:
@@ -921,7 +1078,7 @@ class MySQLBackend(StorageBackend):
                 return cur.fetchall()
 
         try:
-            rows = self._run(connection, work)
+            rows = self._run(connection, work, operation="get_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image batch: {exc}") from exc
         results = []
@@ -972,7 +1129,7 @@ class MySQLBackend(StorageBackend):
                 return cur.fetchall()
 
         try:
-            rows = self._run(connection, work)
+            rows = self._run(connection, work, operation="get_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image batch: {exc}") from exc
         return [
@@ -1000,7 +1157,7 @@ class MySQLBackend(StorageBackend):
                 return cur.fetchone()
 
         try:
-            row = self._run(connection, work)
+            row = self._run(connection, work, operation="get_metadata")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
         if row is None:
@@ -1046,7 +1203,7 @@ class MySQLBackend(StorageBackend):
                 return cur.fetchone()
 
         try:
-            info_row = self._run(connection, info_work)
+            info_row = self._run(connection, info_work, operation="get_stream")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
         if info_row is None:
@@ -1079,7 +1236,7 @@ class MySQLBackend(StorageBackend):
                         return cur.fetchone()
 
                 try:
-                    row = self._run(connection, work)
+                    row = self._run(connection, work, operation="get_stream")
                 except Exception as exc:  # noqa: BLE001
                     raise StorageError(f"Failed to stream image: {exc}") from exc
 
@@ -1113,7 +1270,7 @@ class MySQLBackend(StorageBackend):
                 return cur.fetchone()
 
         try:
-            info_row = self._run(connection, info_work)
+            info_row = self._run(connection, info_work, operation="get_stream")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
         if info_row is None:
@@ -1133,7 +1290,7 @@ class MySQLBackend(StorageBackend):
                         return cur.fetchone()
 
                 try:
-                    row = self._run(connection, work)
+                    row = self._run(connection, work, operation="get_stream")
                 except Exception as exc:  # noqa: BLE001
                     raise StorageError(f"Failed to stream image: {exc}") from exc
 
@@ -1220,7 +1377,7 @@ class MySQLBackend(StorageBackend):
                 return True
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="tier_to_object_storage")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -1259,7 +1416,7 @@ class MySQLBackend(StorageBackend):
                 return row
 
         try:
-            row = self._run(connection, work)
+            row = self._run(connection, work, operation="delete")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image: {exc}") from exc
         if row is None:
@@ -1314,7 +1471,7 @@ class MySQLBackend(StorageBackend):
                 return True
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="delete")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image: {exc}") from exc
 
@@ -1359,7 +1516,7 @@ class MySQLBackend(StorageBackend):
                 return rows
 
         try:
-            rows = self._run(connection, work)
+            rows = self._run(connection, work, operation="delete_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image batch: {exc}") from exc
         deleted_ids = []
@@ -1422,7 +1579,7 @@ class MySQLBackend(StorageBackend):
                 return deleted_ids
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="delete_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image batch: {exc}") from exc
 
@@ -1439,7 +1596,7 @@ class MySQLBackend(StorageBackend):
                 return cur.fetchone() is not None
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="exists")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to check image existence: {exc}") from exc
 
