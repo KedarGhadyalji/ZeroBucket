@@ -23,6 +23,12 @@ export type {
   CallOptions,
 } from "./adapters/base.js";
 
+export { ObjectStorage } from "./object-storage.js";
+export type {
+  ObjectStorageLike,
+  ObjectStorageOptions,
+} from "./object-storage.js";
+
 export type {
   Image,
   ImageMetadata,

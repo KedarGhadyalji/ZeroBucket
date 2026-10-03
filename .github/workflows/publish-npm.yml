@@ -1,0 +1,57 @@
+name: Publish to npm
+
+# Triggered by pushing a tag like  npm-v0.1.0  (kept separate from the Python
+# `v*` tags and from the PyPI publish workflow, which fires on GitHub Releases).
+#
+# Uses npm Trusted Publishing (OIDC): there is NO stored npm token. npm verifies
+# that this exact repo + workflow file + environment is allowed to publish.
+# One-time setup (after the first manual publish) is in NPM_PUBLISH_GUIDE.md.
+on:
+  push:
+    tags: ["npm-v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm            # must match the "Environment" field in the npm trusted-publisher settings
+    permissions:
+      contents: read
+      id-token: write           # lets GitHub mint the OIDC token npm checks
+    defaults:
+      run:
+        working-directory: packages/typescript
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 24 bundles npm 11.x. Trusted publishing needs npm >= 11.5.1, and
+      # Node 22's bundled npm 10.x silently fails with ENEEDAUTH.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: packages/typescript/package-lock.json
+
+      - name: Verify npm supports trusted publishing (>= 11.5.1)
+        run: |
+          node -e "
+            const v = require('child_process').execSync('npm --version').toString().trim();
+            const [a, b, c] = v.split('.').map(Number);
+            const ok = a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1)));
+            console.log('npm ' + v);
+            if (!ok) { console.error('npm ' + v + ' is too old for trusted publishing (need >= 11.5.1)'); process.exit(1); }
+          "
+
+      - run: npm ci
+
+      - name: Tag must match package.json version
+        run: |
+          V=$(node -p "require('./package.json').version")
+          [ "${GITHUB_REF_NAME}" = "npm-v${V}" ] || { echo "tag ${GITHUB_REF_NAME} != npm-v${V}"; exit 1; }
+
+      - run: npm run typecheck
+      - run: npm run build
+
+      # No NODE_AUTH_TOKEN. Provenance is attached automatically under trusted publishing.
+      - name: Publish
+        run: npm publish --access public
