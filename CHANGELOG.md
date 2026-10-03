@@ -6,6 +6,29 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.2.0] - 2026-10-03
+
+### Added -- object-storage tiering (parity with the Python package)
+
+- `ObjectStorage` (S3-compatible: AWS S3, MinIO, R2, B2, Spaces) and `ZeroBucket({ objectStorage })`.
+  `@aws-sdk/client-s3` is an optional peer dependency, loaded lazily.
+- `tierToObjectStorage(id)`: explicit, idempotent (`true` / `false` already tiered / `ImageNotFoundError`).
+  The upload runs inside the row-locking transaction, so a failed upload leaves the row untouched.
+- Transparent reads of tiered rows in `get`, `getMany`, `getStream`/`streamTo`/`toWebStream`, byte ranges and the HTTP
+  handler. Streaming uses real S3 `Range` requests. Size mismatches and missing/short objects raise `StorageError`.
+- `delete`/`deleteMany` remove the object after the row. Object-delete failures never fail the delete and are
+  reported as `object_storage_delete` events.
+- Node and Python interoperate on one table and one bucket (same key scheme); the conformance harness now verifies
+  tiering both ways, including cross-package object cleanup.
+- 20 new tests against a real PostgreSQL 16 and a real S3 HTTP API. Mutation-checked: reintroducing each of the
+  following makes a test fail (UPDATE-before-upload without a transaction; dropping `FOR UPDATE`; deleting objects inside a
+  caller transaction).
+
+### Behaviour differences from Python (deliberate)
+
+- `delete(id, { connection })` does not delete the S3 object, so a rolled-back transaction cannot lose data. Python 0.25.0
+  deletes it immediately, which leaves a restored row pointing at a missing object.
+
 ## npm `zerobucket` [0.1.1] - 2026-10-02
 
 First npm release published by GitHub Actions through npm Trusted Publishing (no stored

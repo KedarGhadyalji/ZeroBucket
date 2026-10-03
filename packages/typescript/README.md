@@ -10,8 +10,8 @@ This is the Node.js/TypeScript sibling of the [Python package](https://pypi.org/
 **It uses the exact same table**, so a Node service and a Python service can share one database
 and read each other's images.
 
-> **Status: early (0.1.x).** PostgreSQL, classic mode. Dedup, object-storage tiering, SQLite and MySQL
-> are on the roadmap (see [What's not here yet](#whats-not-here-yet)).
+> **Status: early (0.2.x).** PostgreSQL, classic mode, with S3-compatible object-storage tiering.
+> Dedup, SQLite, MySQL, a CLI and HEIC are on the roadmap (see [What's not here yet](#whats-not-here-yet)).
 
 ## Install
 
@@ -21,6 +21,7 @@ npm install zerobucket pg sharp
 
 `pg` (the Postgres driver) and `sharp` (image decoding/optimizing) are peer dependencies, so you
 control their versions. If you only store PDFs through a custom validator, `sharp` is not needed.
+For [object-storage tiering](#object-storage-tiering) also install `@aws-sdk/client-s3` (optional; loaded only when used).
 Requires Node 20+. Ships ESM and CommonJS with full types.
 
 ## Quick start
@@ -183,6 +184,45 @@ output. Implement `ContentValidator` (`validate(data, { maxBytes })`) to store o
   operation (and once per chunk when streaming). Exceptions in your callback are swallowed.
 - The schema migration is serialized with an advisory lock, so many processes starting at once is safe.
 
+## Object-storage tiering
+
+For the minority of apps whose image volume outgrows what is economical to keep in a database
+(backups, replication lag, per-GB price), move individual images to any S3-compatible store (AWS S3, MinIO,
+Cloudflare R2, Backblaze B2, DigitalOcean Spaces). It is **explicit and opt-in**: `put()` never tiers
+anything by itself, and nothing changes for you until you configure it.
+
+```ts
+import { ZeroBucket, ObjectStorage } from "zerobucket";
+
+const images = new ZeroBucket({
+  connectionString: process.env.DATABASE_URL,
+  objectStorage: new ObjectStorage({ bucket: "my-images" }), // bucket must already exist
+  // endpoint: "https://<account>.r2.cloudflarestorage.com", region: "auto"   // for non-AWS stores
+});
+
+await images.tierToObjectStorage(id); // true = moved now, false = already tiered (safe to re-run a backfill)
+await images.get(id); // unchanged: get / getMany / getStream / HTTP handler all read transparently
+await images.delete(id); // removes the row, then the object
+```
+
+- **Safe by construction.** The upload runs _inside_ the database transaction that locks the row. If it fails,
+  the transaction rolls back and the row is left byte-for-byte untouched: there is never a moment when the bytes
+  exist nowhere, or when a row claims to be tiered without a finished upload.
+- **Real range requests.** Tiered images stream with genuine S3 `Range` GETs, so a `bytes=1000-1999` request fetches
+  exactly those bytes (strictly better than the Postgres `substring()` approach).
+- **Locking tradeoff.** The row lock is held for the whole upload, so concurrent _writes to that one image_ wait. Other
+  rows and plain reads are never blocked. Treat tiering as a maintenance operation, not a request-path call.
+- **Integrity checks.** A tiered object whose size no longer matches the database, or a missing/short object, raises
+  `StorageError`. It never returns wrong data and never silently truncates a stream.
+- **Same keys as Python.** Objects are named by the image's UUID with no prefix, so the Node and Python packages
+  can read, tier and delete each other's objects in one bucket (verified by the conformance harness).
+- **Deleting inside your own transaction** (`delete(id, { connection })`) deliberately does **not** remove the
+  object: we cannot know whether your transaction will commit, and deleting early would turn a rollback into data
+  loss. After you commit, remove it yourself with `objectStorage.delete(id)`.
+- Failures to remove an object after a normal delete never fail the delete (the row is already gone); they are
+  reported through `onOperation` as `object_storage_delete` events.
+- Credentials come from the AWS SDK's standard chain (env vars, shared config, IAM role) or `credentials: {...}`.
+
 ## Shared database with the Python package
 
 Same table (`zerobucket_images`), same checksum (SHA-256 hex of the stored bytes), same tiering
@@ -192,23 +232,22 @@ same corpus of valid and corrupt files identically.
 
 ## Differences from the Python package
 
-|                        | Python                             | npm                                                                                                |
-| ---------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------- |
-| API                    | sync + async clients               | one async client                                                                                   |
-| Malformed id (`"abc"`) | `StorageError` from Postgres       | treated as not found (`ImageNotFoundError`, no DB round trip), friendlier for `/images/:id` routes |
-| `optimize`             | Pillow; EXIF stripped, not applied | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                           |
-| `putMany` inserts      | pipelined                          | one transaction, statements run sequentially                                                       |
-| Formats                | JPEG, PNG, WebP, HEIC (extra)      | JPEG, PNG, WebP (HEIC not yet)                                                                     |
-| Event duration         | `duration_seconds`                 | `durationMs`                                                                                       |
-| Options                | snake_case kwargs                  | camelCase options object                                                                           |
+|                                                | Python                             | npm                                                                                                |
+| ---------------------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------- |
+| API                                            | sync + async clients               | one async client                                                                                   |
+| Malformed id (`"abc"`)                         | `StorageError` from Postgres       | treated as not found (`ImageNotFoundError`, no DB round trip), friendlier for `/images/:id` routes |
+| `optimize`                                     | Pillow; EXIF stripped, not applied | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                           |
+| `putMany` inserts                              | pipelined                          | one transaction, statements run sequentially                                                       |
+| Formats                                        | JPEG, PNG, WebP, HEIC (extra)      | JPEG, PNG, WebP (HEIC not yet)                                                                     |
+| Event duration                                 | `duration_seconds`                 | `durationMs`                                                                                       |
+| `delete(id, connection=...)` on a tiered image | deletes the S3 object immediately  | leaves the object until you delete it after commit (a rolled-back transaction can never lose data) |
+| S3 delete failure after `delete()`             | raises after the row is gone       | never fails the delete; reported via `onOperation`                                                 |
+| Options                                        | snake_case kwargs                  | camelCase options object                                                                           |
 
 ## What's not here yet
 
-Planned, in order: object-storage **tiering** (S3-compatible), **dedup** mode, **SQLite**, **MySQL/MariaDB**.
-Until tiering lands: reading a row that the Python package tiered to S3 throws a clear `StorageError`
-(never wrong data), and **deleting** such a row from Node removes the database row but leaves the S3
-object behind (the same documented orphan behaviour as Python without `object_storage`).
-Delete tiered images from Python if you use tiering.
+Planned, in order: **dedup** mode, **SQLite**, **MySQL/MariaDB**, the `zerobucket` **CLI**, and **HEIC**.
+Tiering and dedup cannot be combined (same rule as the Python package).
 
 ## Runtime notes
 
