@@ -60,5 +60,7 @@ export interface StorageBackend {
   /** Returns the ids that were actually deleted. */
   deleteMany(ids: string[], opts?: CallOptions): Promise<string[]>;
   exists(id: string, opts?: CallOptions): Promise<boolean>;
+  /** null = no such image, false = already tiered (no-op), true = tiered now. Needs object storage configured. */
+  tierToObjectStorage(id: string, opts?: CallOptions): Promise<boolean | null>;
   close(): Promise<void>;
 }

@@ -17,6 +17,7 @@
  */
 import type { Pool, PoolClient, PoolConfig } from "pg";
 import { StorageError } from "../errors.js";
+import type { ObjectStorageLike } from "../object-storage.js";
 import type { OperationEvent, PreparedRow, Queryable } from "../types.js";
 import type {
   CallOptions,
@@ -101,6 +102,10 @@ const DELETE_RETURNING = `DELETE FROM zerobucket_images WHERE id = $1 RETURNING 
 const DELETE_MANY = `DELETE FROM zerobucket_images WHERE id = ANY($1::uuid[]) RETURNING id, storage_backend, object_storage_key;`;
 const EXISTS = `SELECT 1 FROM zerobucket_images WHERE id = $1;`;
 
+// FOR UPDATE: a per-row lock held until the transaction ends (see tierToObjectStorage).
+const SELECT_FOR_TIERING = `SELECT data, mime_type, size_bytes, storage_backend FROM zerobucket_images WHERE id = $1 FOR UPDATE;`;
+const UPDATE_AFTER_TIERING = `UPDATE zerobucket_images SET data = NULL, storage_backend = 'object_storage', object_storage_bucket = $1, object_storage_key = $2, updated_at = now() WHERE id = $3;`;
+
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -184,6 +189,11 @@ export interface PostgresBackendOptions {
   /** Max wait for a pooled connection. Default 10000. */
   poolTimeoutMs?: number;
   onOperation?: (event: OperationEvent) => void;
+  /**
+   * Enables transparent reads of tiered rows and `tierToObjectStorage()`.
+   * Configure it with the same bucket/credentials used to tier the images.
+   */
+  objectStorage?: ObjectStorageLike;
 }
 
 type Work<T> = (q: Queryable) => Promise<T>;
@@ -440,7 +450,7 @@ export class PostgresBackend implements StorageBackend {
     } catch (exc) {
       throw wrap("Failed to retrieve image", exc);
     }
-    return row ? this.toRecord(row, id) : null;
+    return row ? this.hydrate(row, id) : null;
   }
 
   async getMany(
@@ -459,7 +469,7 @@ export class PostgresBackend implements StorageBackend {
     } catch (exc) {
       throw wrap("Failed to retrieve image batch", exc);
     }
-    return rows.map((r) => this.toRecord(r, String(r.id)));
+    return mapLimit(rows, 4, (r) => this.hydrate(r, String(r.id)));
   }
 
   async getMetadata(
@@ -509,12 +519,22 @@ export class PostgresBackend implements StorageBackend {
       throw wrap("Failed to retrieve image metadata", exc);
     }
     if (!info) return null;
-    if (info.storage_backend === "object_storage")
-      throw this.tieredWithoutStorage(id, info.object_storage_key);
-
     const totalSize: number = info.size_bytes;
     const start = opts.range?.start ?? 0;
     const end = Math.min(opts.range?.end ?? totalSize - 1, totalSize - 1); // inclusive, clamped
+
+    if (info.storage_backend === "object_storage") {
+      const os = this.opts.objectStorage;
+      if (!os) throw this.tieredWithoutStorage(id, info.object_storage_key);
+      return streamFromObjectStorage(
+        os,
+        id,
+        info.object_storage_key,
+        start,
+        end,
+        chunkSize,
+      );
+    }
     const self = this;
 
     async function* generate(): AsyncGenerator<Buffer> {
@@ -562,9 +582,8 @@ export class PostgresBackend implements StorageBackend {
         connection,
         async (q) => (await q.query(DELETE_RETURNING, [id])).rows[0],
       );
-      // NOTE: if the row was tiered, the object-storage object is not removed yet
-      // (tiering ships in a later release of this package). Same documented
-      // orphan behaviour as the Python backend without object_storage configured.
+      if (row?.storage_backend === "object_storage")
+        await this.cleanupObject([row.object_storage_key], connection);
       return row !== undefined;
     } catch (exc) {
       throw wrap("Failed to delete image", exc);
@@ -582,6 +601,12 @@ export class PostgresBackend implements StorageBackend {
         "delete_many",
         connection,
         async (q) => (await q.query(DELETE_MANY, [valid])).rows,
+      );
+      await this.cleanupObject(
+        rows
+          .filter((r) => r.storage_backend === "object_storage")
+          .map((r) => r.object_storage_key as string),
+        connection,
       );
       return rows.map((r) => String(r.id));
     } catch (exc) {
@@ -604,12 +629,25 @@ export class PostgresBackend implements StorageBackend {
 
   // ---- helpers ---------------------------------------------------------
 
-  private toRecord(row: any, id: string): StoredRecord {
-    if (row.storage_backend === "object_storage")
-      throw this.tieredWithoutStorage(id, row.object_storage_key);
+  /** Turn a DB row into a record, fetching the bytes from object storage if the row is tiered. */
+  private async hydrate(row: any, id: string): Promise<StoredRecord> {
+    let data: Buffer;
+    if (row.storage_backend === "object_storage") {
+      const os = this.opts.objectStorage;
+      if (!os) throw this.tieredWithoutStorage(id, row.object_storage_key);
+      data = await os.download(row.object_storage_key);
+      if (data.length !== row.size_bytes) {
+        throw new StorageError(
+          `Object ${JSON.stringify(row.object_storage_key)} for image ${JSON.stringify(id)} has ${data.length} bytes ` +
+            `but the database records ${row.size_bytes}. The stored object is corrupted or was replaced.`,
+        );
+      }
+    } else {
+      data = row.data as Buffer;
+    }
     return {
       id: String(row.id),
-      data: row.data as Buffer,
+      data,
       mimeType: row.mime_type,
       originalFilename: row.original_filename,
       sizeBytes: row.size_bytes,
@@ -619,13 +657,138 @@ export class PostgresBackend implements StorageBackend {
     };
   }
 
+  /**
+   * Remove tiered objects AFTER their rows are gone. Ordering is deliberate:
+   * once the row is deleted the image is correctly "not found" to everyone, so
+   * a failed object delete only leaves a harmless orphan, whereas deleting the
+   * object first and then failing the row delete would leave a row pointing at nothing.
+   *
+   * Never runs inside a caller-owned transaction (`connection`): we cannot know
+   * whether it will commit, and destroying data before the commit outcome is known
+   * could leave a rolled-back row pointing at a deleted object. In that case the
+   * object stays until you remove it yourself after committing (objectStorage.delete(id)).
+   * Failures are reported through onOperation and never fail the delete itself.
+   */
+  private async cleanupObject(
+    keys: string[],
+    connection: Queryable | undefined,
+  ): Promise<void> {
+    const os = this.opts.objectStorage;
+    if (!os || connection || keys.length === 0) return;
+    await Promise.all(
+      keys.map(async (key) => {
+        const start = performance.now();
+        try {
+          await os.delete(key);
+          this.emit("object_storage_delete", start, true, null, 0);
+        } catch (exc) {
+          this.emit("object_storage_delete", start, false, msg(exc), 0);
+        }
+      }),
+    );
+  }
+
+  /**
+   * Move an image's bytes out of Postgres into object storage, replacing the
+   * row's `data` with a pointer. Returns:
+   *   null  - no such image
+   *   false - already tiered (a safe no-op, so backfills can be re-run)
+   *   true  - tiered just now
+   *
+   * SAFETY: the upload happens INSIDE the same transaction as the row lock
+   * (SELECT ... FOR UPDATE) and the UPDATE that flips the row. If the upload
+   * fails, the transaction rolls back and the row is untouched: there is no
+   * moment when the bytes exist nowhere, or when a row claims to be tiered
+   * without a completed upload.
+   *
+   * TRADEOFF: the row lock is held for the whole upload. Concurrent writes
+   * to THIS image (delete, tier) wait; every other row is unaffected, and plain
+   * reads are never blocked (Postgres MVCC). Meant for explicit maintenance, not hot paths.
+   *
+   * Retry is safe: a transient error replays the whole closure, and the
+   * deterministic key (the image id) makes the re-upload an idempotent overwrite.
+   */
+  async tierToObjectStorage(
+    id: string,
+    { connection }: CallOptions = {},
+  ): Promise<boolean | null> {
+    const os = this.opts.objectStorage;
+    if (!os) {
+      throw new StorageError(
+        "tierToObjectStorage() requires objectStorage to be configured (new ZeroBucket({ objectStorage: new ObjectStorage({ bucket }) })).",
+      );
+    }
+    if (!isValidId(id)) return null;
+    const key = id.toLowerCase();
+    try {
+      return await this.run(
+        "tier_to_object_storage",
+        connection,
+        async (q) => {
+          const row = (await q.query(SELECT_FOR_TIERING, [id])).rows[0];
+          if (!row) return null;
+          if (row.storage_backend !== "postgres") return false;
+          await os.upload(key, row.data as Buffer, { mimeType: row.mime_type });
+          await q.query(UPDATE_AFTER_TIERING, [os.bucket, key, id]);
+          return true;
+        },
+        { tx: true },
+      );
+    } catch (exc) {
+      throw wrap("Failed to tier image to object storage", exc);
+    }
+  }
+
   private tieredWithoutStorage(id: string, key: string | null): StorageError {
     return new StorageError(
       `Image ${JSON.stringify(id)} is stored in object storage (key=${JSON.stringify(key)}) ` +
-        "but object-storage tiering is not available in this version of the npm package yet. " +
-        "Read it from the Python package (configured with the same bucket), or wait for npm tiering support.",
+        "but this ZeroBucket was constructed without `objectStorage`. Configure it with the " +
+        "same bucket and credentials that were used to tier this image.",
     );
   }
+}
+
+/** Ranged reads straight from the object store; fails loudly rather than ever truncating. */
+async function* streamFromObjectStorage(
+  os: ObjectStorageLike,
+  id: string,
+  key: string,
+  start: number,
+  end: number,
+  chunkSize: number,
+): AsyncGenerator<Buffer> {
+  let offset = start;
+  while (offset <= end) {
+    const last = Math.min(offset + chunkSize - 1, end);
+    const expected = last - offset + 1;
+    const chunk = await os.downloadRange(key, offset, last);
+    if (chunk.length !== expected) {
+      throw new StorageError(
+        `Object ${JSON.stringify(key)} for image ${JSON.stringify(id)} returned ${chunk.length} bytes for a ${expected}-byte range; ` +
+          "the stored object is shorter than the database records.",
+      );
+    }
+    yield chunk;
+    offset = last + 1;
+  }
+}
+
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) {
+        const i = next++;
+        out[i] = await fn(items[i]!);
+      }
+    }),
+  );
+  return out;
 }
 
 function rowParams(r: PreparedRow): unknown[] {

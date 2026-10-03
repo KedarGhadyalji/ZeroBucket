@@ -12,6 +12,7 @@ import { readFile, stat } from "node:fs/promises";
 import { basename } from "node:path";
 import type { Pool } from "pg";
 import type { CallOptions, StorageBackend } from "./adapters/base.js";
+import type { ObjectStorageLike } from "./object-storage.js";
 import {
   DEFAULT_STREAM_CHUNK_SIZE,
   PostgresBackend,
@@ -91,6 +92,14 @@ export interface ZeroBucketOptions<C = unknown> {
   onOperation?: (event: OperationEvent) => void;
 
   /**
+   * S3-compatible object storage, enabling `tierToObjectStorage()` and transparent
+   * reads of images the Python or Node package tiered. Configure it with the same
+   * bucket and credentials used to tier. Without it, reading a tiered image throws
+   * a clear StorageError.
+   */
+  objectStorage?: ObjectStorageLike;
+
+  /**
    * Authorization hook for get / getMany (per id) / getStream / streamTo / metadata.
    * Return false to deny. A hook that THROWS fails closed: the exception
    * propagates (or is captured per item in getMany) and is never treated as allow.
@@ -162,6 +171,7 @@ export class ZeroBucket<C = unknown> {
         poolMaxSize: options.poolMaxSize,
         poolTimeoutMs: options.poolTimeoutMs,
         onOperation: options.onOperation,
+        objectStorage: options.objectStorage,
       });
     this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
     this.maxPixels = options.maxPixels ?? DEFAULT_MAX_PIXELS;
@@ -577,6 +587,24 @@ export class ZeroBucket<C = unknown> {
       error: null,
       success: true,
     }));
+  }
+
+  /**
+   * Move an image's bytes from Postgres into object storage; reads, streams and
+   * deletes keep working transparently. Returns true if tiered now, false if it was
+   * already tiered (safe to re-run in a backfill). Throws ImageNotFoundError if missing.
+   *
+   * The upload runs inside the database transaction: if it fails, the row is left
+   * completely untouched. Explicit and opt-in: put() never tiers automatically.
+   * Not gated by beforeGet/beforePut (it is a maintenance operation, as in the Python package).
+   */
+  async tierToObjectStorage(
+    imageId: string,
+    options: Pick<CallOptions, "connection"> = {},
+  ): Promise<boolean> {
+    const result = await this.backend.tierToObjectStorage(imageId, options);
+    if (result === null) throw new ImageNotFoundError(imageId);
+    return result;
   }
 
   /** Release the pool (if ZeroBucket created it). */
