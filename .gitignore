@@ -30,3 +30,9 @@ Thumbs.db
 # Benchmark output (regenerate, don't version)
 benchmarks/results.csv
 benchmarks/test/retrieved*
+
+# Node / npm package
+node_modules/
+packages/typescript/dist/
+*.tgz
+coverage/

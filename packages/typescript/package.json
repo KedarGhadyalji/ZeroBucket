@@ -1,0 +1,88 @@
+{
+  "name": "zerobucket",
+  "version": "0.1.0",
+  "description": "Database-native image storage for Node.js. Your database. Your images. Zero buckets.",
+  "license": "MIT",
+  "author": "Kedar Ghadyalji",
+  "homepage": "https://github.com/KedarGhadyalji/ZeroBucket",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KedarGhadyalji/ZeroBucket.git",
+    "directory": "packages/typescript"
+  },
+  "keywords": [
+    "images",
+    "postgres",
+    "postgresql",
+    "bytea",
+    "storage",
+    "database",
+    "uploads",
+    "nextjs",
+    "express"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./http": {
+      "import": {
+        "types": "./dist/http.d.ts",
+        "default": "./dist/http.js"
+      },
+      "require": {
+        "types": "./dist/http.d.cts",
+        "default": "./dist/http.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run typecheck && npm run build"
+  },
+  "peerDependencies": {
+    "pg": ">=8.11.0",
+    "sharp": ">=0.33.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    },
+    "sharp": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "pg": "^8.13.0",
+    "sharp": "^0.33.5",
+    "tsup": "^8.3.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
