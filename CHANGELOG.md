@@ -6,6 +6,17 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.1.1] - 2026-10-02
+
+First npm release published by GitHub Actions through npm Trusted Publishing (no stored
+token), so it carries a signed provenance attestation. **No runtime code changes** from 0.1.0.
+
+### Changed
+
+- npm README status line now reads "early (0.1.x)" instead of naming one exact version.
+- `tsconfig.json` now also type-checks `conformance/` (development tooling, not shipped).
+- Release workflow (`publish-npm.yml`) switched to Trusted Publishing on Node 24 / npm >= 11.5.1.
+
 ## npm `zerobucket` [0.1.0] - 2026-10-01
 
 New, independently-versioned package in `packages/typescript/`

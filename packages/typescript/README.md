@@ -10,7 +10,7 @@ This is the Node.js/TypeScript sibling of the [Python package](https://pypi.org/
 **It uses the exact same table**, so a Node service and a Python service can share one database
 and read each other's images.
 
-> **Status: 0.1.0.** PostgreSQL, classic mode. Dedup, object-storage tiering, SQLite and MySQL
+> **Status: early (0.1.x).** PostgreSQL, classic mode. Dedup, object-storage tiering, SQLite and MySQL
 > are on the roadmap (see [What's not here yet](#whats-not-here-yet)).
 
 ## Install
