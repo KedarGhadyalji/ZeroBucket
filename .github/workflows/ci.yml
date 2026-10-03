@@ -85,6 +85,17 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      moto:
+        image: motoserver/moto:latest # S3-compatible server for the tiering tests
+        ports:
+          - 5000:5000
+
+    env:
+      ZEROBUCKET_TEST_S3_ENDPOINT: http://localhost:5000
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+
     strategy:
       matrix:
         node-version: [20, 22, 24]
@@ -123,5 +134,5 @@ jobs:
         env:
           ZEROBUCKET_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/zerobucket_test
         run: |
-          pip install -e ../python
+          pip install -e "../python[s3]"
           bash conformance/run.sh

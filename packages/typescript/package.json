@@ -1,6 +1,6 @@
 {
   "name": "zerobucket",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Database-native image storage for Node.js. Your database. Your images. Zero buckets.",
   "license": "MIT",
   "author": "Kedar Ghadyalji",
@@ -19,7 +19,10 @@
     "database",
     "uploads",
     "nextjs",
-    "express"
+    "express",
+    "s3",
+    "object-storage",
+    "tiering"
   ],
   "type": "module",
   "engines": {
@@ -65,7 +68,8 @@
   },
   "peerDependencies": {
     "pg": ">=8.11.0",
-    "sharp": ">=0.33.0"
+    "sharp": ">=0.33.0",
+    "@aws-sdk/client-s3": ">=3.500.0"
   },
   "peerDependenciesMeta": {
     "pg": {
@@ -73,9 +77,13 @@
     },
     "sharp": {
       "optional": true
+    },
+    "@aws-sdk/client-s3": {
+      "optional": true
     }
   },
   "devDependencies": {
+    "@aws-sdk/client-s3": "^3.1146.0",
     "@types/node": "^22.0.0",
     "@types/pg": "^8.11.0",
     "pg": "^8.13.0",

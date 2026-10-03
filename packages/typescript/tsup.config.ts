@@ -7,5 +7,5 @@ export default defineConfig({
   clean: true,
   target: "node20",
   sourcemap: true,
-  external: ["pg", "sharp"],
+  external: ["pg", "sharp", "@aws-sdk/client-s3"],
 });
