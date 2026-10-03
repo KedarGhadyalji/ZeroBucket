@@ -6,60 +6,13 @@ import {
   ZeroBucket,
   type OperationEvent,
 } from "../src/index.js";
-import { DATABASE_URL, makeImage, newBucket } from "./helpers.js";
-
-const fail = (code: string, message = "injected") =>
-  Object.assign(new Error(message), { code });
-
-/** Wrap a real pool, letting a test inject failures into connect() and into specific statements. */
-function flakyPool(
-  real: pg.Pool,
-  plan: {
-    connectFailures?: string[];
-    failOnce?: (text: string) => string | undefined;
-  } = {},
-) {
-  const stats = { connects: 0, injected: 0 };
-  const failures = [...(plan.connectFailures ?? [])];
-  const used = new Set<string>();
-  const proxy = new Proxy(real, {
-    get(target, prop, recv) {
-      if (prop === "connect") {
-        return async () => {
-          stats.connects++;
-          const code = failures.shift();
-          if (code) {
-            stats.injected++;
-            throw fail(code);
-          }
-          const client = await target.connect();
-          return new Proxy(client, {
-            get(c, p, r) {
-              if (p === "query") {
-                return async (text: unknown, ...rest: unknown[]) => {
-                  const t = typeof text === "string" ? text : "";
-                  const code = plan.failOnce?.(t);
-                  if (code && !used.has(t)) {
-                    used.add(t);
-                    stats.injected++;
-                    await (c.query as any)("ROLLBACK"); // server never saw a commit
-                    throw fail(code);
-                  }
-                  return (c.query as any)(text, ...rest);
-                };
-              }
-              const v = Reflect.get(c, p, r);
-              return typeof v === "function" ? v.bind(c) : v;
-            },
-          });
-        };
-      }
-      const v = Reflect.get(target, prop, recv);
-      return typeof v === "function" ? v.bind(target) : v;
-    },
-  });
-  return { pool: proxy as unknown as pg.Pool, stats };
-}
+import {
+  DATABASE_URL,
+  fail,
+  flakyPool,
+  makeImage,
+  newBucket,
+} from "./helpers.js";
 
 describe.skipIf(!DATABASE_URL)(
   "operations: metrics, retry, pooling, migration",

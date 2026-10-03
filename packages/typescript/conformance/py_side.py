@@ -1,11 +1,21 @@
 """Cross-language conformance, Python half. Usage: py_side.py read|write <dir>"""
 
 import hashlib, json, os, sys
-from zerobucket import ZeroBucket
+from zerobucket import ZeroBucket, ObjectStorage
 from zerobucket.validation import validate_image
 
 mode, d = sys.argv[1], sys.argv[2]
-zb = ZeroBucket(database_url=os.environ["ZEROBUCKET_TEST_DATABASE_URL"])
+bucket, endpoint = os.environ.get("ZEROBUCKET_TEST_S3_BUCKET"), os.environ.get(
+    "ZEROBUCKET_TEST_S3_ENDPOINT"
+)
+store = (
+    ObjectStorage(bucket, endpoint_url=endpoint, region_name="us-east-1")
+    if bucket and endpoint
+    else None
+)
+zb = ZeroBucket(
+    database_url=os.environ["ZEROBUCKET_TEST_DATABASE_URL"], object_storage=store
+)
 sha = lambda b: hashlib.sha256(b).hexdigest()
 
 if mode == "read":  # rows written by Node
@@ -31,6 +41,16 @@ if mode == "read":  # rows written by Node
             sys.exit(1)
         ok += 1
     print(f"python: read {ok}/{len(node)} Node-written rows OK")
+    if store:
+        # Python must be able to clean up an object NODE tiered.
+        t = next((e for e in node.values() if e.get("tiered")), None)
+        if not t:
+            print("FAIL: Node tiered nothing")
+            sys.exit(1)
+        assert store.exists(t["id"]), "node-tiered object missing from bucket"
+        assert zb.delete(t["id"]) is True
+        assert not store.exists(t["id"]), "python delete left node-tiered object behind"
+        print("python: deleted a Node-tiered row and its S3 object was cleaned up")
 else:  # validate the same corpus + write rows for Node to read
     verdicts, stored = {}, {}
     for name in sorted(os.listdir(f"{d}/corpus")):
@@ -52,6 +72,10 @@ else:  # validate the same corpus + write rows for Node to read
             }
         except Exception:
             verdicts[name] = {"ok": False}
+    if store:
+        for name in ("rgb.png", "photo.jpg"):
+            if zb.tier_to_object_storage(stored[name]["id"]):
+                stored[name]["tiered"] = True
     json.dump(stored, open(f"{d}/py_ids.json", "w"))
     node = json.load(open(f"{d}/node_validation.json"))
     diffs = {k: (node[k], verdicts[k]) for k in node if node[k] != verdicts[k]}

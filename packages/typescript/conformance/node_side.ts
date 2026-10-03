@@ -7,12 +7,20 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import sharp from "sharp";
-import { ZeroBucket, validateImage } from "../src/index.js";
+import { ObjectStorage, ZeroBucket, validateImage } from "../src/index.js";
 
 const [mode, dir] = process.argv.slice(2) as [string, string];
 const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+const S3_BUCKET = process.env.ZEROBUCKET_TEST_S3_BUCKET;
+const S3_ENDPOINT = process.env.ZEROBUCKET_TEST_S3_ENDPOINT;
+// Tiering interop is exercised only when an S3-compatible endpoint is provided.
+const os =
+  S3_BUCKET && S3_ENDPOINT
+    ? new ObjectStorage({ bucket: S3_BUCKET, endpoint: S3_ENDPOINT })
+    : undefined;
 const zb = new ZeroBucket({
   connectionString: process.env.ZEROBUCKET_TEST_DATABASE_URL,
+  objectStorage: os,
 });
 
 async function noise(
@@ -83,6 +91,12 @@ if (mode === "write") {
       verdicts[name] = { ok: false };
     }
   }
+  if (os) {
+    for (const name of ["rgb.png", "photo.jpg"]) {
+      const e = stored[name] as { id: string; tiered?: boolean };
+      if (await zb.tierToObjectStorage(e.id)) e.tiered = true;
+    }
+  }
   writeFileSync(
     join(dir, "node_validation.json"),
     JSON.stringify(verdicts, null, 1),
@@ -118,5 +132,29 @@ if (mode === "write") {
   console.log(
     `node: read ${n}/${Object.keys(py).length} Python-written rows OK`,
   );
+  if (os) {
+    // A row Python tiered must be cleaned up by NODE's delete, in the shared bucket.
+    const t = Object.values(py).find((e: any) => e.tiered) as
+      | { id: string }
+      | undefined;
+    if (!t) {
+      console.error("FAIL: Python tiered nothing");
+      process.exitCode = 1;
+    } else {
+      const before = await os.exists(t.id);
+      await zb.delete(t.id);
+      const after = await os.exists(t.id);
+      if (!before || after) {
+        console.error("FAIL: node delete of python-tiered row", {
+          before,
+          after,
+        });
+        process.exitCode = 1;
+      } else
+        console.log(
+          "node: deleted a Python-tiered row and its S3 object was cleaned up",
+        );
+    }
+  }
 }
 await zb.close();
