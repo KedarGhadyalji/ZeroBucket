@@ -6,6 +6,29 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.1.0] - 2026-10-01
+
+New, independently-versioned package in `packages/typescript/`
+(npm tags use the `npm-v*` prefix, e.g. `npm-v0.1.0`).
+
+### Added -- Node.js/TypeScript package, PostgreSQL classic mode
+
+- `ZeroBucket` async client: `put/putMany/get/getMany/metadata/exists/delete/deleteMany`,
+  `getStream/streamTo/toWebStream` (with server-side byte ranges), `connection=` transaction
+  participation, `beforeGet`/`beforePut` fail-closed hooks, `onOperation` metrics, pooling,
+  retry/backoff, `optimize`, pluggable `ContentValidator` + `PDFValidator`.
+- `zerobucket/http`: Web-standard `createImageHandler()` (ETag/304, Range/If-Range/206/416, HEAD)
+  plus `toNodeHandler()` for Express/Fastify/`node:http`. This also delivers the HTTP range-request
+  item that was never built for the Python package.
+- Uses the **same schema** as the Python package; a Node and a Python app can share one database.
+  `conformance/` verifies this in both directions and checks validation parity on a shared corpus.
+- 89 tests against a real PostgreSQL 16, including regression tests for hazards found while building
+  the Python adapters (whole-transaction retry, explicit pool timeout, concurrent first-use migration).
+- Found and fixed during development: `putMany` initially queued concurrent queries on one `pg`
+  client, which `pg` deprecates (removal in pg@9); now sequential, with a test that fails if the
+  warning ever returns.
+- Not yet: dedup, tiering, SQLite, MySQL, HEIC. See `packages/typescript/README.md`.
+
 ## [0.25.0] - 2026-09-29
 
 ### Added -- MySQL/MariaDB on_operation metrics and automatic retry/backoff

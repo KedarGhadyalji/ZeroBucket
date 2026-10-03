@@ -1105,7 +1105,7 @@ and autovacuum tuning notes specific to a BYTEA-heavy table.
 
 Not yet built, tracked honestly rather than implied:
 
-- [ ] TypeScript/npm package with an equivalent API
+- [ ] TypeScript/npm package with an equivalent API -- **in progress**: `zerobucket@0.1.0` ships PostgreSQL classic mode, streaming/ranges, hooks, HTTP helpers; dedup, tiering, SQLite and MySQL to follow (see `packages/typescript/`)
 - [x] Optional resize/format-conversion pipeline (`optimize=True, max_width=...`)
 - [x] Optional HEIC/HEIF support (`pip install zerobucket[heic]`)
 - [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)
