@@ -10,8 +10,8 @@ This is the Node.js/TypeScript sibling of the [Python package](https://pypi.org/
 **It uses the exact same table**, so a Node service and a Python service can share one database
 and read each other's images.
 
-> **Status: early (0.2.x).** PostgreSQL, classic mode, with S3-compatible object-storage tiering.
-> Dedup, SQLite, MySQL, a CLI and HEIC are on the roadmap (see [What's not here yet](#whats-not-here-yet)).
+> **Status: early (0.3.x).** PostgreSQL in classic and dedup modes, with S3-compatible object-storage tiering.
+> SQLite, MySQL, a CLI and HEIC are on the roadmap (see [What's not here yet](#whats-not-here-yet)).
 
 ## Install
 
@@ -152,6 +152,10 @@ try {
 }
 ```
 
+Multi-statement operations (`putMany`, dedup `put`/`delete`, tiering) are **atomic even on a bare `pg.Client`
+with no open transaction**: ZeroBucket opens its own, or uses a `SAVEPOINT` inside yours so a failure rolls back only
+its own work and leaves your transaction usable.
+
 ## Batches
 
 `putMany` / `getMany` / `deleteMany` are best-effort per item (one bad file doesn't abort the rest):
@@ -183,6 +187,33 @@ output. Implement `ContentValidator` (`validate(data, { maxBytes })`) to store o
 - `onOperation(event)` receives `{ operation, durationMs, success, error, retryCount }` for every
   operation (and once per chunk when streaming). Exceptions in your callback are swallowed.
 - The schema migration is serialized with an advisory lock, so many processes starting at once is safe.
+
+## Deduplication
+
+Store identical bytes once. In dedup mode every `put()` still returns its own id and keeps its own filename,
+but images with the same content share a single stored blob with a reference count (think: the same logo or default
+avatar uploaded a thousand times).
+
+```ts
+const images = new ZeroBucket({ connectionString, dedup: true });
+const a = await images.put(logo, { filename: "a.png" });
+const b = await images.put(logo, { filename: "b.png" }); // different id, same blob: ref_count = 2
+await images.delete(a); // blob stays: ref_count = 1
+await images.delete(b); // last reference gone: blob removed
+```
+
+- Uses separate tables (`zerobucket_blobs` + `zerobucket_image_refs`, identical to the Python package), so dedup and
+  classic data can never be confused. A Node and a Python dedup app share one database and one set of blobs.
+- Reference counts are exact under concurrency: 20 simultaneous `put()`s of the same bytes give `ref_count == 20`, and a
+  `put()` racing the delete of the last reference never loses or leaks the blob (both are tested).
+- Batches (`putMany`, `deleteMany`) take their blob locks in sorted checksum order, so overlapping batches in
+  opposite orders cannot deadlock each other.
+- Everything else works unchanged: hooks, streaming, ranges, the HTTP handler, optimize, validators, metrics, retry.
+- Dedup **cannot be combined with `objectStorage`** (a shared blob has many owners), same rule as Python.
+
+**Moving existing data in:** `await images.migrateClassicToDedup()` copies every classic image into the dedup tables,
+keeping each id, and never modifies the classic table. It runs in small batches (bounded memory), is safe to re-run
+(already-migrated ids are skipped and counted), and refuses up front if any classic image is tiered to object storage.
 
 ## Object-storage tiering
 
@@ -232,21 +263,24 @@ same corpus of valid and corrupt files identically.
 
 ## Differences from the Python package
 
-|                                                | Python                             | npm                                                                                                |
-| ---------------------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------- |
-| API                                            | sync + async clients               | one async client                                                                                   |
-| Malformed id (`"abc"`)                         | `StorageError` from Postgres       | treated as not found (`ImageNotFoundError`, no DB round trip), friendlier for `/images/:id` routes |
-| `optimize`                                     | Pillow; EXIF stripped, not applied | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                           |
-| `putMany` inserts                              | pipelined                          | one transaction, statements run sequentially                                                       |
-| Formats                                        | JPEG, PNG, WebP, HEIC (extra)      | JPEG, PNG, WebP (HEIC not yet)                                                                     |
-| Event duration                                 | `duration_seconds`                 | `durationMs`                                                                                       |
-| `delete(id, connection=...)` on a tiered image | deletes the S3 object immediately  | leaves the object until you delete it after commit (a rolled-back transaction can never lose data) |
-| S3 delete failure after `delete()`             | raises after the row is gone       | never fails the delete; reported via `onOperation`                                                 |
-| Options                                        | snake_case kwargs                  | camelCase options object                                                                           |
+|                                                | Python                                                                     | npm                                                                                                |
+| ---------------------------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| API                                            | sync + async clients                                                       | one async client                                                                                   |
+| Malformed id (`"abc"`)                         | `StorageError` from Postgres                                               | treated as not found (`ImageNotFoundError`, no DB round trip), friendlier for `/images/:id` routes |
+| `optimize`                                     | Pillow; EXIF stripped, not applied                                         | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                           |
+| `putMany` inserts                              | pipelined                                                                  | one transaction, statements run sequentially                                                       |
+| Formats                                        | JPEG, PNG, WebP, HEIC (extra)                                              | JPEG, PNG, WebP (HEIC not yet)                                                                     |
+| Event duration                                 | `duration_seconds`                                                         | `durationMs`                                                                                       |
+| `migrateClassicToDedup`                        | loads the whole table into memory; fails if re-run or if any row is tiered | batched, safe to re-run, refuses tiered rows with a clear message                                  |
+| Dedup `putMany` / `deleteMany` locking         | arbitrary order (overlapping batches can deadlock)                         | sorted checksum order (cannot deadlock)                                                            |
+| `connection=` without an open transaction      | multi-statement ops rely on the driver's implicit transaction              | always atomic (own transaction or savepoint)                                                       |
+| `delete(id, connection=...)` on a tiered image | deletes the S3 object immediately                                          | leaves the object until you delete it after commit (a rolled-back transaction can never lose data) |
+| S3 delete failure after `delete()`             | raises after the row is gone                                               | never fails the delete; reported via `onOperation`                                                 |
+| Options                                        | snake_case kwargs                                                          | camelCase options object                                                                           |
 
 ## What's not here yet
 
-Planned, in order: **dedup** mode, **SQLite**, **MySQL/MariaDB**, the `zerobucket` **CLI**, and **HEIC**.
+Planned, in order: **SQLite**, **MySQL/MariaDB**, the `zerobucket` **CLI**, and **HEIC**.
 Tiering and dedup cannot be combined (same rule as the Python package).
 
 ## Runtime notes

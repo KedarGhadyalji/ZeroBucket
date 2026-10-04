@@ -6,6 +6,29 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.3.0] - 2026-10-04
+
+### Added -- dedup mode (parity with the Python package)
+
+- `new ZeroBucket({ dedup: true })`: content-addressed storage with reference counting, same
+  `zerobucket_blobs` / `zerobucket_image_refs` schema as Python, so both packages share one dedup database.
+  Works with every existing feature (hooks, streaming, ranges, HTTP handler, optimize, validators, metrics, retry).
+  Combining `dedup` with `objectStorage` throws, as in Python.
+- `migrateClassicToDedup()`: non-destructive, id-preserving, batched, re-runnable; refuses tiered classic rows.
+- Multi-statement operations are now atomic on a caller-supplied `connection` even with no open transaction
+  (savepoint inside the caller's transaction, otherwise a transaction of our own). This also hardens classic `putMany`.
+- 24 new tests, including: 20 concurrent puts => `ref_count == 20`; put racing the delete of the last reference (25
+  rounds, retry disabled); overlapping batches in opposite orders with retry disabled (no deadlocks); atomicity on an
+  autocommit connection; migration paging across tied timestamps. Mutation-checked: removing the sorted lock order, the
+  atomic wrapper, or the exact-count decrement each makes a test fail.
+- Cross-language conformance now also runs in dedup mode: each package deletes a reference to a blob the other
+  created, and the ref_count decrements by exactly one with the other reference still readable.
+
+### Found while building
+
+- A migration keyset cursor that round-tripped `created_at` through a JS `Date` (milliseconds) looped forever on
+  Postgres microsecond timestamps. Fixed by passing timestamps as text; a no-progress guard now aborts instead of looping.
+
 ## npm `zerobucket` [0.2.0] - 2026-10-03
 
 ### Added -- object-storage tiering (parity with the Python package)
