@@ -7,11 +7,14 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import sharp from "sharp";
+import pg from "pg";
 import { ObjectStorage, ZeroBucket, validateImage } from "../src/index.js";
 
 const [mode, dir] = process.argv.slice(2) as [string, string];
 const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
-const S3_BUCKET = process.env.ZEROBUCKET_TEST_S3_BUCKET;
+// ZEROBUCKET_CONF_DEDUP=1 runs the whole flow with BOTH packages in dedup mode (tiering is not supported there).
+const DEDUP = process.env.ZEROBUCKET_CONF_DEDUP === "1";
+const S3_BUCKET = DEDUP ? undefined : process.env.ZEROBUCKET_TEST_S3_BUCKET;
 const S3_ENDPOINT = process.env.ZEROBUCKET_TEST_S3_ENDPOINT;
 // Tiering interop is exercised only when an S3-compatible endpoint is provided.
 const os =
@@ -21,7 +24,23 @@ const os =
 const zb = new ZeroBucket({
   connectionString: process.env.ZEROBUCKET_TEST_DATABASE_URL,
   objectStorage: os,
+  dedup: DEDUP,
 });
+const refCount = async (checksum: string) => {
+  const pool = new pg.Pool({
+    connectionString: process.env.ZEROBUCKET_TEST_DATABASE_URL,
+  });
+  try {
+    return (
+      await pool.query(
+        "SELECT ref_count FROM zerobucket_blobs WHERE checksum_sha256=$1",
+        [checksum],
+      )
+    ).rows[0]?.ref_count as number | undefined;
+  } finally {
+    await pool.end();
+  }
+};
 
 async function noise(
   fmt: "jpeg" | "png" | "webp",
@@ -49,6 +68,7 @@ if (mode === "write") {
     "rgb.png": await noise("png", 64, 48),
     "rgba.png": await noise("png", 33, 17, 4),
     "photo.jpg": jpeg,
+    "photo_copy.jpg": jpeg, // identical bytes: shares one blob in dedup mode
     "progressive.jpg": await noise("jpeg", 80, 80, 3, { progressive: true }),
     "img.webp": await noise("webp", 70, 50),
     "one_px.png": await noise("png", 1, 1),
@@ -132,6 +152,26 @@ if (mode === "write") {
   console.log(
     `node: read ${n}/${Object.keys(py).length} Python-written rows OK`,
   );
+  if (DEDUP) {
+    // Python wrote photo.jpg and photo_copy.jpg (same bytes => one shared blob). Node deletes ONE of them.
+    const a = py["photo.jpg"],
+      b = py["photo_copy.jpg"];
+    const before = await refCount(a.checksum);
+    await zb.delete(b.id);
+    const after = await refCount(a.checksum);
+    const survivor = await zb.get(a.id);
+    if (
+      before === undefined ||
+      after !== before - 1 ||
+      sha(survivor.data) !== a.checksum
+    ) {
+      console.error("FAIL: dedup shared-blob delete", { before, after });
+      process.exitCode = 1;
+    } else
+      console.log(
+        `node: deleted a Python-written ref to a shared blob (ref_count ${before} -> ${after}); the other ref still reads fine`,
+      );
+  }
   if (os) {
     // A row Python tiered must be cleaned up by NODE's delete, in the shared bucket.
     const t = Object.values(py).find((e: any) => e.tiered) as
