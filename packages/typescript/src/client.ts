@@ -22,6 +22,7 @@ import {
   ImageNotFoundError,
   ImageTooLargeError,
   ImageValidationError,
+  StorageError,
 } from "./errors.js";
 import { type OptimizeOptions, optimizeImage } from "./optimize.js";
 import type {
@@ -100,6 +101,13 @@ export interface ZeroBucketOptions<C = unknown> {
   objectStorage?: ObjectStorageLike;
 
   /**
+   * Content-addressed mode: identical bytes are stored once and shared by reference, each image
+   * keeping its own id and filename. Cannot be combined with `objectStorage`. Uses separate tables
+   * (zerobucket_blobs / zerobucket_image_refs); see `migrateClassicToDedup()` for existing data.
+   */
+  dedup?: boolean;
+
+  /**
    * Authorization hook for get / getMany (per id) / getStream / streamTo / metadata.
    * Return false to deny. A hook that THROWS fails closed: the exception
    * propagates (or is captured per item in getMany) and is never treated as allow.
@@ -172,6 +180,7 @@ export class ZeroBucket<C = unknown> {
         poolTimeoutMs: options.poolTimeoutMs,
         onOperation: options.onOperation,
         objectStorage: options.objectStorage,
+        dedup: options.dedup,
       });
     this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
     this.maxPixels = options.maxPixels ?? DEFAULT_MAX_PIXELS;
@@ -605,6 +614,21 @@ export class ZeroBucket<C = unknown> {
     const result = await this.backend.tierToObjectStorage(imageId, options);
     if (result === null) throw new ImageNotFoundError(imageId);
     return result;
+  }
+
+  /**
+   * One-time, non-destructive copy of classic-mode images into a dedup instance's tables, keeping every
+   * id. Call it on an instance created with `dedup: true`. Safe to re-run. See PostgresBackend for details.
+   */
+  migrateClassicToDedup(): ReturnType<
+    NonNullable<StorageBackend["migrateClassicToDedup"]>
+  > {
+    if (!this.backend.migrateClassicToDedup) {
+      throw new StorageError(
+        "This backend does not support migrateClassicToDedup().",
+      );
+    }
+    return this.backend.migrateClassicToDedup();
   }
 
   /** Release the pool (if ZeroBucket created it). */

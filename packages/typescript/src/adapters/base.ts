@@ -62,5 +62,12 @@ export interface StorageBackend {
   exists(id: string, opts?: CallOptions): Promise<boolean>;
   /** null = no such image, false = already tiered (no-op), true = tiered now. Needs object storage configured. */
   tierToObjectStorage(id: string, opts?: CallOptions): Promise<boolean | null>;
+  /** Dedup-mode instances only: copy the classic table into the dedup tables (non-destructive). */
+  migrateClassicToDedup?(): Promise<{
+    imagesMigrated: number;
+    distinctBlobsCreated: number;
+    duplicateReferencesFound: number;
+    alreadyMigrated: number;
+  }>;
   close(): Promise<void>;
 }
