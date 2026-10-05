@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import sharp from "sharp";
+import Database from "better-sqlite3";
 import pg from "pg";
 import { ObjectStorage, ZeroBucket, validateImage } from "../src/index.js";
 
@@ -21,12 +22,33 @@ const os =
   S3_BUCKET && S3_ENDPOINT
     ? new ObjectStorage({ bucket: S3_BUCKET, endpoint: S3_ENDPOINT })
     : undefined;
-const zb = new ZeroBucket({
-  connectionString: process.env.ZEROBUCKET_TEST_DATABASE_URL,
-  objectStorage: os,
-  dedup: DEDUP,
-});
+// ZEROBUCKET_CONF_BACKEND=sqlite runs the flow on a shared SQLite FILE instead of Postgres.
+const SQLITE_PATH =
+  process.env.ZEROBUCKET_CONF_BACKEND === "sqlite"
+    ? process.env.ZEROBUCKET_CONF_SQLITE_PATH
+    : undefined;
+const zb = SQLITE_PATH
+  ? new ZeroBucket({ sqlite: SQLITE_PATH, objectStorage: os, dedup: DEDUP })
+  : new ZeroBucket({
+      connectionString: process.env.ZEROBUCKET_TEST_DATABASE_URL,
+      objectStorage: os,
+      dedup: DEDUP,
+    });
 const refCount = async (checksum: string) => {
+  if (SQLITE_PATH) {
+    const db = new Database(SQLITE_PATH, { readonly: true });
+    try {
+      return (
+        db
+          .prepare(
+            "SELECT ref_count FROM zerobucket_blobs WHERE checksum_sha256=?",
+          )
+          .get(checksum) as { ref_count: number } | undefined
+      )?.ref_count;
+    } finally {
+      db.close();
+    }
+  }
   const pool = new pg.Pool({
     connectionString: process.env.ZEROBUCKET_TEST_DATABASE_URL,
   });

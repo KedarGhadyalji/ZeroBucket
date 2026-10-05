@@ -1,7 +1,7 @@
 """Cross-language conformance, Python half. Usage: py_side.py read|write <dir>"""
 
 import hashlib, json, os, sys
-import psycopg
+import psycopg, sqlite3
 from zerobucket import ZeroBucket, ObjectStorage
 from zerobucket.validation import validate_image
 
@@ -20,14 +20,36 @@ store = (
     if bucket and endpoint
     else None
 )
-zb = ZeroBucket(
-    database_url=os.environ["ZEROBUCKET_TEST_DATABASE_URL"],
-    object_storage=store,
-    dedup=DEDUP,
+SQLITE_PATH = (
+    os.environ.get("ZEROBUCKET_CONF_SQLITE_PATH")
+    if os.environ.get("ZEROBUCKET_CONF_BACKEND") == "sqlite"
+    else None
 )
+if SQLITE_PATH:
+    from zerobucket import SQLiteBackend
+
+    zb = ZeroBucket(
+        backend=SQLiteBackend(SQLITE_PATH, dedup=DEDUP, object_storage=store)
+    )
+else:
+    zb = ZeroBucket(
+        database_url=os.environ["ZEROBUCKET_TEST_DATABASE_URL"],
+        object_storage=store,
+        dedup=DEDUP,
+    )
 
 
 def ref_count(checksum):
+    if SQLITE_PATH:
+        c = sqlite3.connect(SQLITE_PATH)
+        try:
+            row = c.execute(
+                "SELECT ref_count FROM zerobucket_blobs WHERE checksum_sha256=?",
+                (checksum,),
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            c.close()
     with psycopg.connect(os.environ["ZEROBUCKET_TEST_DATABASE_URL"]) as c:
         row = c.execute(
             "SELECT ref_count FROM zerobucket_blobs WHERE checksum_sha256=%s",
