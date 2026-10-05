@@ -11,10 +11,10 @@ export type {
   BeforePutHook,
 } from "./client.js";
 
-export {
-  PostgresBackend,
-  DEFAULT_STREAM_CHUNK_SIZE,
-} from "./adapters/postgres.js";
+export { PostgresBackend } from "./adapters/postgres.js";
+export { SQLiteBackend } from "./adapters/sqlite.js";
+export type { SQLiteBackendOptions } from "./adapters/sqlite.js";
+export { DEFAULT_STREAM_CHUNK_SIZE } from "./adapters/shared.js";
 export type { PostgresBackendOptions } from "./adapters/postgres.js";
 export type {
   StorageBackend,
@@ -37,6 +37,8 @@ export type {
   BatchDeleteResult,
   OperationEvent,
   Queryable,
+  SqliteDatabaseLike,
+  Connection,
   PreparedRow,
 } from "./types.js";
 

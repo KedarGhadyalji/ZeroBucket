@@ -13,10 +13,9 @@ import { basename } from "node:path";
 import type { Pool } from "pg";
 import type { CallOptions, StorageBackend } from "./adapters/base.js";
 import type { ObjectStorageLike } from "./object-storage.js";
-import {
-  DEFAULT_STREAM_CHUNK_SIZE,
-  PostgresBackend,
-} from "./adapters/postgres.js";
+import { PostgresBackend } from "./adapters/postgres.js";
+import { SQLiteBackend } from "./adapters/sqlite.js";
+import { DEFAULT_STREAM_CHUNK_SIZE } from "./adapters/shared.js";
 import {
   AccessDeniedError,
   ImageNotFoundError,
@@ -33,7 +32,7 @@ import type {
   ImageMetadata,
   OperationEvent,
   PreparedRow,
-  Queryable,
+  Connection,
 } from "./types.js";
 import {
   DEFAULT_MAX_PIXELS,
@@ -73,7 +72,13 @@ export interface ZeroBucketOptions<C = unknown> {
   connectionString?: string;
   /** Bring your own pg.Pool. It is NOT closed by close(). */
   pool?: Pool;
-  /** Advanced: inject a custom StorageBackend instead of building a PostgresBackend. */
+  /**
+   * Use SQLite instead of PostgreSQL: a database file path (or ":memory:"). Needs `npm install better-sqlite3`.
+   * `dedup`, `objectStorage`, `autoMigrate` and `onOperation` apply to it too. Same file format as the Python
+   * package's SQLiteBackend, so both can share one `.db` file.
+   */
+  sqlite?: string;
+  /** Advanced: inject a custom StorageBackend instead of building one from `connectionString` / `pool` / `sqlite`. */
   backend?: StorageBackend;
 
   /** Max accepted size in bytes. Default 8 MiB. */
@@ -126,7 +131,7 @@ interface PutBase<C> {
   /** Store non-image content through the same machinery. Incompatible with `optimize`. */
   validator?: ContentValidator;
   /** Join your own transaction. ZeroBucket then does not commit, roll back or retry. */
-  connection?: Queryable;
+  connection?: Connection;
   /** Passed to beforePut. */
   context?: C;
 }
@@ -139,7 +144,7 @@ export interface PutManyOptions<C = unknown> extends Omit<
   filenames?: (string | null | undefined)[];
 }
 export interface GetOptions<C = unknown> {
-  connection?: Queryable;
+  connection?: Connection;
   context?: C;
 }
 export interface StreamOptions<C = unknown> extends GetOptions<C> {
@@ -167,21 +172,37 @@ export class ZeroBucket<C = unknown> {
   private readonly beforePut: BeforePutHook<C> | undefined;
 
   constructor(options: ZeroBucketOptions<C> = {}) {
+    if (
+      options.sqlite !== undefined &&
+      (options.connectionString || options.pool)
+    ) {
+      throw new TypeError(
+        "Choose one database: `sqlite` OR `connectionString`/`pool`, not both.",
+      );
+    }
     this.backend =
       options.backend ??
-      new PostgresBackend({
-        connectionString: options.connectionString,
-        pool: options.pool,
-        autoMigrate: options.autoMigrate,
-        maxRetries: options.maxRetries,
-        retryBaseDelayMs: options.retryBaseDelayMs,
-        poolMinSize: options.poolMinSize,
-        poolMaxSize: options.poolMaxSize,
-        poolTimeoutMs: options.poolTimeoutMs,
-        onOperation: options.onOperation,
-        objectStorage: options.objectStorage,
-        dedup: options.dedup,
-      });
+      (options.sqlite !== undefined
+        ? new SQLiteBackend({
+            path: options.sqlite,
+            autoMigrate: options.autoMigrate,
+            dedup: options.dedup,
+            objectStorage: options.objectStorage,
+            onOperation: options.onOperation,
+          })
+        : new PostgresBackend({
+            connectionString: options.connectionString,
+            pool: options.pool,
+            autoMigrate: options.autoMigrate,
+            maxRetries: options.maxRetries,
+            retryBaseDelayMs: options.retryBaseDelayMs,
+            poolMinSize: options.poolMinSize,
+            poolMaxSize: options.poolMaxSize,
+            poolTimeoutMs: options.poolTimeoutMs,
+            onOperation: options.onOperation,
+            objectStorage: options.objectStorage,
+            dedup: options.dedup,
+          }));
     this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
     this.maxPixels = options.maxPixels ?? DEFAULT_MAX_PIXELS;
     this.allowedFormats = options.allowedFormats ?? SUPPORTED_FORMATS;
@@ -620,7 +641,7 @@ export class ZeroBucket<C = unknown> {
    * One-time, non-destructive copy of classic-mode images into a dedup instance's tables, keeping every
    * id. Call it on an instance created with `dedup: true`. Safe to re-run. See PostgresBackend for details.
    */
-  migrateClassicToDedup(): ReturnType<
+  async migrateClassicToDedup(): ReturnType<
     NonNullable<StorageBackend["migrateClassicToDedup"]>
   > {
     if (!this.backend.migrateClassicToDedup) {

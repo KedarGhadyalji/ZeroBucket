@@ -10,7 +10,7 @@
  * retried. When provided, the backend uses it directly and does NOT commit,
  * roll back or retry. That is what lets a call join the caller's transaction.
  */
-import type { PreparedRow, Queryable } from "../types.js";
+import type { Connection, PreparedRow } from "../types.js";
 
 export interface StoredRecord {
   id: string;
@@ -26,7 +26,7 @@ export interface StoredRecord {
 export type StoredRecordMetadata = Omit<StoredRecord, "data">;
 
 export interface CallOptions {
-  connection?: Queryable;
+  connection?: Connection;
 }
 
 export interface StreamOptions extends CallOptions {

@@ -69,6 +69,22 @@ export interface Queryable {
   ): Promise<{ rows: any[]; rowCount: number | null }>;
 }
 
+/**
+ * The slice of a `better-sqlite3` Database that ZeroBucket's SQLite backend uses. Pass your own
+ * Database handle as `connection` to make a call part of YOUR SQLite transaction.
+ */
+export interface SqliteDatabaseLike {
+  prepare(sql: string): {
+    all(...params: unknown[]): any[];
+    get(...params: unknown[]): any;
+    run(...params: unknown[]): { changes: number };
+  };
+  exec(sql: string): unknown;
+}
+
+/** What `connection` accepts: a `pg` client for the Postgres backend, a `better-sqlite3` Database for SQLite. */
+export type Connection = Queryable | SqliteDatabaseLike;
+
 /** The row shape a storage backend persists (after validation and checksumming). */
 export interface PreparedRow {
   data: Buffer;

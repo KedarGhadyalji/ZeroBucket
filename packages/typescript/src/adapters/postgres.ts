@@ -18,7 +18,23 @@
 import type { Pool, PoolClient, PoolConfig } from "pg";
 import { StorageError } from "../errors.js";
 import type { ObjectStorageLike } from "../object-storage.js";
-import type { OperationEvent, PreparedRow, Queryable } from "../types.js";
+import type {
+  Connection,
+  OperationEvent,
+  PreparedRow,
+  Queryable,
+} from "../types.js";
+import {
+  DEFAULT_STREAM_CHUNK_SIZE,
+  hydrateRow,
+  isValidId,
+  mapLimit,
+  msg,
+  sleep,
+  streamFromObjectStorage,
+  tieredWithoutStorage,
+  wrap,
+} from "./shared.js";
 import type {
   CallOptions,
   StorageBackend,
@@ -26,9 +42,6 @@ import type {
   StoredRecordMetadata,
   StreamOptions,
 } from "./base.js";
-
-/** 1 MiB. Default chunk size for getStream(). */
-export const DEFAULT_STREAM_CHUNK_SIZE = 1024 * 1024;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS zerobucket_images (
@@ -173,13 +186,7 @@ const DEDUP_SQL: SqlSet = {
   exists: `SELECT 1 FROM zerobucket_image_refs WHERE id = $1;`,
 };
 
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/** True if `id` is a syntactically valid UUID. Malformed ids can never exist, so they short-circuit to "not found". */
-export function isValidId(id: string): boolean {
-  return typeof id === "string" && UUID_RE.test(id);
-}
+export { isValidId };
 
 // SQLSTATEs worth retrying: transient conditions only, never constraint/syntax errors.
 const RETRYABLE_SQLSTATES = new Set([
@@ -426,11 +433,16 @@ export class PostgresBackend implements StorageBackend {
    */
   private async run<T>(
     operation: string,
-    connection: Queryable | undefined,
+    connection: Connection | undefined,
     work: Work<T>,
     { tx = false }: { tx?: boolean } = {},
   ): Promise<T> {
     if (connection) {
+      if (!isQueryable(connection)) {
+        throw new TypeError(
+          "PostgresBackend expects a pg client/pool client as `connection` (an object with query()), not a SQLite Database.",
+        );
+      }
       const start = performance.now();
       try {
         const result = tx
@@ -699,7 +711,7 @@ export class PostgresBackend implements StorageBackend {
 
     if (info.storage_backend === "object_storage") {
       const os = this.opts.objectStorage;
-      if (!os) throw this.tieredWithoutStorage(id, info.object_storage_key);
+      if (!os) throw tieredWithoutStorage(id, info.object_storage_key);
       return streamFromObjectStorage(
         os,
         id,
@@ -808,7 +820,7 @@ export class PostgresBackend implements StorageBackend {
 
   private async deleteDedup(
     id: string,
-    connection: Queryable | undefined,
+    connection: Connection | undefined,
   ): Promise<boolean> {
     try {
       return await this.run(
@@ -832,7 +844,7 @@ export class PostgresBackend implements StorageBackend {
 
   private async deleteManyDedup(
     ids: string[],
-    connection: Queryable | undefined,
+    connection: Connection | undefined,
   ): Promise<string[]> {
     try {
       return await this.run(
@@ -1017,32 +1029,8 @@ export class PostgresBackend implements StorageBackend {
 
   // ---- helpers ---------------------------------------------------------
 
-  /** Turn a DB row into a record, fetching the bytes from object storage if the row is tiered. */
-  private async hydrate(row: any, id: string): Promise<StoredRecord> {
-    let data: Buffer;
-    if (row.storage_backend === "object_storage") {
-      const os = this.opts.objectStorage;
-      if (!os) throw this.tieredWithoutStorage(id, row.object_storage_key);
-      data = await os.download(row.object_storage_key);
-      if (data.length !== row.size_bytes) {
-        throw new StorageError(
-          `Object ${JSON.stringify(row.object_storage_key)} for image ${JSON.stringify(id)} has ${data.length} bytes ` +
-            `but the database records ${row.size_bytes}. The stored object is corrupted or was replaced.`,
-        );
-      }
-    } else {
-      data = row.data as Buffer;
-    }
-    return {
-      id: String(row.id),
-      data,
-      mimeType: row.mime_type,
-      originalFilename: row.original_filename,
-      sizeBytes: row.size_bytes,
-      width: row.width,
-      height: row.height,
-      checksumSha256: row.checksum_sha256,
-    };
+  private hydrate(row: any, id: string): Promise<StoredRecord> {
+    return hydrateRow(row, id, this.opts.objectStorage);
   }
 
   /**
@@ -1059,7 +1047,7 @@ export class PostgresBackend implements StorageBackend {
    */
   private async cleanupObject(
     keys: string[],
-    connection: Queryable | undefined,
+    connection: Connection | undefined,
   ): Promise<void> {
     const os = this.opts.objectStorage;
     if (!os || connection || keys.length === 0) return;
@@ -1131,57 +1119,6 @@ export class PostgresBackend implements StorageBackend {
       throw wrap("Failed to tier image to object storage", exc);
     }
   }
-
-  private tieredWithoutStorage(id: string, key: string | null): StorageError {
-    return new StorageError(
-      `Image ${JSON.stringify(id)} is stored in object storage (key=${JSON.stringify(key)}) ` +
-        "but this ZeroBucket was constructed without `objectStorage`. Configure it with the " +
-        "same bucket and credentials that were used to tier this image.",
-    );
-  }
-}
-
-/** Ranged reads straight from the object store; fails loudly rather than ever truncating. */
-async function* streamFromObjectStorage(
-  os: ObjectStorageLike,
-  id: string,
-  key: string,
-  start: number,
-  end: number,
-  chunkSize: number,
-): AsyncGenerator<Buffer> {
-  let offset = start;
-  while (offset <= end) {
-    const last = Math.min(offset + chunkSize - 1, end);
-    const expected = last - offset + 1;
-    const chunk = await os.downloadRange(key, offset, last);
-    if (chunk.length !== expected) {
-      throw new StorageError(
-        `Object ${JSON.stringify(key)} for image ${JSON.stringify(id)} returned ${chunk.length} bytes for a ${expected}-byte range; ` +
-          "the stored object is shorter than the database records.",
-      );
-    }
-    yield chunk;
-    offset = last + 1;
-  }
-}
-
-async function mapLimit<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  let next = 0;
-  await Promise.all(
-    Array.from({ length: Math.min(limit, items.length) }, async () => {
-      while (next < items.length) {
-        const i = next++;
-        out[i] = await fn(items[i]!);
-      }
-    }),
-  );
-  return out;
 }
 
 function blobParams(r: PreparedRow, refs: number): unknown[] {
@@ -1208,16 +1145,6 @@ function rowParams(r: PreparedRow): unknown[] {
   ];
 }
 
-function wrap(prefix: string, exc: unknown): StorageError {
-  return exc instanceof StorageError
-    ? exc
-    : new StorageError(`${prefix}: ${msg(exc)}`, { cause: exc });
-}
-
-function msg(exc: unknown): string {
-  return exc instanceof Error ? exc.message : String(exc);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function isQueryable(c: Connection): c is Queryable {
+  return typeof (c as Queryable).query === "function";
 }
