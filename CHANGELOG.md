@@ -6,6 +6,38 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.4.0] - 2026-10-05
+
+### Added -- SQLite (parity with the Python package's SQLite adapters)
+
+- `new ZeroBucket({ sqlite: "./images.db" })` (or `":memory:"`), on `better-sqlite3` (optional peer dependency, loaded lazily).
+  Classic and dedup modes, streaming and byte ranges, object-storage tiering, hooks, the HTTP handler, optimize,
+  validators, `onOperation`. Same file format as the Python `SQLiteBackend` (`storage_backend='sqlite'`, TEXT uuid ids,
+  ISO-8601 microsecond timestamps), so Node and Python can share one `.db` file.
+- Designed for a synchronous driver inside an async server: lock contention is waited out with async retries
+  (`busyTimeoutMs`, default 10 s), never by blocking the event loop; one connection with each unit of work atomic
+  (`BEGIN IMMEDIATE`); WAL set once and only if needed; an in-process async write lock.
+- Tiering uses its own connection and `BEGIN IMMEDIATE` (whole-database lock for the upload; reads unaffected). A failed
+  upload rolls back and leaves the row untouched. `connection` on SQLite takes a `better-sqlite3` Database;
+  multi-statement operations use a `SAVEPOINT`.
+- `Connection` type (`Queryable | SqliteDatabaseLike`) for the `connection` option; the Postgres backend rejects a
+  SQLite handle with a clear error and vice versa.
+- Adapter helpers shared by both backends (`adapters/shared.ts`) so they cannot drift apart.
+- 34 new tests, including: a second PROCESS holding the write lock while the event loop is verified to keep running;
+  8 processes opening one brand-new file at once (the scenario that failed on Windows in the Python package);
+  atomicity on autocommit and in-transaction handles; whole-database tiering lock semantics; dedup refcounts under
+  concurrency. Mutation-checked: blocking driver waits, committing before the upload, removing the savepoint wrapper, and
+  deleting objects inside a caller transaction each make a test fail.
+- Conformance harness now also runs on a shared SQLite file in classic mode (with S3 tiering interop) and dedup mode.
+
+### Changed
+
+- `migrateClassicToDedup()` now always returns a promise (it threw synchronously on backends without support).
+
+### Not available on SQLite
+
+- `migrateClassicToDedup()` (as in Python, which only has it for Postgres).
+
 ## npm `zerobucket` [0.3.0] - 2026-10-04
 
 ### Added -- dedup mode (parity with the Python package)

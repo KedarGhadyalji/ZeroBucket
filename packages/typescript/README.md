@@ -10,16 +10,17 @@ This is the Node.js/TypeScript sibling of the [Python package](https://pypi.org/
 **It uses the exact same table**, so a Node service and a Python service can share one database
 and read each other's images.
 
-> **Status: early (0.3.x).** PostgreSQL in classic and dedup modes, with S3-compatible object-storage tiering.
-> SQLite, MySQL, a CLI and HEIC are on the roadmap (see [What's not here yet](#whats-not-here-yet)).
+> **Status: early (0.4.x).** PostgreSQL **and SQLite**, each in classic and dedup modes, with S3-compatible
+> object-storage tiering. MySQL, a CLI and HEIC are on the roadmap (see [What's not here yet](#whats-not-here-yet)).
 
 ## Install
 
 ```bash
-npm install zerobucket pg sharp
+npm install zerobucket pg sharp          # PostgreSQL
+npm install zerobucket better-sqlite3 sharp   # or SQLite (see below): no database server at all
 ```
 
-`pg` (the Postgres driver) and `sharp` (image decoding/optimizing) are peer dependencies, so you
+`pg` (the Postgres driver), `better-sqlite3` (SQLite) and `sharp` (image decoding/optimizing) are peer dependencies, so you
 control their versions. If you only store PDFs through a custom validator, `sharp` is not needed.
 For [object-storage tiering](#object-storage-tiering) also install `@aws-sdk/client-s3` (optional; loaded only when used).
 Requires Node 20+. Ships ESM and CommonJS with full types.
@@ -188,6 +189,40 @@ output. Implement `ContentValidator` (`validate(data, { maxBytes })`) to store o
   operation (and once per chunk when streaming). Exceptions in your callback are swallowed.
 - The schema migration is serialized with an advisory lock, so many processes starting at once is safe.
 
+## SQLite
+
+No database server at all: one file. Ideal for small apps, single-server deployments, desktop/Electron apps, tests and prototypes.
+
+```ts
+const images = new ZeroBucket({ sqlite: "./images.db" }); // npm install better-sqlite3
+// ZeroBucket({ sqlite: ":memory:" }) for a throwaway in-process database
+```
+
+Everything in this README works on SQLite, **including dedup (`dedup: true`), object-storage tiering, streaming and
+byte ranges, hooks, the HTTP handler, optimize and validators**. The file format is identical to the Python
+package's `SQLiteBackend`, so a Node app and a Python app can share one `.db` file (verified in both directions, including
+tiering and dedup reference counts, by the conformance harness).
+
+How it behaves in Node, and why:
+
+- **Synchronous driver, event loop kept free.** `better-sqlite3` is synchronous (a local file read is microseconds). Lock
+  contention is the exception, and ZeroBucket never lets the driver sleep on a lock, which would freeze your whole server.
+  Each attempt waits ~25 ms; a `SQLITE_BUSY` is retried with async sleeps up to `busyTimeoutMs` (default 10 s, set via
+  `new ZeroBucket({ backend: new SQLiteBackend({ path, busyTimeoutMs }) })`), then fails with a clear `StorageError`.
+  A test holds the write lock from a second process and asserts the event loop keeps ticking while ZeroBucket waits.
+- **One connection, no interleaving.** Each operation is a single synchronous `BEGIN IMMEDIATE ... COMMIT`, so concurrent
+  requests can never run inside each other's transaction. WAL mode is set once, and only if the file is not already WAL.
+- **Many processes, one new file** is safe (tested with 8 processes opening a fresh database simultaneously).
+- **Tiering locks the whole database** for the duration of the upload (SQLite has no row locks): other processes' writes
+  wait, this process's writes queue, reads are never blocked. It uses its own connection, so `tierToObjectStorage` does not
+  accept `connection`, and it needs a real file (not `:memory:`). The safety guarantee is unchanged: a failed upload
+  rolls back and leaves the row untouched.
+- **`connection`** takes your own `better-sqlite3` `Database`. Multi-statement operations use a `SAVEPOINT`, so they
+  are atomic whether or not you have an open transaction.
+- **Streaming** uses ranged `substr()` reads, so a delete mid-stream raises `StorageError` (like Postgres). SQLite still
+  reads the whole blob per chunk, in native memory: this bounds Node-side memory only.
+- Not available on SQLite: `migrateClassicToDedup()` (Python has it for Postgres only, too).
+
 ## Deduplication
 
 Store identical bytes once. In dedup mode every `put()` still returns its own id and keeps its own filename,
@@ -273,6 +308,9 @@ same corpus of valid and corrupt files identically.
 | Event duration                                 | `duration_seconds`                                                         | `durationMs`                                                                                       |
 | `migrateClassicToDedup`                        | loads the whole table into memory; fails if re-run or if any row is tiered | batched, safe to re-run, refuses tiered rows with a clear message                                  |
 | Dedup `putMany` / `deleteMany` locking         | arbitrary order (overlapping batches can deadlock)                         | sorted checksum order (cannot deadlock)                                                            |
+| SQLite API                                     | synchronous `SQLiteBackend` + separate async backend                       | one async client; the sync driver runs on the event loop, lock waits are async (never block it)    |
+| SQLite `onOperation` / busy retry              | none                                                                       | `onOperation` events and async `SQLITE_BUSY` retry (`busyTimeoutMs`)                               |
+| SQLite stream deleted mid-read                 | sync adapter keeps reading a WAL snapshot (async adapter raises)           | raises `StorageError`, like Postgres; use `connection` in a transaction for a snapshot             |
 | `connection=` without an open transaction      | multi-statement ops rely on the driver's implicit transaction              | always atomic (own transaction or savepoint)                                                       |
 | `delete(id, connection=...)` on a tiered image | deletes the S3 object immediately                                          | leaves the object until you delete it after commit (a rolled-back transaction can never lose data) |
 | S3 delete failure after `delete()`             | raises after the row is gone                                               | never fails the delete; reported via `onOperation`                                                 |
@@ -280,7 +318,7 @@ same corpus of valid and corrupt files identically.
 
 ## What's not here yet
 
-Planned, in order: **SQLite**, **MySQL/MariaDB**, the `zerobucket` **CLI**, and **HEIC**.
+Planned, in order: **MySQL/MariaDB**, the `zerobucket` **CLI**, and **HEIC**.
 Tiering and dedup cannot be combined (same rule as the Python package).
 
 ## Runtime notes
