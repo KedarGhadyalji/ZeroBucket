@@ -23,7 +23,7 @@ npm install zerobucket better-sqlite3 sharp   # or SQLite (see below): no databa
 `pg` (the Postgres driver), `better-sqlite3` (SQLite) and `sharp` (image decoding/optimizing) are peer dependencies, so you
 control their versions. If you only store PDFs through a custom validator, `sharp` is not needed.
 For [object-storage tiering](#object-storage-tiering) also install `@aws-sdk/client-s3` (optional; loaded only when used).
-Requires Node 20+. Ships ESM and CommonJS with full types.
+Requires Node 20+ (SQLite needs Node 22+, see below). Ships ESM and CommonJS with full types.
 
 ## Quick start
 
@@ -221,6 +221,9 @@ How it behaves in Node, and why:
   are atomic whether or not you have an open transaction.
 - **Streaming** uses ranged `substr()` reads, so a delete mid-stream raises `StorageError` (like Postgres). SQLite still
   reads the whole blob per chunk, in native memory: this bounds Node-side memory only.
+- **Node 22+ for SQLite.** `better-sqlite3` 13 requires Node 22 or newer and crashes on older versions. It ships its Windows,
+  macOS and Linux binaries inside the npm package, so no compiler or Visual Studio is needed. Postgres users can stay on Node 20.
+  (`better-sqlite3` 12 declares Node 20 support, but it is untested here.)
 - Not available on SQLite: `migrateClassicToDedup()` (Python has it for Postgres only, too).
 
 ## Deduplication
@@ -323,7 +326,7 @@ Tiering and dedup cannot be combined (same rule as the Python package).
 
 ## Runtime notes
 
-Node 20+. Bun/Deno: expected to work, not yet tested. Edge runtimes (Cloudflare Workers, Vercel Edge) cannot open raw
+Node 20+ for Postgres, Node 22+ for SQLite. Bun/Deno: expected to work, not yet tested. Edge runtimes (Cloudflare Workers, Vercel Edge) cannot open raw
 Postgres TCP connections through `pg` without a proxy such as Hyperdrive; use the Node runtime for these routes.
 In serverless, keep `poolMaxSize` small (1-2) or inject a pool shared across invocations.
 

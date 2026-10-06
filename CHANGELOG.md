@@ -8,6 +8,10 @@ version sequence from 0.1.0.
 
 ## npm `zerobucket` [0.4.0] - 2026-10-05
 
+> **Release note:** versions 0.1.1, 0.2.0 and 0.3.0 below were internal development milestones and were
+> **never published to npm separately**. 0.4.0 is the first npm release after 0.1.0 and contains everything
+> described in the 0.1.1, 0.2.0, 0.3.0 and 0.4.0 entries.
+
 ### Added -- SQLite (parity with the Python package's SQLite adapters)
 
 - `new ZeroBucket({ sqlite: "./images.db" })` (or `":memory:"`), on `better-sqlite3` (optional peer dependency, loaded lazily).
@@ -32,6 +36,8 @@ version sequence from 0.1.0.
 
 ### Changed
 
+- Test runs now skip the SQLite suite automatically on Node < 22 (`better-sqlite3` 13 requires Node 22+ and crashes on
+  older versions). All other tests pass on Node 20 too. Documented: Postgres works on Node 20+, SQLite needs Node 22+.
 - `migrateClassicToDedup()` now always returns a promise (it threw synchronously on backends without support).
 
 ### Not available on SQLite
@@ -39,6 +45,8 @@ version sequence from 0.1.0.
 - `migrateClassicToDedup()` (as in Python, which only has it for Postgres).
 
 ## npm `zerobucket` [0.3.0] - 2026-10-04
+
+_Internal milestone, not published to npm separately (shipped as part of 0.4.0)._
 
 ### Added -- dedup mode (parity with the Python package)
 
@@ -63,6 +71,8 @@ version sequence from 0.1.0.
 
 ## npm `zerobucket` [0.2.0] - 2026-10-03
 
+_Internal milestone, not published to npm separately (shipped as part of 0.4.0)._
+
 ### Added -- object-storage tiering (parity with the Python package)
 
 - `ObjectStorage` (S3-compatible: AWS S3, MinIO, R2, B2, Spaces) and `ZeroBucket({ objectStorage })`.
@@ -86,8 +96,8 @@ version sequence from 0.1.0.
 
 ## npm `zerobucket` [0.1.1] - 2026-10-02
 
-First npm release published by GitHub Actions through npm Trusted Publishing (no stored
-token), so it carries a signed provenance attestation. **No runtime code changes** from 0.1.0.
+_Internal milestone, not published to npm separately (shipped as part of 0.4.0)._ No runtime code changes
+from 0.1.0; moved the release workflow to npm Trusted Publishing.
 
 ### Changed
 
