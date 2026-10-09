@@ -24,6 +24,9 @@ npm install libheif-js                         # optional: accept HEIC (iPhone) 
 
 `pg` (the Postgres driver), `better-sqlite3` (SQLite) and `sharp` (image decoding/optimizing) are peer dependencies, so you
 control their versions. If you only store PDFs through a custom validator, `sharp` is not needed.
+`sharp` must be **0.35.5 or newer**: older versions bundle libvips/libheif/librsvg builds with published high-severity
+advisories, and this package decodes untrusted uploads with it. A plain `npm install sharp` already gets a fixed version;
+if you pinned an older one, upgrade with `npm install sharp@latest`.
 For [object-storage tiering](#object-storage-tiering) also install `@aws-sdk/client-s3` (optional; loaded only when used).
 Requires Node 20+ (SQLite needs Node 22+, see below). Ships ESM and CommonJS with full types.
 
