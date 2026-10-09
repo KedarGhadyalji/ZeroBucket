@@ -6,6 +6,43 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.6.1] - 2026-10-10
+
+### Security -- `sharp` peer range raised from `>=0.33.0` to `>=0.35.5`
+
+- `sharp` is the library that decodes untrusted uploads, and every version before 0.35.5 bundles image libraries with
+  published high-severity advisories. `npm audit` flags each of these ranges: `<0.35.0` (libvips, GHSA-f88m-g3jw-g9cj),
+  `<0.35.4` (libheif, GHSA-rgj7-g3m4-5g8c) and `<0.35.5` (librsvg, CVE-2026-96889). 0.35.5 is the first version that
+  audits clean, so it is the new minimum. The old range still permitted all of the vulnerable ones.
+- Users who ran `npm install sharp` already received a fixed version; this change makes the package state it, so a
+  dependency resolver or an old lockfile can no longer quietly keep a vulnerable `sharp` under `zerobucket`.
+- The dev dependency moved from `^0.33.5` to `^0.35.5`, so the whole test suite now runs against the fixed version
+  (libvips 8.18.7).
+
+### Fixed
+
+- Type-checking against `sharp` 0.35: its typings are split into ESM and CommonJS variants, and under the ESM one the
+  callable is the module's `default` rather than the module itself, which made `tsc` fail in `validation.ts` and
+  `optimize.ts`. The internal `Sharp` type now resolves to the callable under either shape. Runtime behaviour is unchanged:
+  the loader already accepted both module shapes.
+- Two tests (`tests/sqlite.test.ts`: many processes opening one new file; `tests/heic.test.ts`: the worker-lifecycle exit
+  check) generated a child script that imported the library by a raw Windows path (`C:\...`), which Node's ESM loader
+  rejects (`ERR_UNSUPPORTED_ESM_URL_SCHEME`). Both now import by `file://` URL. Test-only: the library itself was not
+  affected, and both tests passed on Linux.
+
+### Verified
+
+- Full suite on `sharp` 0.35.5: 230 passed, 0 skipped (Postgres, SQLite, and S3 tiering/CLI against a moto server); 190
+  passed and 40 skipped without the S3 server. The same suite on 0.33.5 gave 190 passed with the 40 S3-dependent tests
+  skipped, so no test changed result.
+- The built CommonJS (`dist/index.cjs`) and ESM (`dist/index.js`) bundles each validated and optimized a real image
+  through `sharp` 0.35.5.
+
+### Notes
+
+- Upgrading from 0.6.0: if you pinned `sharp` below 0.35.5, run `npm install sharp@latest`. `sharp` itself needs Node
+  20.9 or newer.
+
 ## npm `zerobucket` [0.6.0] - 2026-10-07
 
 ### Added -- HEIC / HEIF (iPhone photos), parity with the Python `[heic]` extra
