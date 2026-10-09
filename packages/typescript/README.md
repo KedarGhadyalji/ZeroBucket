@@ -10,8 +10,9 @@ This is the Node.js/TypeScript sibling of the [Python package](https://pypi.org/
 **It uses the exact same table**, so a Node service and a Python service can share one database
 and read each other's images.
 
-> **Status: early (0.4.x).** PostgreSQL **and SQLite**, each in classic and dedup modes, with S3-compatible
-> object-storage tiering. MySQL, a CLI and HEIC are on the roadmap (see [What's not here yet](#whats-not-here-yet)).
+> **Status: early (0.5.x).** PostgreSQL **and SQLite**, each in classic and dedup modes, with S3-compatible
+> object-storage tiering and a `zerobucket` command line tool. MySQL and HEIC are on the roadmap
+> (see [What's not here yet](#whats-not-here-yet)).
 
 ## Install
 
@@ -176,6 +177,37 @@ await images.put(pdfBuf, { validator: new PDFValidator() }); // any ContentValid
 Optimize strips metadata, applies EXIF orientation first, never upscales, and re-validates its own
 output. Implement `ContentValidator` (`validate(data, { maxBytes })`) to store other content types.
 
+## Command line
+
+The package installs a `zerobucket` command (`npx zerobucket ...`, or install globally with `npm i -g zerobucket`).
+It has the same commands, flags, messages and exit codes as the Python package's CLI, and additionally works with
+**SQLite** and **dedup mode**, and understands images that were tiered to object storage.
+
+```bash
+export ZEROBUCKET_DATABASE_URL=postgresql://user:pass@localhost/mydb     # or: --database-url URL
+# SQLite instead:  export ZEROBUCKET_SQLITE_PATH=./images.db              # or: --sqlite PATH
+
+zerobucket init                 # create the schema (add --dedup for the dedup tables)
+zerobucket info                 # image count, sizes, on-disk size, breakdown by format (+ dedup savings / tiered count)
+zerobucket verify               # re-checksum every image; exit 1 and list the ids if anything is corrupted
+zerobucket verify --sample 200  # ...or just a random sample (good for a nightly cron job)
+zerobucket tier IMAGE_ID --bucket my-images                         # move one image to S3
+zerobucket tier --older-than 90 --min-size 500000 --bucket my-images --dry-run   # preview a bulk move
+zerobucket tier --all --limit 1000 --bucket my-images --endpoint-url https://<acct>.r2.cloudflarestorage.com
+zerobucket migrate --to-dedup   # PostgreSQL: copy classic images into the dedup tables (non-destructive, re-runnable)
+```
+
+- **Exit codes:** `0` success, `1` problems found or an operation failed, `2` usage or connection error. That makes
+  `zerobucket verify && deploy` and cron/CI checks work as you would hope.
+- `info` and `verify` never create anything: looking at a database that does not exist (or has no schema yet) reports it
+  and exits 1 instead of silently creating an empty one.
+- `verify` checksums one image at a time (memory stays flat on big tables). Images tiered to object storage are
+  skipped with a note unless you also pass `--bucket` (and credentials), in which case they are downloaded and verified too.
+- `tier` processes images one at a time and reports each failure; a failed upload leaves that image untouched in the database.
+  Credentials come from the AWS SDK's standard chain, or `--aws-access-key-id` / `--aws-secret-access-key`.
+- `tier` is not available with `--dedup`. `tier`, and `verify --bucket`, need `@aws-sdk/client-s3`; every other command works without it.
+- The same operations are available from code: `new ZeroBucket({...}).tierToObjectStorage(id)`, `migrateClassicToDedup()`, etc.
+
 ## Reliability and observability
 
 - Pooling: `poolMinSize` (1), `poolMaxSize` (5), `poolTimeoutMs` (10000), or pass your own `pool`
@@ -301,27 +333,28 @@ same corpus of valid and corrupt files identically.
 
 ## Differences from the Python package
 
-|                                                | Python                                                                     | npm                                                                                                |
-| ---------------------------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| API                                            | sync + async clients                                                       | one async client                                                                                   |
-| Malformed id (`"abc"`)                         | `StorageError` from Postgres                                               | treated as not found (`ImageNotFoundError`, no DB round trip), friendlier for `/images/:id` routes |
-| `optimize`                                     | Pillow; EXIF stripped, not applied                                         | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                           |
-| `putMany` inserts                              | pipelined                                                                  | one transaction, statements run sequentially                                                       |
-| Formats                                        | JPEG, PNG, WebP, HEIC (extra)                                              | JPEG, PNG, WebP (HEIC not yet)                                                                     |
-| Event duration                                 | `duration_seconds`                                                         | `durationMs`                                                                                       |
-| `migrateClassicToDedup`                        | loads the whole table into memory; fails if re-run or if any row is tiered | batched, safe to re-run, refuses tiered rows with a clear message                                  |
-| Dedup `putMany` / `deleteMany` locking         | arbitrary order (overlapping batches can deadlock)                         | sorted checksum order (cannot deadlock)                                                            |
-| SQLite API                                     | synchronous `SQLiteBackend` + separate async backend                       | one async client; the sync driver runs on the event loop, lock waits are async (never block it)    |
-| SQLite `onOperation` / busy retry              | none                                                                       | `onOperation` events and async `SQLITE_BUSY` retry (`busyTimeoutMs`)                               |
-| SQLite stream deleted mid-read                 | sync adapter keeps reading a WAL snapshot (async adapter raises)           | raises `StorageError`, like Postgres; use `connection` in a transaction for a snapshot             |
-| `connection=` without an open transaction      | multi-statement ops rely on the driver's implicit transaction              | always atomic (own transaction or savepoint)                                                       |
-| `delete(id, connection=...)` on a tiered image | deletes the S3 object immediately                                          | leaves the object until you delete it after commit (a rolled-back transaction can never lose data) |
-| S3 delete failure after `delete()`             | raises after the row is gone                                               | never fails the delete; reported via `onOperation`                                                 |
-| Options                                        | snake_case kwargs                                                          | camelCase options object                                                                           |
+|                                                | Python                                                                     | npm                                                                                                            |
+| ---------------------------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| API                                            | sync + async clients                                                       | one async client                                                                                               |
+| Malformed id (`"abc"`)                         | `StorageError` from Postgres                                               | treated as not found (`ImageNotFoundError`, no DB round trip), friendlier for `/images/:id` routes             |
+| `optimize`                                     | Pillow; EXIF stripped, not applied                                         | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                                       |
+| `putMany` inserts                              | pipelined                                                                  | one transaction, statements run sequentially                                                                   |
+| Formats                                        | JPEG, PNG, WebP, HEIC (extra)                                              | JPEG, PNG, WebP (HEIC not yet)                                                                                 |
+| Event duration                                 | `duration_seconds`                                                         | `durationMs`                                                                                                   |
+| `migrateClassicToDedup`                        | loads the whole table into memory; fails if re-run or if any row is tiered | batched, safe to re-run, refuses tiered rows with a clear message                                              |
+| Dedup `putMany` / `deleteMany` locking         | arbitrary order (overlapping batches can deadlock)                         | sorted checksum order (cannot deadlock)                                                                        |
+| SQLite API                                     | synchronous `SQLiteBackend` + separate async backend                       | one async client; the sync driver runs on the event loop, lock waits are async (never block it)                |
+| SQLite `onOperation` / busy retry              | none                                                                       | `onOperation` events and async `SQLITE_BUSY` retry (`busyTimeoutMs`)                                           |
+| SQLite stream deleted mid-read                 | sync adapter keeps reading a WAL snapshot (async adapter raises)           | raises `StorageError`, like Postgres; use `connection` in a transaction for a snapshot                         |
+| CLI                                            | PostgreSQL, classic mode only; `verify` crashes on tiered rows             | PostgreSQL **and** SQLite, classic **and** dedup; `info`/`verify` understand tiered rows; `migrate --to-dedup` |
+| `connection=` without an open transaction      | multi-statement ops rely on the driver's implicit transaction              | always atomic (own transaction or savepoint)                                                                   |
+| `delete(id, connection=...)` on a tiered image | deletes the S3 object immediately                                          | leaves the object until you delete it after commit (a rolled-back transaction can never lose data)             |
+| S3 delete failure after `delete()`             | raises after the row is gone                                               | never fails the delete; reported via `onOperation`                                                             |
+| Options                                        | snake_case kwargs                                                          | camelCase options object                                                                                       |
 
 ## What's not here yet
 
-Planned, in order: **MySQL/MariaDB**, the `zerobucket` **CLI**, and **HEIC**.
+Planned, in order: **MySQL/MariaDB** and **HEIC**.
 Tiering and dedup cannot be combined (same rule as the Python package).
 
 ## Runtime notes

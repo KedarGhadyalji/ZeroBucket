@@ -6,6 +6,29 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.5.0] - 2026-10-06
+
+### Added -- `zerobucket` command line tool (parity with the Python package's CLI)
+
+- Commands `init`, `migrate`, `info`, `verify`, `tier` with the same flags, messages and exit codes as Python
+  (0 ok / 1 problems found or operation failed / 2 usage or connection error). Output was compared against the Python
+  CLI on the same database: identical apart from fixes below.
+- Beyond Python's CLI: works on **SQLite** (`--sqlite PATH`, `ZEROBUCKET_SQLITE_PATH`) and in **dedup mode** (`--dedup`);
+  `info` reports tiered images and dedup savings; `verify` skips tiered images with a note, or verifies them with
+  `--bucket`; `migrate --to-dedup` exposes the classic -> dedup copy (PostgreSQL).
+- `info` / `verify` / `tier` never create a missing database or schema.
+- Zero new dependencies (Node's built-in `util.parseArgs`). `bin: zerobucket` -> `dist/bin.js` (ESM, shebang).
+- Backend maintenance methods `getInfo()` and `listImages()` (filters: sample, limit, min size, older than, untiered only).
+- 44 new tests: both backends x classic/dedup, usage errors, corruption detection (including a corrupted dedup blob
+  flagging every reference), tiering filters (`--min-size`, `--older-than`, `--limit`, `--dry-run`) against a real S3 API,
+  and a real child-process test that exit codes reach the shell. Mutation-checked: `info` creating a database, `verify`
+  touching tiered rows, `--min-size` being ignored, and `verify` exiting 0 on corruption each make a test fail.
+
+### Fixed
+
+- Python's `verify` crashes on tiered rows (`bytes(None)`); the npm CLI skips or verifies them. (Python fix pending.)
+- Build: `dist/` is now cleared by the `build` script, so parallel library/CLI builds cannot delete each other's output.
+
 ## npm `zerobucket` [0.4.0] - 2026-10-05
 
 > **Release note:** versions 0.1.1, 0.2.0 and 0.3.0 below were internal development milestones and were
