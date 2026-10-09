@@ -30,6 +30,7 @@
  *    memory: this bounds Node-side memory only.
  */
 import { randomUUID } from "node:crypto";
+import { existsSync, statSync } from "node:fs";
 import { StorageError } from "../errors.js";
 import type { ObjectStorageLike } from "../object-storage.js";
 import type {
@@ -40,7 +41,10 @@ import type {
 } from "../types.js";
 import type {
   CallOptions,
+  ImageListEntry,
+  ImageListOptions,
   StorageBackend,
+  StorageInfo,
   StoredRecord,
   StoredRecordMetadata,
   StreamOptions,
@@ -50,6 +54,7 @@ import {
   isValidId,
   mapLimit,
   msg,
+  prettySize,
   sleep,
   streamFromObjectStorage,
   tieredWithoutStorage,
@@ -753,6 +758,119 @@ export class SQLiteBackend implements StorageBackend {
       );
     } catch (exc) {
       throw wrap("Failed to check image existence", exc);
+    }
+  }
+
+  // ---- maintenance (CLI) -----------------------------------------------
+
+  async getInfo(): Promise<StorageInfo | null> {
+    try {
+      return await this.execute("info", undefined, "read", (db) => {
+        const has = (t: string) =>
+          db
+            .prepare(
+              "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .get(t) !== undefined;
+        if (
+          !has(this.dedup ? "zerobucket_image_refs" : "zerobucket_images") ||
+          (this.dedup && !has("zerobucket_blobs"))
+        )
+          return null;
+        const j = this.dedup ? D_FROM : "FROM zerobucket_images";
+        const size = this.dedup ? "b.size_bytes" : "size_bytes";
+        const created = this.dedup ? "r.created_at" : "created_at";
+        const mime = this.dedup ? "b.mime_type" : "mime_type";
+        const tot = db
+          .prepare(
+            `SELECT count(*) AS n, coalesce(sum(${size}), 0) AS bytes, min(${created}) AS oldest, max(${created}) AS newest ${j}`,
+          )
+          .get();
+        const fmt = db
+          .prepare(
+            `SELECT ${mime} AS m, count(*) AS n, coalesce(sum(${size}), 0) AS bytes ${j} GROUP BY ${mime} ORDER BY count(*) DESC, ${mime}`,
+          )
+          .all();
+        let onDisk: string | null = null;
+        if (this.opts.path !== ":memory:") {
+          let total = statSync(this.opts.path).size;
+          for (const suffix of ["-wal", "-shm"])
+            if (existsSync(this.opts.path + suffix))
+              total += statSync(this.opts.path + suffix).size;
+          onDisk = prettySize(total);
+        }
+        const info: StorageInfo = {
+          mode: this.dedup ? "dedup" : "classic",
+          count: tot.n,
+          totalBytes: Number(tot.bytes),
+          oldest: tot.oldest,
+          newest: tot.newest,
+          onDisk,
+          byFormat: fmt.map((r: any) => ({
+            mimeType: r.m,
+            count: r.n,
+            bytes: Number(r.bytes),
+          })),
+        };
+        if (this.dedup) {
+          const b = db
+            .prepare(
+              "SELECT count(*) AS n, coalesce(sum(size_bytes), 0) AS bytes FROM zerobucket_blobs",
+            )
+            .get();
+          info.dedup = { blobs: b.n, storedBytes: Number(b.bytes) };
+        } else {
+          const t = db
+            .prepare(
+              "SELECT count(*) AS n, coalesce(sum(size_bytes), 0) AS bytes FROM zerobucket_images WHERE storage_backend = 'object_storage'",
+            )
+            .get();
+          info.tiered = { count: t.n, bytes: Number(t.bytes) };
+        }
+        return info;
+      });
+    } catch (exc) {
+      throw wrap("Failed to read storage info", exc);
+    }
+  }
+
+  async listImages(o: ImageListOptions = {}): Promise<ImageListEntry[]> {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (o.minSize !== undefined)
+      (where.push(`${this.dedup ? "b.size_bytes" : "size_bytes"} >= ?`),
+        params.push(o.minSize));
+    if (o.olderThanDays !== undefined) {
+      // timestamps are ISO-8601 text in one fixed format, so string comparison is chronological
+      const cutoff = new Date(Date.now() - o.olderThanDays * 86_400_000)
+        .toISOString()
+        .replace("Z", "000+00:00");
+      where.push(`${this.dedup ? "r.created_at" : "created_at"} <= ?`);
+      params.push(cutoff);
+    }
+    if (o.onlyUntiered && !this.dedup) where.push("storage_backend = 'sqlite'");
+    const from = this.dedup ? D_FROM : "FROM zerobucket_images";
+    const idCol = this.dedup ? "r.id" : "id";
+    const tierCol = this.dedup
+      ? "0 AS tiered"
+      : "(storage_backend = 'object_storage') AS tiered";
+    const order =
+      o.sample !== undefined
+        ? "ORDER BY random()"
+        : `ORDER BY ${this.dedup ? "r.created_at" : "created_at"}, ${idCol}`;
+    const lim = o.sample ?? o.limit;
+    let sql = `SELECT ${idCol} AS id, ${tierCol} ${from}${where.length ? " WHERE " + where.join(" AND ") : ""} ${order}`;
+    if (lim !== undefined) ((sql += " LIMIT ?"), params.push(lim));
+    try {
+      const rows = await this.execute("list_images", undefined, "read", (db) =>
+        db.prepare(sql).all(...params),
+      );
+      return rows.map((r: any) => ({
+        id: String(r.id),
+        tiered: Boolean(r.tiered),
+      }));
+    } catch (exc) {
+      throw wrap("Failed to list images", exc);
     }
   }
 

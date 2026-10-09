@@ -35,6 +35,42 @@ export interface StreamOptions extends CallOptions {
   range?: { start: number; end: number };
 }
 
+/** Filters for maintenance listings (CLI `verify` / `tier`). All optional; combined with AND. */
+export interface ImageListOptions {
+  /** Return a random sample of this many images instead of all of them. */
+  sample?: number;
+  limit?: number;
+  /** Only images with size_bytes >= this. */
+  minSize?: number;
+  /** Only images created at least this many days ago. */
+  olderThanDays?: number;
+  /** Only images whose bytes are still in the database (not tiered). */
+  onlyUntiered?: boolean;
+}
+export interface ImageListEntry {
+  id: string;
+  /** Bytes live in object storage, not in the database. */
+  tiered: boolean;
+}
+
+/** Storage statistics for `zerobucket info`. */
+export interface StorageInfo {
+  mode: "classic" | "dedup";
+  /** Number of images (references, in dedup mode). */
+  count: number;
+  /** Sum of every image's size_bytes as recorded by the application (logical size). */
+  totalBytes: number;
+  oldest: string | null;
+  newest: string | null;
+  /** Human-readable on-disk size, if the database can tell. */
+  onDisk: string | null;
+  byFormat: { mimeType: string; count: number; bytes: number }[];
+  /** Classic mode: images currently living in object storage. */
+  tiered?: { count: number; bytes: number };
+  /** Dedup mode: distinct stored blobs and the bytes they physically occupy. */
+  dedup?: { blobs: number; storedBytes: number };
+}
+
 export interface StorageBackend {
   /** Resolve once the backend is connected and migrated. Safe to call repeatedly. */
   ready(): Promise<void>;
@@ -69,5 +105,9 @@ export interface StorageBackend {
     duplicateReferencesFound: number;
     alreadyMigrated: number;
   }>;
+  /** Maintenance: storage statistics, or null if the tables do not exist yet. */
+  getInfo?(): Promise<StorageInfo | null>;
+  /** Maintenance: list ids matching the filters (oldest first, or random when sampling). */
+  listImages?(opts?: ImageListOptions): Promise<ImageListEntry[]>;
   close(): Promise<void>;
 }

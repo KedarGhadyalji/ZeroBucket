@@ -112,3 +112,16 @@ export async function* streamFromObjectStorage(
     offset = last + 1;
   }
 }
+
+/** 1024-based, like Postgres' pg_size_pretty: "812 bytes", "13.2 kB", "4.0 MB". */
+export function prettySize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} bytes`;
+  const units = ["kB", "MB", "GB", "TB"];
+  let v = bytes / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(1)} ${units[i]}`;
+}

@@ -37,7 +37,10 @@ import {
 } from "./shared.js";
 import type {
   CallOptions,
+  ImageListEntry,
+  ImageListOptions,
   StorageBackend,
+  StorageInfo,
   StoredRecord,
   StoredRecordMetadata,
   StreamOptions,
@@ -813,6 +816,124 @@ export class PostgresBackend implements StorageBackend {
       );
     } catch (exc) {
       throw wrap("Failed to check image existence", exc);
+    }
+  }
+
+  // ---- maintenance (CLI) -----------------------------------------------
+
+  async getInfo(): Promise<StorageInfo | null> {
+    try {
+      return await this.run("info", undefined, async (q) => {
+        const imgTable = this.dedup
+          ? "zerobucket_image_refs"
+          : "zerobucket_images";
+        const present = await q.query(
+          "SELECT to_regclass($1) AS a, to_regclass('zerobucket_blobs') AS b",
+          [imgTable],
+        );
+        if (!present.rows[0].a || (this.dedup && !present.rows[0].b))
+          return null;
+        const j = this.dedup
+          ? "FROM zerobucket_image_refs r JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256"
+          : "FROM zerobucket_images";
+        const size = this.dedup ? "b.size_bytes" : "size_bytes";
+        const created = this.dedup ? "r.created_at" : "created_at";
+        const mime = this.dedup ? "b.mime_type" : "mime_type";
+        const tot = (
+          await q.query(
+            `SELECT count(*)::int AS n, coalesce(sum(${size}), 0)::text AS bytes, min(${created})::text AS oldest, max(${created})::text AS newest ${j}`,
+          )
+        ).rows[0];
+        const disk = (
+          await q.query(
+            this.dedup
+              ? "SELECT pg_size_pretty(pg_total_relation_size('zerobucket_blobs') + pg_total_relation_size('zerobucket_image_refs')) AS s"
+              : "SELECT pg_size_pretty(pg_total_relation_size('zerobucket_images')) AS s",
+          )
+        ).rows[0].s as string;
+        const fmt = (
+          await q.query(
+            `SELECT ${mime} AS m, count(*)::int AS n, coalesce(sum(${size}), 0)::text AS bytes ${j} GROUP BY ${mime} ORDER BY count(*) DESC, ${mime}`,
+          )
+        ).rows;
+        const info: StorageInfo = {
+          mode: this.dedup ? "dedup" : "classic",
+          count: tot.n,
+          totalBytes: Number(tot.bytes),
+          // Postgres prints the offset as "+00"; Python's CLI (and ISO-8601) print "+00:00". Normalise so output is identical.
+          oldest: tot.oldest && tot.oldest.replace(/([+-]\d\d)$/, "$1:00"),
+          newest: tot.newest && tot.newest.replace(/([+-]\d\d)$/, "$1:00"),
+          onDisk: disk,
+          byFormat: fmt.map((r) => ({
+            mimeType: r.m,
+            count: r.n,
+            bytes: Number(r.bytes),
+          })),
+        };
+        if (this.dedup) {
+          const b = (
+            await q.query(
+              "SELECT count(*)::int AS n, coalesce(sum(size_bytes), 0)::text AS bytes FROM zerobucket_blobs",
+            )
+          ).rows[0];
+          info.dedup = { blobs: b.n, storedBytes: Number(b.bytes) };
+        } else {
+          const t = (
+            await q.query(
+              "SELECT count(*)::int AS n, coalesce(sum(size_bytes), 0)::text AS bytes FROM zerobucket_images WHERE storage_backend = 'object_storage'",
+            )
+          ).rows[0];
+          info.tiered = { count: t.n, bytes: Number(t.bytes) };
+        }
+        return info;
+      });
+    } catch (exc) {
+      throw wrap("Failed to read storage info", exc);
+    }
+  }
+
+  async listImages(o: ImageListOptions = {}): Promise<ImageListEntry[]> {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    const add = (sql: string, v: unknown) => (
+      params.push(v),
+      where.push(sql.replace("$?", `$${params.length}`))
+    );
+    if (o.minSize !== undefined)
+      add(`${this.dedup ? "b.size_bytes" : "size_bytes"} >= $?`, o.minSize);
+    if (o.olderThanDays !== undefined)
+      add(
+        `${this.dedup ? "r.created_at" : "created_at"} <= now() - make_interval(days => $?::int)`,
+        o.olderThanDays,
+      );
+    if (o.onlyUntiered && !this.dedup)
+      where.push("storage_backend = 'postgres'");
+    const from = this.dedup
+      ? "FROM zerobucket_image_refs r JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256"
+      : "FROM zerobucket_images";
+    const idCol = this.dedup ? "r.id" : "id";
+    const tierCol = this.dedup
+      ? "false AS tiered"
+      : "(storage_backend = 'object_storage') AS tiered";
+    const order =
+      o.sample !== undefined
+        ? "ORDER BY random()"
+        : `ORDER BY ${this.dedup ? "r.created_at" : "created_at"}, ${idCol}`;
+    const lim = o.sample ?? o.limit;
+    let sql = `SELECT ${idCol} AS id, ${tierCol} ${from}${where.length ? " WHERE " + where.join(" AND ") : ""} ${order}`;
+    if (lim !== undefined) {
+      params.push(lim);
+      sql += ` LIMIT $${params.length}`;
+    }
+    try {
+      const rows = await this.run(
+        "list_images",
+        undefined,
+        async (q) => (await q.query(sql, params)).rows,
+      );
+      return rows.map((r) => ({ id: String(r.id), tiered: Boolean(r.tiered) }));
+    } catch (exc) {
+      throw wrap("Failed to list images", exc);
     }
   }
 
