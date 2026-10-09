@@ -10,15 +10,16 @@ This is the Node.js/TypeScript sibling of the [Python package](https://pypi.org/
 **It uses the exact same table**, so a Node service and a Python service can share one database
 and read each other's images.
 
-> **Status: early (0.5.x).** PostgreSQL **and SQLite**, each in classic and dedup modes, with S3-compatible
-> object-storage tiering and a `zerobucket` command line tool. MySQL and HEIC are on the roadmap
-> (see [What's not here yet](#whats-not-here-yet)).
+> **Status: early (0.6.x).** PostgreSQL **and SQLite**, each in classic and dedup modes, with S3-compatible
+> object-storage tiering, HEIC (iPhone photo) support and a `zerobucket` command line tool. MySQL is on the
+> roadmap (see [What's not here yet](#whats-not-here-yet)).
 
 ## Install
 
 ```bash
 npm install zerobucket pg sharp          # PostgreSQL
 npm install zerobucket better-sqlite3 sharp   # or SQLite (see below): no database server at all
+npm install libheif-js                         # optional: accept HEIC (iPhone) photos, see below
 ```
 
 `pg` (the Postgres driver), `better-sqlite3` (SQLite) and `sharp` (image decoding/optimizing) are peer dependencies, so you
@@ -177,6 +178,38 @@ await images.put(pdfBuf, { validator: new PDFValidator() }); // any ContentValid
 Optimize strips metadata, applies EXIF orientation first, never upscales, and re-validates its own
 output. Implement `ContentValidator` (`validate(data, { maxBytes })`) to store other content types.
 
+## HEIC (iPhone photos)
+
+iPhones upload HEIC by default, and most validators reject it. With the optional `libheif-js` installed, HEIC/HEIF
+is accepted like any other format: validated by really decoding it, stored **as uploaded** (`image/heic`), and
+convertible with `optimize`.
+
+```bash
+npm install libheif-js
+```
+
+```ts
+const id = await images.put(iphonePhoto); // stored unchanged, mimeType "image/heic"
+const id2 = await images.put(iphonePhoto, {
+  optimize: { format: "webp", maxWidth: 1600 },
+}); // convert on the way in
+```
+
+- **Convert for the web.** HEIC is only displayable in Safari. Serve a web format by uploading with
+  `optimize: { format: "webp" | "jpeg" | "png" }`, as above. HEIC orientation is applied during conversion.
+- **Decode only, by design.** There is no HEVC _encoder_ for Node, so `optimize` can convert **from** HEIC but not **to** it:
+  `optimize: { format: "heic" }` throws a clear error (Python's `pillow-heif` can encode), and `optimize: true` on a HEIC
+  needs an explicit target format instead of silently choosing one.
+- **Never blocks your server.** Decoding is ~2 s of CPU for a 12-megapixel photo. It runs in a dedicated worker thread, so
+  other requests keep being served (tested), and the worker never keeps your process from exiting.
+- **Safe on hostile input.** Pixel bombs are refused from the file header _before_ any decoding (`maxPixels`), truncated or
+  corrupt files are rejected with the decoder's own diagnosis, and a missing `libheif-js` is reported as "install it", never as "corrupt image".
+- Recognised by content (`ftyp` brands `heic heix hevc heim heis mif1 msf1`), never by file extension: same rules as the Python package, and both
+  accept and reject the same files (checked by the conformance harness against `pillow-heif`).
+- **License:** `libheif-js` is LGPL-3.0. It is an optional peer dependency that **you** install; it is not bundled with or redistributed by
+  this MIT-licensed package. If you use it, review its license for your distribution model.
+- If a file contains several images, the first top-level image is used.
+
 ## Command line
 
 The package installs a `zerobucket` command (`npx zerobucket ...`, or install globally with `npm i -g zerobucket`).
@@ -333,28 +366,29 @@ same corpus of valid and corrupt files identically.
 
 ## Differences from the Python package
 
-|                                                | Python                                                                     | npm                                                                                                            |
-| ---------------------------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| API                                            | sync + async clients                                                       | one async client                                                                                               |
-| Malformed id (`"abc"`)                         | `StorageError` from Postgres                                               | treated as not found (`ImageNotFoundError`, no DB round trip), friendlier for `/images/:id` routes             |
-| `optimize`                                     | Pillow; EXIF stripped, not applied                                         | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                                       |
-| `putMany` inserts                              | pipelined                                                                  | one transaction, statements run sequentially                                                                   |
-| Formats                                        | JPEG, PNG, WebP, HEIC (extra)                                              | JPEG, PNG, WebP (HEIC not yet)                                                                                 |
-| Event duration                                 | `duration_seconds`                                                         | `durationMs`                                                                                                   |
-| `migrateClassicToDedup`                        | loads the whole table into memory; fails if re-run or if any row is tiered | batched, safe to re-run, refuses tiered rows with a clear message                                              |
-| Dedup `putMany` / `deleteMany` locking         | arbitrary order (overlapping batches can deadlock)                         | sorted checksum order (cannot deadlock)                                                                        |
-| SQLite API                                     | synchronous `SQLiteBackend` + separate async backend                       | one async client; the sync driver runs on the event loop, lock waits are async (never block it)                |
-| SQLite `onOperation` / busy retry              | none                                                                       | `onOperation` events and async `SQLITE_BUSY` retry (`busyTimeoutMs`)                                           |
-| SQLite stream deleted mid-read                 | sync adapter keeps reading a WAL snapshot (async adapter raises)           | raises `StorageError`, like Postgres; use `connection` in a transaction for a snapshot                         |
-| CLI                                            | PostgreSQL, classic mode only; `verify` crashes on tiered rows             | PostgreSQL **and** SQLite, classic **and** dedup; `info`/`verify` understand tiered rows; `migrate --to-dedup` |
-| `connection=` without an open transaction      | multi-statement ops rely on the driver's implicit transaction              | always atomic (own transaction or savepoint)                                                                   |
-| `delete(id, connection=...)` on a tiered image | deletes the S3 object immediately                                          | leaves the object until you delete it after commit (a rolled-back transaction can never lose data)             |
-| S3 delete failure after `delete()`             | raises after the row is gone                                               | never fails the delete; reported via `onOperation`                                                             |
-| Options                                        | snake_case kwargs                                                          | camelCase options object                                                                                       |
+|                                                | Python                                                                     | npm                                                                                                              |
+| ---------------------------------------------- | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| API                                            | sync + async clients                                                       | one async client                                                                                                 |
+| Malformed id (`"abc"`)                         | `StorageError` from Postgres                                               | treated as not found (`ImageNotFoundError`, no DB round trip), friendlier for `/images/:id` routes               |
+| `optimize`                                     | Pillow; EXIF stripped, not applied                                         | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                                         |
+| `putMany` inserts                              | pipelined                                                                  | one transaction, statements run sequentially                                                                     |
+| Formats                                        | JPEG, PNG, WebP, HEIC (`[heic]` extra)                                     | JPEG, PNG, WebP, HEIC (optional `libheif-js`)                                                                    |
+| Convert TO HEIC with `optimize`                | yes (pillow-heif)                                                          | no (no HEVC encoder for Node); converting FROM HEIC works; `optimize: true` on a HEIC needs an explicit `format` |
+| Event duration                                 | `duration_seconds`                                                         | `durationMs`                                                                                                     |
+| `migrateClassicToDedup`                        | loads the whole table into memory; fails if re-run or if any row is tiered | batched, safe to re-run, refuses tiered rows with a clear message                                                |
+| Dedup `putMany` / `deleteMany` locking         | arbitrary order (overlapping batches can deadlock)                         | sorted checksum order (cannot deadlock)                                                                          |
+| SQLite API                                     | synchronous `SQLiteBackend` + separate async backend                       | one async client; the sync driver runs on the event loop, lock waits are async (never block it)                  |
+| SQLite `onOperation` / busy retry              | none                                                                       | `onOperation` events and async `SQLITE_BUSY` retry (`busyTimeoutMs`)                                             |
+| SQLite stream deleted mid-read                 | sync adapter keeps reading a WAL snapshot (async adapter raises)           | raises `StorageError`, like Postgres; use `connection` in a transaction for a snapshot                           |
+| CLI                                            | PostgreSQL, classic mode only; `verify` crashes on tiered rows             | PostgreSQL **and** SQLite, classic **and** dedup; `info`/`verify` understand tiered rows; `migrate --to-dedup`   |
+| `connection=` without an open transaction      | multi-statement ops rely on the driver's implicit transaction              | always atomic (own transaction or savepoint)                                                                     |
+| `delete(id, connection=...)` on a tiered image | deletes the S3 object immediately                                          | leaves the object until you delete it after commit (a rolled-back transaction can never lose data)               |
+| S3 delete failure after `delete()`             | raises after the row is gone                                               | never fails the delete; reported via `onOperation`                                                               |
+| Options                                        | snake_case kwargs                                                          | camelCase options object                                                                                         |
 
 ## What's not here yet
 
-Planned, in order: **MySQL/MariaDB** and **HEIC**.
+Planned: **MySQL/MariaDB**.
 Tiering and dedup cannot be combined (same rule as the Python package).
 
 ## Runtime notes

@@ -6,6 +6,35 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.6.0] - 2026-10-07
+
+### Added -- HEIC / HEIF (iPhone photos), parity with the Python `[heic]` extra
+
+- With the optional peer dependency `libheif-js` (libheif + libde265 as WebAssembly), HEIC is accepted by content
+  (`ftyp` brands `heic heix hevc heim heis mif1 msf1`, same list as Python), fully decoded to validate, and stored
+  as-is with mime `image/heic`. Without it, a HEIC gets an "install libheif-js" error, never a "corrupt" one.
+- `optimize` converts FROM HEIC to jpeg / webp / png (orientation applied). Converting TO HEIC is not available (no HEVC
+  encoder for Node) and says so; `optimize: true` on a HEIC requires an explicit `format`.
+- Decoding runs in a dedicated worker thread: a 12-megapixel photo is ~2 s of CPU and must not freeze a server.
+  Verified by a test that the event loop keeps ticking while a 12 MP HEIC decodes.
+- Pixel bombs are refused from the container header before any decoding; corrupt files are rejected with libheif's own
+  diagnosis, which is no longer printed to stderr.
+- Conformance: Node (`libheif-js`) and Python (`pillow-heif`) give identical verdicts on valid, portrait and truncated
+  HEIC files, in all four conformance flows (Postgres and SQLite, classic and dedup).
+- 19 new tests; HEIC fixtures were made by an independent encoder (`tests/fixtures/make_heic_fixtures.py`).
+
+### Fixed (found while building this)
+
+- Worker lifecycle: the decoder worker is now referenced only while a job is in flight. Previously an idle worker kept
+  any script or CLI from ever exiting, and an unreferenced one let the process exit mid-decode. A dying worker's late
+  `exit` event can no longer fail the jobs of its replacement. A worker crash is reported as a server fault
+  (`StorageError`), not as a corrupt image. Each is covered by a regression test that fails when the bug is reintroduced.
+
+### Notes
+
+- `libheif-js` is LGPL-3.0 and is **not** bundled: users install it themselves, which keeps this package MIT.
+- The library build now shims `import.meta.url` for CommonJS (`tsup` `shims: true`).
+
 ## npm `zerobucket` [0.5.0] - 2026-10-06
 
 ### Added -- `zerobucket` command line tool (parity with the Python package's CLI)
