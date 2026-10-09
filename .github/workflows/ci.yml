@@ -134,5 +134,5 @@ jobs:
         env:
           ZEROBUCKET_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/zerobucket_test
         run: |
-          pip install -e "../python[s3]"
+          pip install -e "../python[s3,heic]"
           bash conformance/run.sh
