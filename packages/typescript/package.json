@@ -1,6 +1,6 @@
 {
   "name": "zerobucket",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Database-native image storage for Node.js. Your database. Your images. Zero buckets.",
   "license": "MIT",
   "author": "Kedar Ghadyalji",
@@ -26,7 +26,8 @@
     "dedup",
     "deduplication",
     "sqlite",
-    "better-sqlite3"
+    "better-sqlite3",
+    "cli"
   ],
   "type": "module",
   "engines": {
@@ -64,8 +65,11 @@
     },
     "./package.json": "./package.json"
   },
+  "bin": {
+    "zerobucket": "./dist/bin.js"
+  },
   "scripts": {
-    "build": "tsup",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepublishOnly": "npm run typecheck && npm run build"
