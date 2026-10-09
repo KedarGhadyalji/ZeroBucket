@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   CreateBucketCommand,
   DeleteObjectCommand,
@@ -544,7 +545,7 @@ describe("SQLite: lock contention without blocking the event loop", () => {
     );
     writeFileSync(
       join(dir, "child.mts"),
-      `import { ZeroBucket } from ${JSON.stringify(join(ROOT, "src/index.ts"))};
+      `import { ZeroBucket } from ${JSON.stringify(pathToFileURL(join(ROOT, "src/index.ts")).href)};
        const zb = new ZeroBucket({ sqlite: ${JSON.stringify(path)} });
        const id = await zb.put(${JSON.stringify(join(dir, "img.png"))});
        console.log("OK " + id); await zb.close();`,

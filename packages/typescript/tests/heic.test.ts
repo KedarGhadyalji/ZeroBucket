@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import sharp from "sharp";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -204,7 +205,7 @@ describe("HEIC worker lifecycle", () => {
     const { mkdtempSync, writeFileSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const script = `import { readFileSync } from "node:fs";
-      import { validateImage } from ${JSON.stringify(join(process.cwd(), "src/index.ts"))};
+      import { validateImage } from ${JSON.stringify(pathToFileURL(join(process.cwd(), "src/index.ts")).href)};
       const d = readFileSync(${JSON.stringify(join(process.cwd(), "tests/fixtures/small.heic"))});
       const v = await validateImage(d, { maxBytes: 8388608 });
       console.log("RESULT " + v.mimeType + " " + v.width + "x" + v.height);
