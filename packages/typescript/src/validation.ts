@@ -41,7 +41,14 @@ export interface ValidatedImage {
   sizeBytes: number;
 }
 
-type Sharp = typeof import("sharp");
+// sharp <= 0.34 types the module as `export =` (the namespace itself is callable); sharp >= 0.35 ships separate
+// ESM typings where the callable is the namespace's `default`. Resolve to the callable either way.
+type SharpModule = typeof import("sharp");
+type Sharp = SharpModule extends (...args: never[]) => unknown
+  ? SharpModule
+  : SharpModule extends { default: infer D }
+    ? D
+    : never;
 let sharpPromise: Promise<Sharp> | undefined;
 
 /** Lazily load sharp, with an actionable error if it is not installed. */
