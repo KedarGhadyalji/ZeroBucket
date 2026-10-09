@@ -64,6 +64,9 @@ const refCount = async (checksum: string) => {
   }
 };
 
+const fixture = (n: string) =>
+  readFileSync(new URL(`../tests/fixtures/${n}`, import.meta.url));
+
 async function noise(
   fmt: "jpeg" | "png" | "webp",
   w: number,
@@ -111,6 +114,13 @@ if (mode === "write") {
     "garbage.bin": Buffer.from("this is not an image at all"),
     "empty.bin": Buffer.alloc(0),
     "doc.pdf": Buffer.from("%PDF-1.4\n%%EOF"),
+    // HEIC from an independent encoder (pillow-heif). Needs libheif-js here and the [heic] extra in Python.
+    "photo.heic": fixture("small.heic"),
+    "portrait.heic": fixture("tall.heic"),
+    "truncated.heic": fixture("small.heic").subarray(
+      0,
+      Math.floor(fixture("small.heic").length * 0.6),
+    ),
   };
   for (const [n, b] of Object.entries(files)) writeFileSync(join(c, n), b);
 
