@@ -5,6 +5,7 @@ const external = [
   "sharp",
   "@aws-sdk/client-s3",
   "better-sqlite3",
+  "mysql2",
   "libheif-js",
 ];
 

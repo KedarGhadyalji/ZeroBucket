@@ -14,6 +14,8 @@ export type {
 export { PostgresBackend } from "./adapters/postgres.js";
 export { SQLiteBackend } from "./adapters/sqlite.js";
 export type { SQLiteBackendOptions } from "./adapters/sqlite.js";
+export { MySQLBackend } from "./adapters/mysql.js";
+export type { MySQLBackendOptions } from "./adapters/mysql.js";
 export { DEFAULT_STREAM_CHUNK_SIZE } from "./adapters/shared.js";
 export type { PostgresBackendOptions } from "./adapters/postgres.js";
 export type {
@@ -38,6 +40,9 @@ export type {
   OperationEvent,
   Queryable,
   SqliteDatabaseLike,
+  MysqlQueryable,
+  MysqlPoolLike,
+  MysqlPoolConnectionLike,
   Connection,
   PreparedRow,
 } from "./types.js";

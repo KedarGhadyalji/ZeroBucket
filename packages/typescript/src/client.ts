@@ -15,6 +15,7 @@ import type { CallOptions, StorageBackend } from "./adapters/base.js";
 import type { ObjectStorageLike } from "./object-storage.js";
 import { PostgresBackend } from "./adapters/postgres.js";
 import { SQLiteBackend } from "./adapters/sqlite.js";
+import { MySQLBackend } from "./adapters/mysql.js";
 import { DEFAULT_STREAM_CHUNK_SIZE } from "./adapters/shared.js";
 import {
   AccessDeniedError,
@@ -33,6 +34,7 @@ import type {
   OperationEvent,
   PreparedRow,
   Connection,
+  MysqlPoolLike,
 } from "./types.js";
 import {
   DEFAULT_MAX_PIXELS,
@@ -78,7 +80,17 @@ export interface ZeroBucketOptions<C = unknown> {
    * package's SQLiteBackend, so both can share one `.db` file.
    */
   sqlite?: string;
-  /** Advanced: inject a custom StorageBackend instead of building one from `connectionString` / `pool` / `sqlite`. */
+  /**
+   * Use MySQL or MariaDB instead of PostgreSQL: `mysql://user:password@host:3306/database`
+   * (`mariadb://` works too). Needs `npm install mysql2`. Same schema as the Python package's
+   * MySQLBackend, so both can share one database. Classic mode only for now (`dedup` is not
+   * available for MySQL yet). `maxRetries`, `retryBaseDelayMs`, `poolMaxSize`, `poolTimeoutMs`,
+   * `autoMigrate`, `objectStorage` and `onOperation` apply to it too.
+   */
+  mysql?: string;
+  /** Bring your own `mysql2/promise` Pool for MySQL/MariaDB. It is NOT closed by close(). */
+  mysqlPool?: MysqlPoolLike;
+  /** Advanced: inject a custom StorageBackend instead of building one from `connectionString` / `pool` / `sqlite` / `mysql`. */
   backend?: StorageBackend;
 
   /** Max accepted size in bytes. Default 8 MiB. */
@@ -172,12 +184,15 @@ export class ZeroBucket<C = unknown> {
   private readonly beforePut: BeforePutHook<C> | undefined;
 
   constructor(options: ZeroBucketOptions<C> = {}) {
-    if (
-      options.sqlite !== undefined &&
-      (options.connectionString || options.pool)
-    ) {
+    const chosen = [
+      options.sqlite !== undefined && "`sqlite`",
+      (options.mysql !== undefined || options.mysqlPool) &&
+        "`mysql`/`mysqlPool`",
+      (options.connectionString || options.pool) && "`connectionString`/`pool`",
+    ].filter(Boolean);
+    if (chosen.length > 1) {
       throw new TypeError(
-        "Choose one database: `sqlite` OR `connectionString`/`pool`, not both.",
+        `Choose one database: ${chosen.join(" OR ")}, not several.`,
       );
     }
     this.backend =
@@ -190,19 +205,33 @@ export class ZeroBucket<C = unknown> {
             objectStorage: options.objectStorage,
             onOperation: options.onOperation,
           })
-        : new PostgresBackend({
-            connectionString: options.connectionString,
-            pool: options.pool,
-            autoMigrate: options.autoMigrate,
-            maxRetries: options.maxRetries,
-            retryBaseDelayMs: options.retryBaseDelayMs,
-            poolMinSize: options.poolMinSize,
-            poolMaxSize: options.poolMaxSize,
-            poolTimeoutMs: options.poolTimeoutMs,
-            onOperation: options.onOperation,
-            objectStorage: options.objectStorage,
-            dedup: options.dedup,
-          }));
+        : options.mysql !== undefined || options.mysqlPool
+          ? new MySQLBackend({
+              connectionString: options.mysql,
+              pool: options.mysqlPool,
+              autoMigrate: options.autoMigrate,
+              maxRetries: options.maxRetries,
+              retryBaseDelayMs: options.retryBaseDelayMs,
+              poolMinSize: options.poolMinSize,
+              poolMaxSize: options.poolMaxSize,
+              poolTimeoutMs: options.poolTimeoutMs,
+              onOperation: options.onOperation,
+              objectStorage: options.objectStorage,
+              dedup: options.dedup,
+            })
+          : new PostgresBackend({
+              connectionString: options.connectionString,
+              pool: options.pool,
+              autoMigrate: options.autoMigrate,
+              maxRetries: options.maxRetries,
+              retryBaseDelayMs: options.retryBaseDelayMs,
+              poolMinSize: options.poolMinSize,
+              poolMaxSize: options.poolMaxSize,
+              poolTimeoutMs: options.poolTimeoutMs,
+              onOperation: options.onOperation,
+              objectStorage: options.objectStorage,
+              dedup: options.dedup,
+            }));
     this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
     this.maxPixels = options.maxPixels ?? DEFAULT_MAX_PIXELS;
     this.allowedFormats = options.allowedFormats ?? SUPPORTED_FORMATS;
