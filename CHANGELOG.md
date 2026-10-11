@@ -6,6 +6,59 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.7.0] - 2026-10-10
+
+### Added -- MySQL / MariaDB backend (classic mode)
+
+- `new ZeroBucket({ mysql: "mysql://user:pass@host:3306/db" })` (also `mariadb://`, or bring your own pool with
+  `mysqlPool`), and `MySQLBackend` for direct use. New optional peer dependency: `mysql2 >=3.23.1`.
+- Everything the other backends do except dedup: put/get/putMany/getMany/delete/deleteMany/exists/metadata, streaming and
+  byte ranges, access-control hooks, optimize pipeline, custom validators, HEIC, `onOperation` metrics, retry with
+  backoff, pooling (`poolMaxSize`, `poolTimeoutMs`), object-storage tiering (`tierToObjectStorage`, transparent reads,
+  real S3 Range requests for tiered streams) and `connection` (your own `mysql2` transaction).
+- **Same database as the Python package.** The table is byte-identical to the one the Python `MySQLBackend` creates
+  (`SHOW CREATE TABLE` compared, 19 lines each), and the conformance harness now runs a MySQL section: Node-written rows
+  are read by Python and Python-written rows by Node, including tiered rows and each side cleaning up the other's S3 objects.
+- Not available yet: `dedup: true` (throws a clear `TypeError` rather than being ignored) and the `zerobucket` CLI for
+  MySQL. Both exist in the Python package.
+
+### Behaviour worth knowing (each verified against MariaDB 10.11)
+
+- No `RETURNING` (MySQL 8.0 has none): `delete`/`deleteMany` use `SELECT ... FOR UPDATE` then `DELETE` in one transaction.
+- Timestamps are written as UTC strings, so the server's and the process's timezone cannot change what is stored.
+- Blobs are sent with prepared statements (raw bytes, not a hex literal). An image over the server's `max_allowed_packet`
+  fails with an error that says so and how to raise it, and is not retried.
+- `mysql2`'s pool has no acquire timeout, so `poolTimeoutMs` is implemented in the adapter. Timing out waiting for a free
+  connection throws a clear `StorageError` and is not retried. A waiter that gives up never leaks a connection.
+- Retry covers connection loss, lock-wait timeout (1205), deadlock (1213), server shutdown and too-many-connections. A retry
+  re-runs the whole operation on a fresh connection after a full rollback, never one statement, and a connection that
+  failed is destroyed rather than returned to the pool.
+- On a caller-supplied `connection`, multi-statement calls first probe for an open transaction (`SAVEPOINT` + `ROLLBACK TO`
+  fails with error 1305 when there is none): inside one they use a savepoint so a failed call undoes only its own work;
+  in autocommit mode they open and commit their own transaction. Never retried, never commits your transaction.
+- Migration takes a server-side lock (`GET_LOCK`) and issues **no DDL when the schema is already current**. Even a no-op
+  `ALTER TABLE` needs an exclusive metadata lock, which waits behind every open transaction while all later queries on the
+  table queue behind it, so starting an app instance during a long transaction could stall all traffic. (The Python
+  package runs `ALTER TABLE ... MODIFY data LONGBLOB NULL` on every startup and is exposed to this; see below.)
+
+### Security -- `mysql2` minimum
+
+- The peer range is `>=3.23.1`, chosen with `npm audit`, not by guess: every `mysql2` before 3.23.1 has a published
+  advisory (critical ones before 3.9.7, high before 3.22.0, moderate through 3.23.0), and 3.23.1 is the first release
+  that audits clean. The first draft of this change said `>=3.9.0`, which would have allowed the critical ones.
+
+### Verified
+
+- 47 new tests against a real MariaDB 10.11 plus a moto S3 server, run three times back to back without a flake, with
+  a least-privilege database user (no `PROCESS`/`SUPER`), and on both `mysql2` 3.24.5 and the new minimum 3.23.1.
+- Full existing suite and the Postgres/SQLite/dedup conformance sections still pass.
+- Real MySQL 8.x was **not** available; the SQL avoids MariaDB-only features, but MySQL 8 is expected, not verified.
+
+### Changed
+
+- CI: the npm job now has a MariaDB service, so the MySQL tests and the MySQL conformance section run there (without it
+  they would have skipped silently).
+
 ## npm `zerobucket` [0.6.1] - 2026-10-10
 
 ### Security -- `sharp` peer range raised from `>=0.33.0` to `>=0.35.5`

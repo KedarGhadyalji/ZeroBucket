@@ -10,23 +10,26 @@ This is the Node.js/TypeScript sibling of the [Python package](https://pypi.org/
 **It uses the exact same table**, so a Node service and a Python service can share one database
 and read each other's images.
 
-> **Status: early (0.6.x).** PostgreSQL **and SQLite**, each in classic and dedup modes, with S3-compatible
-> object-storage tiering, HEIC (iPhone photo) support and a `zerobucket` command line tool. MySQL is on the
-> roadmap (see [What's not here yet](#whats-not-here-yet)).
+> **Status: early (0.7.x).** PostgreSQL **and SQLite**, each in classic and dedup modes, plus **MySQL/MariaDB** (classic
+> mode; dedup and the CLI are not available for MySQL yet, see [What's not here yet](#whats-not-here-yet)), with
+> S3-compatible object-storage tiering, HEIC (iPhone photo) support and a `zerobucket` command line tool.
 
 ## Install
 
 ```bash
 npm install zerobucket pg sharp          # PostgreSQL
 npm install zerobucket better-sqlite3 sharp   # or SQLite (see below): no database server at all
+npm install zerobucket mysql2 sharp            # or MySQL / MariaDB (see below)
 npm install libheif-js                         # optional: accept HEIC (iPhone) photos, see below
 ```
 
-`pg` (the Postgres driver), `better-sqlite3` (SQLite) and `sharp` (image decoding/optimizing) are peer dependencies, so you
-control their versions. If you only store PDFs through a custom validator, `sharp` is not needed.
+`pg` (the Postgres driver), `better-sqlite3` (SQLite), `mysql2` (MySQL/MariaDB) and `sharp` (image decoding/optimizing) are
+peer dependencies, so you control their versions. If you only store PDFs through a custom validator, `sharp` is not needed.
 `sharp` must be **0.35.5 or newer**: older versions bundle libvips/libheif/librsvg builds with published high-severity
 advisories, and this package decodes untrusted uploads with it. A plain `npm install sharp` already gets a fixed version;
 if you pinned an older one, upgrade with `npm install sharp@latest`.
+`mysql2` must be **3.23.1 or newer** for the same reason: every earlier release has a published advisory (the oldest range
+includes critical ones), and 3.23.1 is the first that `npm audit` reports clean.
 For [object-storage tiering](#object-storage-tiering) also install `@aws-sdk/client-s3` (optional; loaded only when used).
 Requires Node 20+ (SQLite needs Node 22+, see below). Ships ESM and CommonJS with full types.
 
@@ -217,7 +220,7 @@ const id2 = await images.put(iphonePhoto, {
 
 The package installs a `zerobucket` command (`npx zerobucket ...`, or install globally with `npm i -g zerobucket`).
 It has the same commands, flags, messages and exit codes as the Python package's CLI, and additionally works with
-**SQLite** and **dedup mode**, and understands images that were tiered to object storage.
+**SQLite** and **dedup mode**, and understands images that were tiered to object storage. It does not know MySQL/MariaDB yet.
 
 ```bash
 export ZEROBUCKET_DATABASE_URL=postgresql://user:pass@localhost/mydb     # or: --database-url URL
@@ -293,6 +296,55 @@ How it behaves in Node, and why:
   macOS and Linux binaries inside the npm package, so no compiler or Visual Studio is needed. Postgres users can stay on Node 20.
   (`better-sqlite3` 12 declares Node 20 support, but it is untested here.)
 - Not available on SQLite: `migrateClassicToDedup()` (Python has it for Postgres only, too).
+
+## MySQL / MariaDB
+
+```ts
+const images = new ZeroBucket({
+  mysql: "mysql://user:password@localhost:3306/mydb",
+}); // npm install mysql2
+// "mariadb://..." works too. Bring your own pool with ZeroBucket({ mysqlPool }) (never closed by close()).
+```
+
+Same API as everywhere else: `put`, `get`, `getMany`, `putMany`, `delete`, `deleteMany`, `exists`, `metadata`, streaming
+and ranges, access-control hooks, the optimize pipeline, custom validators, HEIC, `onOperation` metrics, retry with
+backoff, pooling (`poolMaxSize`, `poolTimeoutMs`), **object-storage tiering** and `connection` (your own transaction).
+It uses the Python package's table, byte for byte (`SHOW CREATE TABLE` is identical), so a Node app and a Python app can
+share one MySQL/MariaDB database (the conformance harness verifies both directions, including tiered rows).
+
+**Not available on MySQL yet:** dedup mode (`dedup: true` throws, rather than being ignored) and the `zerobucket` command
+line tool (it knows PostgreSQL and SQLite). The Python package has both for MySQL.
+
+What is different from Postgres, and why (each verified against a real MariaDB 10.11):
+
+- **No `RETURNING`.** MySQL 8.0 does not have it (MariaDB 10.5+ does, but one code path serves both), so `delete()` and
+  `deleteMany()` run `SELECT ... FOR UPDATE` and then `DELETE` in one transaction. That is also how a tiered row's object
+  gets cleaned up.
+- **Timestamps are written as UTC strings** (`DATETIME(6)`, naive UTC, like the Python package), so your server's or your
+  process's timezone setting cannot change what is stored.
+- **Pooling.** `mysql2` opens connections on demand, so `poolMinSize` is accepted for parity but there is no minimum to hold.
+  `mysql2` has no acquire timeout, so `poolTimeoutMs` is implemented here: waiting longer than that for a free connection
+  throws a clear `StorageError`, which is **not** retried (retrying would only wait again).
+- **Retry** covers connection loss, lock-wait timeout (1205), deadlock (1213) and "too many connections". Every retry
+  re-runs the **whole** operation on a fresh connection after a full rollback, never a single statement, so a multi-statement
+  operation can never be half-applied. A connection that fails is destroyed, never returned to the pool.
+- **Migration takes a server-side lock** (`GET_LOCK`), so many processes starting at once do not race on the DDL, and it
+  issues **no DDL at all** when the schema is current. (Even a no-op `ALTER TABLE` needs an exclusive metadata lock that
+  waits behind every open transaction, and everything else on that table then queues behind _it_.)
+- **Large images and `max_allowed_packet`.** An image bigger than the server's limit fails with an error that says so and
+  how to raise it (`SET GLOBAL max_allowed_packet = ...`). Images are sent as raw bytes, so the limit applies to the image
+  size, not twice that.
+- **Tiering** locks only the image being moved (InnoDB row lock) for the duration of the upload: writes to _that_ image wait
+  (up to `innodb_lock_wait_timeout`, 50 s by default), every other row and every plain read is unaffected. Postgres behaves
+  the same way; SQLite has to lock the whole file.
+- **`connection`** takes your own `mysql2/promise` connection. Multi-statement operations first check whether a transaction
+  is open: inside one they use a `SAVEPOINT` (a failure undoes only this call's work), in autocommit mode they open and
+  commit their own. The adapter never commits, rolls back or retries your transaction. Object cleanup after a `delete` is
+  skipped on your connection (it cannot know whether you will commit).
+- **Streaming** uses ranged `SUBSTRING()` reads, so a delete mid-stream raises `StorageError` (like Postgres). Tiered images
+  stream with real S3 `Range` requests.
+- **Tested on MariaDB 10.11.** Real MySQL 8.x is expected to behave the same (the SQL avoids MariaDB-only features) but has
+  not been run here. Use MariaDB 10.2.1+ or MySQL 8.0.16+: older servers accept the `CHECK` constraint syntax but ignore it.
 
 ## Deduplication
 
@@ -391,12 +443,12 @@ same corpus of valid and corrupt files identically.
 
 ## What's not here yet
 
-Planned: **MySQL/MariaDB**.
+Planned for MySQL/MariaDB: **dedup mode**, the **`zerobucket` CLI**, and a MySQL-specific operations guide.
 Tiering and dedup cannot be combined (same rule as the Python package).
 
 ## Runtime notes
 
-Node 20+ for Postgres, Node 22+ for SQLite. Bun/Deno: expected to work, not yet tested. Edge runtimes (Cloudflare Workers, Vercel Edge) cannot open raw
+Node 20+ for Postgres and MySQL/MariaDB, Node 22+ for SQLite. Bun/Deno: expected to work, not yet tested. Edge runtimes (Cloudflare Workers, Vercel Edge) cannot open raw
 Postgres TCP connections through `pg` without a proxy such as Hyperdrive; use the Node runtime for these routes.
 In serverless, keep `poolMaxSize` small (1-2) or inject a pool shared across invocations.
 
