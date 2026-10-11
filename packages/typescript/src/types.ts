@@ -82,8 +82,33 @@ export interface SqliteDatabaseLike {
   exec(sql: string): unknown;
 }
 
-/** What `connection` accepts: a `pg` client for the Postgres backend, a `better-sqlite3` Database for SQLite. */
-export type Connection = Queryable | SqliteDatabaseLike;
+/**
+ * A `mysql2/promise` connection (or pool connection): both `query()` and `execute()` resolve to
+ * `[rowsOrResultHeader, fields]`. Pass one as `connection` to make a call part of YOUR MySQL/MariaDB
+ * transaction. Declared structurally so consumers do not need `mysql2` installed to type-check.
+ */
+export interface MysqlQueryable {
+  query(sql: string, values?: any): Promise<[any, any]>;
+  execute(sql: string, values?: any): Promise<[any, any]>;
+}
+
+/** The slice of a `mysql2/promise` pool connection that the MySQL backend uses. */
+export interface MysqlPoolConnectionLike extends MysqlQueryable {
+  beginTransaction(): Promise<void>;
+  commit(): Promise<void>;
+  rollback(): Promise<void>;
+  release(): void;
+  destroy(): void;
+}
+
+/** The slice of a `mysql2/promise` Pool that the MySQL backend uses (bring your own via `pool`). */
+export interface MysqlPoolLike {
+  getConnection(): Promise<MysqlPoolConnectionLike>;
+  end(): Promise<void>;
+}
+
+/** What `connection` accepts: a `pg` client for Postgres, a `better-sqlite3` Database for SQLite, a `mysql2/promise` connection for MySQL/MariaDB. */
+export type Connection = Queryable | SqliteDatabaseLike | MysqlQueryable;
 
 /** The row shape a storage backend persists (after validation and checksumming). */
 export interface PreparedRow {
