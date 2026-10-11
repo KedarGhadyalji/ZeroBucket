@@ -27,13 +27,20 @@ const SQLITE_PATH =
   process.env.ZEROBUCKET_CONF_BACKEND === "sqlite"
     ? process.env.ZEROBUCKET_CONF_SQLITE_PATH
     : undefined;
+// ZEROBUCKET_CONF_BACKEND=mysql runs the flow on a shared MySQL/MariaDB database (classic mode only).
+const MYSQL_URL =
+  process.env.ZEROBUCKET_CONF_BACKEND === "mysql"
+    ? process.env.ZEROBUCKET_TEST_MYSQL_URL
+    : undefined;
 const zb = SQLITE_PATH
   ? new ZeroBucket({ sqlite: SQLITE_PATH, objectStorage: os, dedup: DEDUP })
-  : new ZeroBucket({
-      connectionString: process.env.ZEROBUCKET_TEST_DATABASE_URL,
-      objectStorage: os,
-      dedup: DEDUP,
-    });
+  : MYSQL_URL
+    ? new ZeroBucket({ mysql: MYSQL_URL, objectStorage: os })
+    : new ZeroBucket({
+        connectionString: process.env.ZEROBUCKET_TEST_DATABASE_URL,
+        objectStorage: os,
+        dedup: DEDUP,
+      });
 const refCount = async (checksum: string) => {
   if (SQLITE_PATH) {
     const db = new Database(SQLITE_PATH, { readonly: true });

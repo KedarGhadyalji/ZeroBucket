@@ -25,12 +25,21 @@ SQLITE_PATH = (
     if os.environ.get("ZEROBUCKET_CONF_BACKEND") == "sqlite"
     else None
 )
+MYSQL_URL = (
+    os.environ.get("ZEROBUCKET_TEST_MYSQL_URL")
+    if os.environ.get("ZEROBUCKET_CONF_BACKEND") == "mysql"
+    else None
+)
 if SQLITE_PATH:
     from zerobucket import SQLiteBackend
 
     zb = ZeroBucket(
         backend=SQLiteBackend(SQLITE_PATH, dedup=DEDUP, object_storage=store)
     )
+elif MYSQL_URL:
+    from zerobucket import MySQLBackend
+
+    zb = ZeroBucket(backend=MySQLBackend(MYSQL_URL, object_storage=store))
 else:
     zb = ZeroBucket(
         database_url=os.environ["ZEROBUCKET_TEST_DATABASE_URL"],
