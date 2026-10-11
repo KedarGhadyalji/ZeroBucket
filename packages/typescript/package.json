@@ -1,6 +1,6 @@
 {
   "name": "zerobucket",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Database-native image storage for Node.js. Your database. Your images. Zero buckets.",
   "license": "MIT",
   "author": "Kedar Ghadyalji",
@@ -81,6 +81,7 @@
     "@aws-sdk/client-s3": ">=3.500.0",
     "better-sqlite3": ">=9.0.0",
     "libheif-js": ">=1.17.0",
+    "mysql2": ">=3.23.1",
     "pg": ">=8.11.0",
     "sharp": ">=0.35.5"
   },
@@ -99,6 +100,9 @@
     },
     "libheif-js": {
       "optional": true
+    },
+    "mysql2": {
+      "optional": true
     }
   },
   "devDependencies": {
@@ -108,6 +112,7 @@
     "@types/pg": "^8.11.0",
     "better-sqlite3": "^13.0.3",
     "libheif-js": "^1.23.5",
+    "mysql2": "^3.24.5",
     "pg": "^8.13.0",
     "sharp": "^0.35.5",
     "tsup": "^8.3.0",
