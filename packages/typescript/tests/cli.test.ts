@@ -9,6 +9,7 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
+import mysql from "mysql2/promise";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ZeroBucket } from "../src/index.js";
@@ -16,6 +17,7 @@ import { main } from "../src/cli.js";
 import { DATABASE_URL, makeImage } from "./helpers.js";
 
 const ENDPOINT = process.env.ZEROBUCKET_TEST_S3_ENDPOINT;
+const MYSQL_URL = process.env.ZEROBUCKET_TEST_MYSQL_URL;
 const nodeMajor = Number(process.versions.node.split(".")[0]);
 const num = (n: number) => n.toLocaleString("en-US");
 const version = JSON.parse(readFileSync("package.json", "utf8"))
@@ -133,9 +135,10 @@ describe("CLI: usage, flags and environment (no database needed)", () => {
 });
 
 // ---------------------------------------------------------------------------------------------------------------
-type Kind = "postgres" | "sqlite";
+type Kind = "postgres" | "sqlite" | "mysql";
 const kinds: Kind[] = [
   ...(DATABASE_URL ? (["postgres"] as const) : []),
+  ...(MYSQL_URL ? (["mysql"] as const) : []),
   ...(nodeMajor >= 22 ? (["sqlite"] as const) : []),
 ];
 
@@ -144,12 +147,15 @@ for (const kind of kinds) {
     let dir: string;
     let path: string;
     let raw: pg.Pool | undefined;
+    let my: mysql.Pool | undefined;
     let n = 0;
 
     const target = () =>
       kind === "postgres"
         ? ["--database-url", DATABASE_URL!]
-        : ["--sqlite", path];
+        : kind === "mysql"
+          ? ["--database-url", MYSQL_URL!]
+          : ["--sqlite", path];
     const fresh = () => {
       n += 1;
       path = join(dir, `t${n}.db`);
@@ -158,14 +164,20 @@ for (const kind of kinds) {
       new ZeroBucket(
         kind === "postgres"
           ? { connectionString: DATABASE_URL, dedup }
-          : { sqlite: path, dedup },
+          : kind === "mysql"
+            ? { mysql: MYSQL_URL, dedup }
+            : { sqlite: path, dedup },
       );
     const dropAll = async () => {
       if (kind === "postgres")
         await raw!.query(
           "DROP TABLE IF EXISTS zerobucket_images, zerobucket_image_refs, zerobucket_blobs CASCADE",
         );
-      else fresh();
+      else if (kind === "mysql") {
+        await my!.query("DROP TABLE IF EXISTS zerobucket_image_refs"); // references blobs: drop first
+        await my!.query("DROP TABLE IF EXISTS zerobucket_blobs");
+        await my!.query("DROP TABLE IF EXISTS zerobucket_images");
+      } else fresh();
     };
     const reset = async (dedup = false) => {
       await dropAll();
@@ -179,6 +191,21 @@ for (const kind of kinds) {
             ? "UPDATE zerobucket_blobs SET data = set_byte(data, 10, 255 - get_byte(data, 10)) WHERE checksum_sha256 = (SELECT checksum_sha256 FROM zerobucket_image_refs WHERE id = $1)"
             : "UPDATE zerobucket_images SET data = set_byte(data, 10, 255 - get_byte(data, 10)) WHERE id = $1",
           [id],
+        );
+      } else if (kind === "mysql") {
+        const [rows] = (await my!.query(
+          dedup
+            ? "SELECT b.checksum_sha256 AS k, b.data AS data FROM zerobucket_blobs b JOIN zerobucket_image_refs r ON r.checksum_sha256 = b.checksum_sha256 WHERE r.id = ?"
+            : "SELECT id AS k, data FROM zerobucket_images WHERE id = ?",
+          [id],
+        )) as [{ k: string; data: Buffer }[], unknown];
+        const row = rows[0]!;
+        row.data[10] = 255 - row.data[10]!;
+        await my!.query(
+          dedup
+            ? "UPDATE zerobucket_blobs SET data = ? WHERE checksum_sha256 = ?"
+            : "UPDATE zerobucket_images SET data = ? WHERE id = ?",
+          [row.data, row.k],
         );
       } else {
         const Database = (await import("better-sqlite3")).default;
@@ -202,6 +229,11 @@ for (const kind of kinds) {
           "UPDATE zerobucket_images SET created_at = now() - make_interval(days => $2::int) WHERE id = $1",
           [id, days],
         );
+      else if (kind === "mysql")
+        await my!.query(
+          "UPDATE zerobucket_images SET created_at = UTC_TIMESTAMP(6) - INTERVAL ? DAY WHERE id = ?",
+          [days, id],
+        );
       else {
         const Database = (await import("better-sqlite3")).default;
         const db = new Database(path);
@@ -222,11 +254,16 @@ for (const kind of kinds) {
       fresh();
       if (kind === "postgres")
         raw = new pg.Pool({ connectionString: DATABASE_URL });
+      if (kind === "mysql") my = mysql.createPool({ uri: MYSQL_URL! });
     });
     afterAll(async () => {
       if (kind === "postgres") {
         await run(["init", ...target()]); // leave the schema behind for the other test files
         await raw!.end();
+      }
+      if (kind === "mysql") {
+        await run(["init", ...target()]);
+        await my!.end();
       }
     });
 
@@ -253,9 +290,9 @@ for (const kind of kinds) {
         expect(m.out).toMatch(/does not have versioned migrations yet/);
         expect(m.out).toMatch(/table and indexes are ready/);
       });
-      it("migrate --to-dedup copies classic images (PostgreSQL) or is refused (SQLite)", async () => {
+      it("migrate --to-dedup copies classic images (PostgreSQL) or is refused (SQLite, MySQL)", async () => {
         await reset();
-        if (kind === "sqlite") {
+        if (kind !== "postgres") {
           const r = await run(["migrate", "--to-dedup", ...target()]);
           expect(r).toMatchObject({ code: 2 });
           expect(r.err).toMatch(/only supported for PostgreSQL/);
@@ -292,6 +329,14 @@ for (const kind of kinds) {
             /does not exist yet. Run 'zerobucket init --sqlite PATH'/,
           );
           expect(existsSync(path)).toBe(false); // looking must never create the database
+        } else if (kind === "mysql") {
+          expect(r.out).toBe(
+            "zerobucket_images table does not exist yet. Run 'zerobucket init' first.",
+          );
+          const [t] = (await my!.query(
+            "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'zerobucket_images'",
+          )) as [unknown[], unknown];
+          expect(t).toHaveLength(0); // looking must never create the table
         } else {
           expect(r.out).toBe(
             "zerobucket_images table does not exist yet. Run 'zerobucket init' first.",
@@ -424,6 +469,11 @@ for (const kind of kinds) {
           await raw!.query(
             "INSERT INTO zerobucket_images (id, data, mime_type, size_bytes, checksum_sha256, storage_backend, object_storage_bucket, object_storage_key) VALUES ($1::uuid, NULL, 'image/png', 10, $2, 'object_storage', 'b', $1::text)",
             [id, "a".repeat(64)],
+          );
+        } else if (kind === "mysql") {
+          await my!.query(
+            "INSERT INTO zerobucket_images (id, data, mime_type, size_bytes, checksum_sha256, created_at, updated_at, storage_backend, object_storage_bucket, object_storage_key) VALUES (?, NULL, 'image/png', 10, ?, NOW(6), NOW(6), 'object_storage', 'b', ?)",
+            [id, "a".repeat(64), id],
           );
         } else {
           const Database = (await import("better-sqlite3")).default;

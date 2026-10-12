@@ -8,6 +8,7 @@ import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import sharp from "sharp";
 import Database from "better-sqlite3";
+import mysql from "mysql2/promise";
 import pg from "pg";
 import { ObjectStorage, ZeroBucket, validateImage } from "../src/index.js";
 
@@ -27,7 +28,7 @@ const SQLITE_PATH =
   process.env.ZEROBUCKET_CONF_BACKEND === "sqlite"
     ? process.env.ZEROBUCKET_CONF_SQLITE_PATH
     : undefined;
-// ZEROBUCKET_CONF_BACKEND=mysql runs the flow on a shared MySQL/MariaDB database (classic mode only).
+// ZEROBUCKET_CONF_BACKEND=mysql runs the flow on a shared MySQL/MariaDB database (classic and dedup mode).
 const MYSQL_URL =
   process.env.ZEROBUCKET_CONF_BACKEND === "mysql"
     ? process.env.ZEROBUCKET_TEST_MYSQL_URL
@@ -35,7 +36,7 @@ const MYSQL_URL =
 const zb = SQLITE_PATH
   ? new ZeroBucket({ sqlite: SQLITE_PATH, objectStorage: os, dedup: DEDUP })
   : MYSQL_URL
-    ? new ZeroBucket({ mysql: MYSQL_URL, objectStorage: os })
+    ? new ZeroBucket({ mysql: MYSQL_URL, objectStorage: os, dedup: DEDUP })
     : new ZeroBucket({
         connectionString: process.env.ZEROBUCKET_TEST_DATABASE_URL,
         objectStorage: os,
@@ -54,6 +55,18 @@ const refCount = async (checksum: string) => {
       )?.ref_count;
     } finally {
       db.close();
+    }
+  }
+  if (MYSQL_URL) {
+    const conn = await mysql.createConnection({ uri: MYSQL_URL });
+    try {
+      const [rows] = (await conn.query(
+        "SELECT ref_count FROM zerobucket_blobs WHERE checksum_sha256 = ?",
+        [checksum],
+      )) as [{ ref_count: number }[], unknown];
+      return rows[0]?.ref_count;
+    } finally {
+      await conn.end();
     }
   }
   const pool = new pg.Pool({

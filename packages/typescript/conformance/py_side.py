@@ -39,7 +39,7 @@ if SQLITE_PATH:
 elif MYSQL_URL:
     from zerobucket import MySQLBackend
 
-    zb = ZeroBucket(backend=MySQLBackend(MYSQL_URL, object_storage=store))
+    zb = ZeroBucket(backend=MySQLBackend(MYSQL_URL, dedup=DEDUP, object_storage=store))
 else:
     zb = ZeroBucket(
         database_url=os.environ["ZEROBUCKET_TEST_DATABASE_URL"],
@@ -57,6 +57,28 @@ def ref_count(checksum):
                 (checksum,),
             ).fetchone()
             return row[0] if row else None
+        finally:
+            c.close()
+    if MYSQL_URL:
+        import pymysql
+        from urllib.parse import urlparse
+
+        u = urlparse(MYSQL_URL)
+        c = pymysql.connect(
+            host=u.hostname,
+            port=u.port or 3306,
+            user=u.username,
+            password=u.password,
+            database=u.path.lstrip("/"),
+        )
+        try:
+            with c.cursor() as cur:
+                cur.execute(
+                    "SELECT ref_count FROM zerobucket_blobs WHERE checksum_sha256=%s",
+                    (checksum,),
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
         finally:
             c.close()
     with psycopg.connect(os.environ["ZEROBUCKET_TEST_DATABASE_URL"]) as c:

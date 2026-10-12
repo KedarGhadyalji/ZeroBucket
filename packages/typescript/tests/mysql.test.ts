@@ -263,6 +263,36 @@ describe.skipIf(!URL)("MySQL/MariaDB (real server)", () => {
       expect(await zb.exists(b)).toBe(false);
     });
 
+    it("overlapping deleteMany batches in opposite orders never deadlock (retry disabled, so a deadlock would surface)", async () => {
+      // Regression: on MariaDB 10.11 `DELETE ... WHERE id IN (...)` is planned as a full scan on a small table, which
+      // locks every row it passes and deadlocked two overlapping batches about 40% of the time (MySQL 8.0.46 plans
+      // a range there and does not deadlock, so this test only FAILS on MariaDB with the old code). Batches now
+      // lock with one SELECT ... FOR UPDATE and delete by primary key.
+      const imgs = await Promise.all(
+        Array.from({ length: 12 }, (_, i) =>
+          makeImage("png", 16 + i, 16, { seed: 300 + i }),
+        ),
+      );
+      const fwd = new ZeroBucket({ mysql: URL, maxRetries: 0 });
+      const bwd = new ZeroBucket({ mysql: URL, maxRetries: 0 });
+      for (let round = 0; round < 15; round++) {
+        const put = await fwd.putMany(imgs);
+        const ids = put.map((r) => r.imageId!);
+        const half = ids.length / 2;
+        const del = await Promise.all([
+          fwd.deleteMany(ids.slice(0, half)),
+          bwd.deleteMany(ids.slice(half).reverse()),
+          bwd.deleteMany(ids.slice(0, half).reverse()), // overlaps the first batch: only one may win each id
+        ]);
+        expect(del.flat().every((r) => r.success)).toBe(true);
+        const deletedOnce = del.flat().filter((r) => r.deleted).length;
+        expect(deletedOnce).toBe(ids.length); // every id deleted exactly once, never twice, never missed
+        for (const id of ids) expect(await fwd.exists(id)).toBe(false);
+      }
+      await fwd.close();
+      await bwd.close();
+    });
+
     it("accepts mariadb:// URLs", async () => {
       const m = new ZeroBucket({ mysql: URL!.replace(/^mysql:/, "mariadb:") });
       const id = await m.put(await makeImage("png", 10, 10, { seed: 30 }));
@@ -270,13 +300,15 @@ describe.skipIf(!URL)("MySQL/MariaDB (real server)", () => {
       await m.close();
     });
 
-    it("rejects dedup, and refuses two databases at once, with clear errors", () => {
+    it("refuses two databases at once, and dedup together with objectStorage, with clear errors", () => {
       expect(
-        () => new MySQLBackend({ connectionString: URL!, dedup: true }),
-      ).toThrow(/dedup mode is not available for MySQL/);
-      expect(() => new ZeroBucket({ mysql: URL, dedup: true })).toThrow(
-        /dedup mode is not available for MySQL/,
-      );
+        () =>
+          new MySQLBackend({
+            connectionString: URL!,
+            dedup: true,
+            objectStorage: new ObjectStorage({ bucket: "b" }),
+          }),
+      ).toThrow(/objectStorage is not supported together with dedup/);
       expect(() => new ZeroBucket({ mysql: URL, sqlite: ":memory:" })).toThrow(
         /Choose one database/,
       );
@@ -288,10 +320,10 @@ describe.skipIf(!URL)("MySQL/MariaDB (real server)", () => {
     });
 
     it("a wrong password fails at ready() with a StorageError, not a raw driver error", async () => {
-      const bad = new ZeroBucket({
-        mysql: URL!.replace("zerobucket:zerobucket@", "zerobucket:wrong@"),
-        maxRetries: 0,
-      });
+      // `URL` is shadowed by the test URL string above, hence globalThis. Works whatever the real password is.
+      const wrong = new globalThis.URL(URL!);
+      wrong.password = "definitely-not-the-password";
+      const bad = new ZeroBucket({ mysql: wrong.toString(), maxRetries: 0 });
       await expect(bad.ready()).rejects.toBeInstanceOf(StorageError);
       await expect(bad.ready()).rejects.toThrow(/MySQL\/MariaDB/);
       await bad.close();
