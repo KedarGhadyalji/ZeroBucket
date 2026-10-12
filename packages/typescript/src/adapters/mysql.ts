@@ -32,7 +32,19 @@
  *    metadata lock, which queues behind every open transaction and blocks all later queries on the table.
  *    (The Python package always runs `ALTER TABLE ... MODIFY data` at startup; both additions are
  *    purely additive and work on MySQL and MariaDB.)
- *  - Dedup mode is NOT available yet. It is rejected loudly rather than silently ignored.
+ *  - Dedup mode (`dedup: true`) uses the Python package's two tables (zerobucket_blobs: one row per distinct
+ *    content with a ref_count; zerobucket_image_refs: one row per image). A batch groups identical images,
+ *    upserts each distinct blob ONCE in sorted checksum order and decrements in sorted order too: a global
+ *    lock order, so two overlapping batches can never deadlock on each other's blob rows. Without `RETURNING`
+ *    the decrement is `UPDATE ... ref_count = ref_count - n` (which takes the row lock) followed by a point
+ *    `DELETE ... WHERE ref_count <= 0`; the foreign key makes deleting a still-referenced blob impossible.
+ *  - Batch deletes lock with one `SELECT ... FOR UPDATE` and then use POINT statements, never `DELETE ... IN (...)`.
+ *    On MariaDB 10.11 that statement is planned as a full scan on a small table (EXPLAIN type=ALL) while the ordered
+ *    SELECT gets a range plan; a scan locks every row it passes, so overlapping batches deadlocked (measured: 126 per
+ *    300 concurrent transactions with IN-list deletes, 0 with point deletes). MySQL 8.0.46 plans the same delete as a
+ *    range on just the listed keys and did NOT deadlock in the same test; point deletes do not depend on the plan, so
+ *    they are used on both.
+ *    Like the other adapters, dedup cannot be combined with object storage (a blob may be shared).
  */
 import { randomUUID } from "node:crypto";
 import { StorageError } from "../errors.js";
@@ -47,7 +59,10 @@ import type {
 } from "../types.js";
 import type {
   CallOptions,
+  ImageListEntry,
+  ImageListOptions,
   StorageBackend,
+  StorageInfo,
   StoredRecord,
   StoredRecordMetadata,
   StreamOptions,
@@ -57,6 +72,7 @@ import {
   isValidId,
   mapLimit,
   msg,
+  prettySize,
   sleep,
   streamFromObjectStorage,
   tieredWithoutStorage,
@@ -97,14 +113,93 @@ const CHUNK = `SELECT SUBSTRING(data FROM ? FOR ?) AS chunk FROM zerobucket_imag
 const EXISTS = `SELECT 1 FROM zerobucket_images WHERE id = ?`;
 const LOCK_ONE = `SELECT storage_backend, object_storage_key FROM zerobucket_images WHERE id = ? FOR UPDATE`;
 const DELETE_ONE = `DELETE FROM zerobucket_images WHERE id = ?`;
-// ORDER BY id: every writer locks rows in the same order, so two overlapping batches cannot deadlock.
-const LOCK_MANY = `SELECT id, storage_backend, object_storage_key FROM zerobucket_images WHERE id IN (?) ORDER BY id FOR UPDATE`;
-const DELETE_MANY = `DELETE FROM zerobucket_images WHERE id IN (?)`;
+// LOCKING RULE for every batch write here: lock the rows with a set-based SELECT ... FOR UPDATE, then change
+// them with POINT statements (`WHERE id = ?`), always in sorted order. Never `DELETE ... WHERE id IN (...)`:
+// MariaDB 10.11 plans that as a full scan on a small table (EXPLAIN type=ALL), and a scan under REPEATABLE READ
+// locks EVERY row it passes, including rows another batch already holds, so two overlapping batches deadlock.
+// Measured on MariaDB 10.11: 126 deadlocks in 300 concurrent transactions with the IN-list delete, 0 with point
+// deletes (also 0 with a concurrent writer). MySQL 8.0.46 plans the same delete as a range on the listed keys and
+// did not deadlock in the same test; point deletes do not depend on the plan, so they are used on both.
+// FORCE INDEX(PRIMARY) on the SELECT makes it probe exactly the listed keys instead of scanning (record locks on
+// existing rows only, no gap locks), and ORDER BY id gives every writer the same lock order.
+const LOCK_MANY = `SELECT id, storage_backend, object_storage_key FROM zerobucket_images FORCE INDEX (PRIMARY) WHERE id IN (?) ORDER BY id FOR UPDATE`;
 const SELECT_FOR_TIERING = `SELECT data, mime_type, size_bytes, storage_backend FROM zerobucket_images WHERE id = ? FOR UPDATE`;
 const UPDATE_AFTER_TIERING = `UPDATE zerobucket_images SET data = NULL, storage_backend = 'object_storage', object_storage_bucket = ?, object_storage_key = ?, updated_at = ? WHERE id = ?`;
 
 /** Value of `storage_backend` for rows whose bytes live in the database (same as the Python package). */
 const LOCAL = "mysql";
+
+// ---- dedup mode: content-addressed blobs + per-image refs (same schema as the Python package) ----
+
+const DEDUP_BLOBS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS zerobucket_blobs (
+    checksum_sha256     CHAR(64) PRIMARY KEY,
+    data                LONGBLOB NOT NULL,
+    mime_type           VARCHAR(255) NOT NULL,
+    size_bytes          INT NOT NULL,
+    width               INT,
+    height              INT,
+    ref_count           INT NOT NULL DEFAULT 0,
+    created_at          DATETIME(6) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`;
+
+const DEDUP_REFS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS zerobucket_image_refs (
+    id                  CHAR(36) PRIMARY KEY,
+    checksum_sha256     CHAR(64) NOT NULL,
+    original_filename   TEXT,
+    created_at          DATETIME(6) NOT NULL,
+    updated_at          DATETIME(6) NOT NULL,
+    INDEX idx_zerobucket_image_refs_checksum (checksum_sha256),
+    INDEX idx_zerobucket_image_refs_created_at (created_at),
+    FOREIGN KEY (checksum_sha256) REFERENCES zerobucket_blobs(checksum_sha256)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`;
+
+/**
+ * Insert a blob with `n` references, or add `n` to an existing blob's count. InnoDB makes the increment
+ * atomic at the row level, so 20 concurrent puts of the same bytes give ref_count == 20. `n` is a
+ * count this module computed (never user input); it is inlined because prepared statements send JS
+ * numbers as DOUBLE, which makes `ref_count + ?` a floating-point expression.
+ */
+function upsertBlobSql(n: number): string {
+  if (!Number.isInteger(n) || n < 1) throw new RangeError("invalid ref count");
+  return `INSERT INTO zerobucket_blobs (checksum_sha256, data, mime_type, size_bytes, width, height, ref_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ${n}, ?) ON DUPLICATE KEY UPDATE ref_count = ref_count + ${n}`;
+}
+const D_INSERT_REF = `INSERT INTO zerobucket_image_refs (id, checksum_sha256, original_filename, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`;
+// Aliased to the classic column names so one row mapper serves both modes.
+const D_COLS = `r.id, b.data, b.mime_type, r.original_filename, b.size_bytes, b.width, b.height, r.checksum_sha256, '${LOCAL}' AS storage_backend, NULL AS object_storage_bucket, NULL AS object_storage_key`;
+const D_FROM = `FROM zerobucket_image_refs r JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256`;
+const D_LOCK_REF = `SELECT checksum_sha256 FROM zerobucket_image_refs WHERE id = ? FOR UPDATE`;
+const D_DELETE_REF = `DELETE FROM zerobucket_image_refs WHERE id = ?`;
+const D_LOCK_REFS = `SELECT id, checksum_sha256 FROM zerobucket_image_refs FORCE INDEX (PRIMARY) WHERE id IN (?) ORDER BY id FOR UPDATE`;
+const D_DECREMENT = `UPDATE zerobucket_blobs SET ref_count = ref_count - ? WHERE checksum_sha256 = ?`;
+// Point delete, never an IN list (see the LOCKING RULE above); a no-op unless the count reached zero.
+const D_DELETE_EMPTY = `DELETE FROM zerobucket_blobs WHERE checksum_sha256 = ? AND ref_count <= 0`;
+
+interface SqlSet {
+  selectFull: string;
+  selectMany: string;
+  selectMetadata: string;
+  streamInfo: string;
+  chunk: string;
+  exists: string;
+}
+const CLASSIC_SQL: SqlSet = {
+  selectFull: SELECT_FULL,
+  selectMany: SELECT_MANY,
+  selectMetadata: SELECT_METADATA,
+  streamInfo: STREAM_INFO,
+  chunk: CHUNK,
+  exists: EXISTS,
+};
+const DEDUP_SQL: SqlSet = {
+  selectFull: `SELECT ${D_COLS} ${D_FROM} WHERE r.id = ?`,
+  selectMany: `SELECT ${D_COLS} ${D_FROM} WHERE r.id IN (?)`,
+  selectMetadata: `SELECT r.id, b.mime_type, r.original_filename, b.size_bytes, b.width, b.height, r.checksum_sha256 ${D_FROM} WHERE r.id = ?`,
+  streamInfo: `SELECT b.size_bytes, '${LOCAL}' AS storage_backend, NULL AS object_storage_key ${D_FROM} WHERE r.id = ?`,
+  chunk: `SELECT SUBSTRING(b.data FROM ? FOR ?) AS chunk ${D_FROM} WHERE r.id = ?`,
+  exists: `SELECT 1 FROM zerobucket_image_refs WHERE id = ?`,
+};
 
 // ---- error classification ----------------------------------------------------------------------
 
@@ -228,7 +323,11 @@ export interface MySQLBackendOptions {
   onOperation?: (event: OperationEvent) => void;
   /** Enables transparent reads of tiered rows and `tierToObjectStorage()`. */
   objectStorage?: ObjectStorageLike;
-  /** Not available for MySQL yet; passing `true` throws. */
+  /**
+   * Content-addressed storage: identical bytes are stored once and shared by every image that has them
+   * (reference counted). Same tables as the Python package's dedup mode. Cannot be combined with
+   * `objectStorage` (a blob may be shared by many images).
+   */
   dedup?: boolean;
 }
 
@@ -243,6 +342,8 @@ export class MySQLBackend implements StorageBackend {
   private readonly retryBaseDelayMs: number;
   private readonly poolTimeoutMs: number;
   private readonly autoMigrate: boolean;
+  private readonly dedup: boolean;
+  private readonly sql: SqlSet;
 
   constructor(private readonly opts: MySQLBackendOptions) {
     if (!opts.connectionString && !opts.pool) {
@@ -250,12 +351,14 @@ export class MySQLBackend implements StorageBackend {
         "MySQLBackend requires either `connectionString` or `pool`",
       );
     }
-    if (opts.dedup) {
+    this.dedup = opts.dedup ?? false;
+    if (this.dedup && opts.objectStorage) {
       throw new TypeError(
-        "dedup mode is not available for MySQL in the npm package yet (the Python package supports it). " +
-          "Use classic mode, or Postgres/SQLite for dedup.",
+        "objectStorage is not supported together with dedup: true (same restriction as the Python package). " +
+          "Tiering moves one image's bytes, but a deduplicated blob can be shared by many images.",
       );
     }
+    this.sql = this.dedup ? DEDUP_SQL : CLASSIC_SQL;
     this.ownsPool = !opts.pool;
     this.pool = opts.pool;
     this.maxRetries = opts.maxRetries ?? 3;
@@ -342,6 +445,10 @@ export class MySQLBackend implements StorageBackend {
       );
     }
     try {
+      if (this.dedup) {
+        await this.migrateDedup(q);
+        return;
+      }
       // DDL only when something is actually missing. Even a no-op ALTER TABLE needs an EXCLUSIVE metadata
       // lock, which waits behind every open transaction on the table, and while it waits, every other
       // query on that table queues behind IT. Starting an app instance during a long transaction must
@@ -401,6 +508,21 @@ export class MySQLBackend implements StorageBackend {
     } finally {
       await q.query("SELECT RELEASE_LOCK(?)", [MIGRATE_LOCK]).catch(() => {});
     }
+  }
+
+  /** Dedup tables, created only if missing (same no-needless-DDL rule as the classic table). */
+  private async migrateDedup(q: MysqlQueryable): Promise<void> {
+    const have = new Set(
+      (
+        (
+          await q.query(
+            "SELECT TABLE_NAME AS t FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('zerobucket_blobs', 'zerobucket_image_refs')",
+          )
+        )[0] as { t: string }[]
+      ).map((r) => r.t),
+    );
+    if (!have.has("zerobucket_blobs")) await q.query(DEDUP_BLOBS_SCHEMA); // the refs table references it
+    if (!have.has("zerobucket_image_refs")) await q.query(DEDUP_REFS_SCHEMA);
   }
 
   async close(): Promise<void> {
@@ -601,6 +723,19 @@ export class MySQLBackend implements StorageBackend {
   ): Promise<string> {
     try {
       const id = randomUUID();
+      if (this.dedup) {
+        await this.run(
+          "put",
+          connection,
+          async (q) => {
+            const now = mysqlNow();
+            await q.execute(upsertBlobSql(1), blobParams(row, now));
+            await q.execute(D_INSERT_REF, refParams(id, row, now));
+          },
+          { tx: true },
+        );
+        return id;
+      }
       await this.run("put", connection, async (q) => {
         await q.execute(INSERT, rowParams(id, row, mysqlNow()));
       });
@@ -624,6 +759,24 @@ export class MySQLBackend implements StorageBackend {
         connection,
         async (q) => {
           const now = mysqlNow();
+          if (this.dedup) {
+            // Identical images in one batch share a blob: count them, upsert each distinct checksum ONCE
+            // in sorted order (a global lock order, so overlapping batches cannot deadlock), then create
+            // the refs in input order.
+            const groups = new Map<string, { row: PreparedRow; n: number }>();
+            for (const r of rows) {
+              const g = groups.get(r.checksumSha256);
+              if (g) g.n += 1;
+              else groups.set(r.checksumSha256, { row: r, n: 1 });
+            }
+            for (const checksum of [...groups.keys()].sort()) {
+              const g = groups.get(checksum)!;
+              await q.execute(upsertBlobSql(g.n), blobParams(g.row, now));
+            }
+            for (let i = 0; i < rows.length; i++)
+              await q.execute(D_INSERT_REF, refParams(ids[i]!, rows[i]!, now));
+            return;
+          }
           for (let i = 0; i < rows.length; i++)
             await q.execute(INSERT, rowParams(ids[i]!, rows[i]!, now));
         },
@@ -645,7 +798,7 @@ export class MySQLBackend implements StorageBackend {
       row = await this.run(
         "get",
         connection,
-        async (q) => (await q.query(SELECT_FULL, [id]))[0][0],
+        async (q) => (await q.query(this.sql.selectFull, [id]))[0][0],
       );
     } catch (exc) {
       throw wrap("Failed to retrieve image", exc);
@@ -664,7 +817,7 @@ export class MySQLBackend implements StorageBackend {
       rows = await this.run(
         "get_many",
         connection,
-        async (q) => (await q.query(SELECT_MANY, [valid]))[0],
+        async (q) => (await q.query(this.sql.selectMany, [valid]))[0],
       );
     } catch (exc) {
       throw wrap("Failed to retrieve image batch", exc);
@@ -682,7 +835,7 @@ export class MySQLBackend implements StorageBackend {
       row = await this.run(
         "get_metadata",
         connection,
-        async (q) => (await q.query(SELECT_METADATA, [id]))[0][0],
+        async (q) => (await q.query(this.sql.selectMetadata, [id]))[0][0],
       );
     } catch (exc) {
       throw wrap("Failed to retrieve image metadata", exc);
@@ -713,7 +866,7 @@ export class MySQLBackend implements StorageBackend {
       info = await this.run(
         "get_metadata",
         connection,
-        async (q) => (await q.query(STREAM_INFO, [id]))[0][0],
+        async (q) => (await q.query(this.sql.streamInfo, [id]))[0][0],
       );
     } catch (exc) {
       throw wrap("Failed to retrieve image metadata", exc);
@@ -748,7 +901,8 @@ export class MySQLBackend implements StorageBackend {
           row = await self.run(
             "get_stream",
             connection,
-            async (q) => (await q.query(CHUNK, [offset + 1, length, id]))[0][0],
+            async (q) =>
+              (await q.query(self.sql.chunk, [offset + 1, length, id]))[0][0],
           );
         } catch (exc) {
           throw wrap("Failed to stream image", exc);
@@ -775,6 +929,7 @@ export class MySQLBackend implements StorageBackend {
 
   async delete(id: string, { connection }: CallOptions = {}): Promise<boolean> {
     if (!isValidId(id)) return false;
+    if (this.dedup) return this.deleteDedup(id, connection);
     try {
       // No RETURNING: lock the row, learn where its bytes live, delete it, all in one transaction.
       const row = await this.run(
@@ -802,14 +957,14 @@ export class MySQLBackend implements StorageBackend {
   ): Promise<string[]> {
     const valid = [...new Set(ids.filter(isValidId))];
     if (valid.length === 0) return [];
+    if (this.dedup) return this.deleteManyDedup(valid, connection);
     try {
       const rows: any[] = await this.run(
         "delete_many",
         connection,
         async (q) => {
           const found = (await q.query(LOCK_MANY, [valid]))[0] as any[];
-          if (found.length === 0) return [];
-          await q.query(DELETE_MANY, [found.map((r) => r.id)]);
+          for (const r of found) await q.query(DELETE_ONE, [r.id]); // point deletes, in sorted order
           return found;
         },
         { tx: true },
@@ -832,10 +987,203 @@ export class MySQLBackend implements StorageBackend {
       return await this.run(
         "exists",
         connection,
-        async (q) => (await q.query(EXISTS, [id]))[0].length > 0,
+        async (q) => (await q.query(this.sql.exists, [id]))[0].length > 0,
       );
     } catch (exc) {
       throw wrap("Failed to check image existence", exc);
+    }
+  }
+
+  // ---- maintenance (CLI) -----------------------------------------------
+
+  /** Storage statistics, or null if the tables do not exist yet (nothing is created). */
+  async getInfo(): Promise<StorageInfo | null> {
+    try {
+      return await this.run("info", undefined, async (q) => {
+        const need = this.dedup
+          ? ["zerobucket_image_refs", "zerobucket_blobs"]
+          : ["zerobucket_images"];
+        const present = new Set(
+          (
+            (
+              await q.query(
+                "SELECT TABLE_NAME AS t FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (?)",
+                [need],
+              )
+            )[0] as { t: string }[]
+          ).map((r) => r.t),
+        );
+        if (!need.every((t) => present.has(t))) return null;
+        const j = this.dedup
+          ? "FROM zerobucket_image_refs r JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256"
+          : "FROM zerobucket_images";
+        const size = this.dedup ? "b.size_bytes" : "size_bytes";
+        const created = this.dedup ? "r.created_at" : "created_at";
+        const mime = this.dedup ? "b.mime_type" : "mime_type";
+        const tot = (
+          await q.query(
+            `SELECT COUNT(*) AS n, COALESCE(SUM(${size}), 0) AS bytes, CAST(MIN(${created}) AS CHAR) AS oldest, CAST(MAX(${created}) AS CHAR) AS newest ${j}`,
+          )
+        )[0][0];
+        // information_schema statistics are an estimate (MySQL 8 caches them for up to 24h), hence "approximate".
+        const disk = (
+          await q.query(
+            "SELECT COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0) AS s FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (?)",
+            [need],
+          )
+        )[0][0];
+        const fmt = (
+          await q.query(
+            `SELECT ${mime} AS m, COUNT(*) AS n, COALESCE(SUM(${size}), 0) AS bytes ${j} GROUP BY ${mime} ORDER BY COUNT(*) DESC, ${mime}`,
+          )
+        )[0] as { m: string; n: number; bytes: string }[];
+        // created_at is naive UTC; print it the way the Postgres output does (ISO with an explicit +00:00).
+        const utc = (v: string | null) => (v ? `${v}+00:00` : null);
+        const info: StorageInfo = {
+          mode: this.dedup ? "dedup" : "classic",
+          count: Number(tot.n),
+          totalBytes: Number(tot.bytes),
+          oldest: utc(tot.oldest),
+          newest: utc(tot.newest),
+          onDisk: prettySize(Number(disk.s)),
+          byFormat: fmt.map((r) => ({
+            mimeType: r.m,
+            count: Number(r.n),
+            bytes: Number(r.bytes),
+          })),
+        };
+        if (this.dedup) {
+          const b = (
+            await q.query(
+              "SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS bytes FROM zerobucket_blobs",
+            )
+          )[0][0];
+          info.dedup = { blobs: Number(b.n), storedBytes: Number(b.bytes) };
+        } else {
+          const t = (
+            await q.query(
+              "SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS bytes FROM zerobucket_images WHERE storage_backend = 'object_storage'",
+            )
+          )[0][0];
+          info.tiered = { count: Number(t.n), bytes: Number(t.bytes) };
+        }
+        return info;
+      });
+    } catch (exc) {
+      throw wrap("Failed to read storage info", exc);
+    }
+  }
+
+  /** Ids matching the filters: oldest first, or a random sample. Used by the CLI's verify and tier. */
+  async listImages(o: ImageListOptions = {}): Promise<ImageListEntry[]> {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    const created = this.dedup ? "r.created_at" : "created_at";
+    if (o.minSize !== undefined) {
+      where.push(`${this.dedup ? "b.size_bytes" : "size_bytes"} >= ?`);
+      params.push(o.minSize);
+    }
+    if (o.olderThanDays !== undefined) {
+      // created_at is naive UTC, so compare against UTC_TIMESTAMP, never NOW() (which is session-timezone local).
+      where.push(`${created} <= UTC_TIMESTAMP(6) - INTERVAL ? DAY`);
+      params.push(o.olderThanDays);
+    }
+    if (o.onlyUntiered && !this.dedup)
+      where.push(`storage_backend = '${LOCAL}'`);
+    const from = this.dedup
+      ? "FROM zerobucket_image_refs r JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256"
+      : "FROM zerobucket_images";
+    const idCol = this.dedup ? "r.id" : "id";
+    const tierCol = this.dedup
+      ? "0 AS tiered"
+      : "(storage_backend = 'object_storage') AS tiered";
+    const order =
+      o.sample !== undefined
+        ? "ORDER BY RAND()"
+        : `ORDER BY ${created}, ${idCol}`;
+    const lim = o.sample ?? o.limit;
+    let sql = `SELECT ${idCol} AS id, ${tierCol} ${from}${where.length ? " WHERE " + where.join(" AND ") : ""} ${order}`;
+    if (lim !== undefined) {
+      if (!Number.isInteger(lim) || lim < 0)
+        throw new RangeError("limit/sample must be a non-negative integer");
+      sql += ` LIMIT ${lim}`;
+    }
+    try {
+      const rows = await this.run(
+        "list_images",
+        undefined,
+        async (q) => (await q.query(sql, params))[0] as any[],
+      );
+      return rows.map((r) => ({
+        id: String(r.id),
+        tiered: Boolean(Number(r.tiered)),
+      }));
+    } catch (exc) {
+      throw wrap("Failed to list images", exc);
+    }
+  }
+
+  // ---- dedup deletes ---------------------------------------------------
+
+  /**
+   * Lock the ref row, delete it, then decrement its blob (the UPDATE takes the blob row lock, so two
+   * deletes of different refs to one blob serialize instead of racing) and remove the blob once nothing
+   * references it. All in one transaction: a failure can never leave a ref without its count or the reverse.
+   */
+  private async deleteDedup(
+    id: string,
+    connection: Connection | undefined,
+  ): Promise<boolean> {
+    try {
+      return await this.run(
+        "delete",
+        connection,
+        async (q) => {
+          const ref = (await q.query(D_LOCK_REF, [id]))[0][0];
+          if (!ref) return false; // id did not exist: nothing to decrement either
+          const checksum = ref.checksum_sha256 as string;
+          await q.query(D_DELETE_REF, [id]);
+          await q.query(D_DECREMENT, [1, checksum]);
+          await q.query(D_DELETE_EMPTY, [checksum]);
+          return true;
+        },
+        { tx: true },
+      );
+    } catch (exc) {
+      throw wrap("Failed to delete image", exc);
+    }
+  }
+
+  private async deleteManyDedup(
+    ids: string[],
+    connection: Connection | undefined,
+  ): Promise<string[]> {
+    try {
+      return await this.run(
+        "delete_many",
+        connection,
+        async (q) => {
+          const found = (await q.query(D_LOCK_REFS, [ids]))[0] as any[];
+          if (found.length === 0) return [];
+          for (const r of found) await q.query(D_DELETE_REF, [r.id]); // point deletes, in sorted order
+          // Several deleted refs may share one blob: decrement each blob by its exact count, in sorted
+          // checksum order (a global lock order, so concurrent batches cannot deadlock).
+          const counts = new Map<string, number>();
+          for (const r of found)
+            counts.set(
+              r.checksum_sha256,
+              (counts.get(r.checksum_sha256) ?? 0) + 1,
+            );
+          for (const checksum of [...counts.keys()].sort()) {
+            await q.query(D_DECREMENT, [counts.get(checksum), checksum]);
+            await q.query(D_DELETE_EMPTY, [checksum]);
+          }
+          return found.map((r) => String(r.id));
+        },
+        { tx: true },
+      );
+    } catch (exc) {
+      throw wrap("Failed to delete image batch", exc);
     }
   }
 
@@ -894,6 +1242,11 @@ export class MySQLBackend implements StorageBackend {
     id: string,
     { connection }: CallOptions = {},
   ): Promise<boolean | null> {
+    if (this.dedup) {
+      throw new StorageError(
+        "tierToObjectStorage() is not supported in dedup mode (a blob may be shared by many images).",
+      );
+    }
     const os = this.opts.objectStorage;
     if (!os) {
       throw new StorageError(
@@ -920,6 +1273,22 @@ export class MySQLBackend implements StorageBackend {
       throw wrap("Failed to tier image to object storage", exc);
     }
   }
+}
+
+function blobParams(r: PreparedRow, now: string): unknown[] {
+  return [
+    r.checksumSha256,
+    r.data,
+    r.mimeType,
+    r.sizeBytes,
+    r.width,
+    r.height,
+    now,
+  ];
+}
+
+function refParams(id: string, r: PreparedRow, now: string): unknown[] {
+  return [id, r.checksumSha256, r.originalFilename, now, now];
 }
 
 function rowParams(id: string, r: PreparedRow, now: string): unknown[] {
