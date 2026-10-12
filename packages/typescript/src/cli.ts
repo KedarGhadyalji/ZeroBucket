@@ -8,8 +8,9 @@
  *   zerobucket tier      move image(s) into S3-compatible object storage
  *
  * Same commands, flags, messages and exit codes as the Python package's CLI (0 ok, 1 problems found / operation
- * failed, 2 usage or connection error), plus what Python's CLI lacks: it works on PostgreSQL AND SQLite, in classic
- * AND dedup mode, and `info` / `verify` understand images that were tiered to object storage.
+ * failed, 2 usage or connection error), plus what Python's CLI lacks: it works on PostgreSQL, SQLite AND MySQL/MariaDB
+ * (a `mysql://` or `mariadb://` --database-url selects it), in classic AND dedup mode, and `info` / `verify`
+ * understand images that were tiered to object storage.
  *
  * No dependencies: argument parsing is Node's built-in util.parseArgs. `tier` (and `verify --bucket`) need
  * `@aws-sdk/client-s3`, loaded lazily so every other command works without it.
@@ -21,6 +22,7 @@ import type { ImageListEntry, StorageBackend } from "./adapters/base.js";
 import { PostgresBackend } from "./adapters/postgres.js";
 import { msg } from "./adapters/shared.js";
 import { SQLiteBackend } from "./adapters/sqlite.js";
+import { MySQLBackend } from "./adapters/mysql.js";
 import { ObjectStorage } from "./object-storage.js";
 
 export interface CliIO {
@@ -75,7 +77,8 @@ Commands:
                --region NAME  --aws-access-key-id ID  --aws-secret-access-key KEY
 
 Database (choose one; flags beat environment variables):
-  --database-url URL    PostgreSQL connection string   (env: ZEROBUCKET_DATABASE_URL)
+  --database-url URL    PostgreSQL (postgresql://) or MySQL/MariaDB (mysql://, mariadb://)
+                        connection string               (env: ZEROBUCKET_DATABASE_URL)
   --sqlite PATH         SQLite database file            (env: ZEROBUCKET_SQLITE_PATH)
   --dedup               operate on the dedup-mode tables instead of the classic table
 
@@ -139,7 +142,14 @@ const COMMON = new Set(["database-url", "sqlite", "dedup", "help", "version"]);
 
 type Target =
   | { kind: "postgres"; url: string }
+  | { kind: "mysql"; url: string }
   | { kind: "sqlite"; path: string };
+
+/** `mysql://` and `mariadb://` URLs select MySQL/MariaDB; anything else is treated as PostgreSQL, as before. */
+const urlTarget = (url: string): Target =>
+  /^(mysql|mariadb):\/\//i.test(url)
+    ? { kind: "mysql", url }
+    : { kind: "postgres", url };
 
 function resolveTarget(v: Values, env: CliIO["env"]): Target {
   if (v.sqlite && v["database-url"])
@@ -147,7 +157,7 @@ function resolveTarget(v: Values, env: CliIO["env"]): Target {
       "Error: choose one database: --sqlite OR --database-url, not both.",
     );
   if (v.sqlite) return { kind: "sqlite", path: v.sqlite };
-  if (v["database-url"]) return { kind: "postgres", url: v["database-url"] };
+  if (v["database-url"]) return urlTarget(v["database-url"]);
   const url = env.ZEROBUCKET_DATABASE_URL;
   const path = env.ZEROBUCKET_SQLITE_PATH;
   if (url && path) {
@@ -155,10 +165,10 @@ function resolveTarget(v: Values, env: CliIO["env"]): Target {
       "Error: both ZEROBUCKET_DATABASE_URL and ZEROBUCKET_SQLITE_PATH are set. Pass --database-url or --sqlite to choose.",
     );
   }
-  if (url) return { kind: "postgres", url };
+  if (url) return urlTarget(url);
   if (path) return { kind: "sqlite", path };
   throw usageError(
-    "Error: no database provided. Pass --database-url (PostgreSQL) or --sqlite PATH, or set the " +
+    "Error: no database provided. Pass --database-url (PostgreSQL or MySQL/MariaDB) or --sqlite PATH, or set the " +
       "ZEROBUCKET_DATABASE_URL / ZEROBUCKET_SQLITE_PATH environment variable.",
   );
 }
@@ -178,13 +188,21 @@ function openBackend(
           autoMigrate: o.autoMigrate,
           objectStorage: o.objectStorage,
         })
-      : new PostgresBackend({
-          connectionString: t.url,
-          dedup: o.dedup,
-          autoMigrate: o.autoMigrate,
-          objectStorage: o.objectStorage,
-          maxRetries: 0,
-        })
+      : t.kind === "mysql"
+        ? new MySQLBackend({
+            connectionString: t.url,
+            dedup: o.dedup,
+            autoMigrate: o.autoMigrate,
+            objectStorage: o.objectStorage,
+            maxRetries: 0,
+          })
+        : new PostgresBackend({
+            connectionString: t.url,
+            dedup: o.dedup,
+            autoMigrate: o.autoMigrate,
+            objectStorage: o.objectStorage,
+            maxRetries: 0,
+          })
   ) as Admin;
 }
 
@@ -338,7 +356,9 @@ async function cmdInfo(
       io.out(
         target.kind === "postgres"
           ? `  On-disk size (table + TOAST + indexes):    ${info.onDisk}`
-          : `  On-disk size (database file + WAL):        ${info.onDisk}`,
+          : target.kind === "mysql"
+            ? `  On-disk size (data + indexes, approximate): ${info.onDisk}`
+            : `  On-disk size (database file + WAL):        ${info.onDisk}`,
       );
     }
     if (info.tiered && info.tiered.count > 0) {
