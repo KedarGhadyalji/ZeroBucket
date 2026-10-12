@@ -10,8 +10,7 @@ This is the Node.js/TypeScript sibling of the [Python package](https://pypi.org/
 **It uses the exact same table**, so a Node service and a Python service can share one database
 and read each other's images.
 
-> **Status: early (0.7.x).** PostgreSQL **and SQLite**, each in classic and dedup modes, plus **MySQL/MariaDB** (classic
-> mode; dedup and the CLI are not available for MySQL yet, see [What's not here yet](#whats-not-here-yet)), with
+> **Status: early (0.8.x).** PostgreSQL, SQLite **and MySQL/MariaDB**, each in classic and dedup modes, with
 > S3-compatible object-storage tiering, HEIC (iPhone photo) support and a `zerobucket` command line tool.
 
 ## Install
@@ -220,10 +219,13 @@ const id2 = await images.put(iphonePhoto, {
 
 The package installs a `zerobucket` command (`npx zerobucket ...`, or install globally with `npm i -g zerobucket`).
 It has the same commands, flags, messages and exit codes as the Python package's CLI, and additionally works with
-**SQLite** and **dedup mode**, and understands images that were tiered to object storage. It does not know MySQL/MariaDB yet.
+**SQLite**, **MySQL/MariaDB** (a `mysql://` or `mariadb://` `--database-url`, or `ZEROBUCKET_DATABASE_URL`) and **dedup
+mode**, and understands images that were tiered to object storage. On MySQL the on-disk size is read from
+`information_schema` and is approximate (MySQL 8 caches those statistics for up to 24 hours).
 
 ```bash
 export ZEROBUCKET_DATABASE_URL=postgresql://user:pass@localhost/mydb     # or: --database-url URL
+# MySQL/MariaDB:   export ZEROBUCKET_DATABASE_URL=mysql://user:pass@localhost:3306/mydb   # mariadb:// works too
 # SQLite instead:  export ZEROBUCKET_SQLITE_PATH=./images.db              # or: --sqlite PATH
 
 zerobucket init                 # create the schema (add --dedup for the dedup tables)
@@ -308,12 +310,16 @@ const images = new ZeroBucket({
 
 Same API as everywhere else: `put`, `get`, `getMany`, `putMany`, `delete`, `deleteMany`, `exists`, `metadata`, streaming
 and ranges, access-control hooks, the optimize pipeline, custom validators, HEIC, `onOperation` metrics, retry with
-backoff, pooling (`poolMaxSize`, `poolTimeoutMs`), **object-storage tiering** and `connection` (your own transaction).
-It uses the Python package's table, byte for byte (`SHOW CREATE TABLE` is identical), so a Node app and a Python app can
-share one MySQL/MariaDB database (the conformance harness verifies both directions, including tiered rows).
+backoff, pooling (`poolMaxSize`, `poolTimeoutMs`), **dedup mode** (`dedup: true`), **object-storage tiering** and
+`connection` (your own transaction). The [`zerobucket` CLI](#command-line) works on it too: pass a `mysql://` or
+`mariadb://` `--database-url`.
 
-**Not available on MySQL yet:** dedup mode (`dedup: true` throws, rather than being ignored) and the `zerobucket` command
-line tool (it knows PostgreSQL and SQLite). The Python package has both for MySQL.
+It uses the Python package's tables, byte for byte (`SHOW CREATE TABLE` is identical for the classic table and for both
+dedup tables), so a Node app and a Python app can share one MySQL/MariaDB database. The conformance harness verifies both
+directions in both modes, including tiered rows and shared dedup blobs.
+
+As everywhere, dedup and tiering cannot be combined (`dedup: true` with `objectStorage` throws). Copying an existing
+classic table into the dedup tables (`migrate --to-dedup`) is PostgreSQL-only, as in the Python package.
 
 What is different from Postgres, and why (each verified against a real MariaDB 10.11):
 
@@ -331,6 +337,18 @@ What is different from Postgres, and why (each verified against a real MariaDB 1
 - **Migration takes a server-side lock** (`GET_LOCK`), so many processes starting at once do not race on the DDL, and it
   issues **no DDL at all** when the schema is current. (Even a no-op `ALTER TABLE` needs an exclusive metadata lock that
   waits behind every open transaction, and everything else on that table then queues behind _it_.)
+- **Dedup** stores each distinct image once (`zerobucket_blobs`, with a `ref_count`) and one row per image
+  (`zerobucket_image_refs`). Without `RETURNING`, a delete decrements with `UPDATE ... ref_count = ref_count - n` (which
+  takes the row lock) and then removes the blob once the count reaches zero; the foreign key makes deleting a blob that is
+  still referenced impossible. A batch groups identical images, touches each distinct blob **once, in sorted checksum
+  order**, and decrements in the same order, so overlapping batches cannot deadlock.
+- **Batch deletes use one `SELECT ... FOR UPDATE` and then point deletes, never `DELETE ... WHERE id IN (...)`.** On
+  MariaDB 10.11, with a small table, the `IN` delete is planned as a full scan (`EXPLAIN` says `type=ALL`), and a scan
+  under REPEATABLE READ locks every row it passes, including rows another batch already holds. Two overlapping
+  `deleteMany` batches deadlocked in 126 of 300 transactions with an `IN` delete and in 0 with point deletes (also 0 with
+  a concurrent writer on the same blobs); `READ COMMITTED` and `FORCE INDEX` alone did not fix it. MySQL 8.0.46 plans the
+  same statement as a range over just the listed ids and did **not** deadlock in the same test. Point deletes do not
+  depend on the plan, so they are used on both.
 - **Large images and `max_allowed_packet`.** An image bigger than the server's limit fails with an error that says so and
   how to raise it (`SET GLOBAL max_allowed_packet = ...`). Images are sent as raw bytes, so the limit applies to the image
   size, not twice that.
@@ -343,8 +361,9 @@ What is different from Postgres, and why (each verified against a real MariaDB 1
   skipped on your connection (it cannot know whether you will commit).
 - **Streaming** uses ranged `SUBSTRING()` reads, so a delete mid-stream raises `StorageError` (like Postgres). Tiered images
   stream with real S3 `Range` requests.
-- **Tested on MariaDB 10.11.** Real MySQL 8.x is expected to behave the same (the SQL avoids MariaDB-only features) but has
-  not been run here. Use MariaDB 10.2.1+ or MySQL 8.0.16+: older servers accept the `CHECK` constraint syntax but ignore it.
+- **Tested on MariaDB 10.11 and MySQL 8.0.46** (the MySQL, dedup and CLI test suites, the Node/Python conformance harness
+  and the schema comparison all pass on both). Other versions are expected to behave the same but have not been run. Use
+  MariaDB 10.2.1+ or MySQL 8.0.16+: older servers accept the `CHECK` constraint syntax but ignore it.
 
 ## Deduplication
 
@@ -443,8 +462,8 @@ same corpus of valid and corrupt files identically.
 
 ## What's not here yet
 
-Planned for MySQL/MariaDB: **dedup mode**, the **`zerobucket` CLI**, and a MySQL-specific operations guide.
-Tiering and dedup cannot be combined (same rule as the Python package).
+Planned for MySQL/MariaDB: a MySQL-specific operations guide, and `migrate --to-dedup` (PostgreSQL-only today, as in the
+Python package). Tiering and dedup cannot be combined (same rule as the Python package).
 
 ## Runtime notes
 

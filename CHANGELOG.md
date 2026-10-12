@@ -6,6 +6,66 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.8.0] - 2026-10-11
+
+### Added -- MySQL / MariaDB: dedup mode and the CLI
+
+- `new ZeroBucket({ mysql: url, dedup: true })` (and `MySQLBackend({ dedup: true })`): content-addressed storage with
+  reference counting, on the Python package's own tables (`zerobucket_blobs`, `zerobucket_image_refs`). `SHOW CREATE TABLE`
+  was compared against tables created by the Python `MySQLBackend`: both dedup tables are byte-identical. The conformance
+  harness now runs a MySQL dedup section in both directions (Python-written refs to a shared blob deleted from Node and the
+  reverse, ref_count 3 -> 2 each way). `dedup: true` together with `objectStorage` throws, and `tierToObjectStorage()` is
+  refused in dedup mode, as in the other backends. `migrate --to-dedup` stays PostgreSQL-only (also true in Python).
+- The `zerobucket` CLI works on MySQL/MariaDB: a `mysql://` or `mariadb://` `--database-url` (or `ZEROBUCKET_DATABASE_URL`)
+  selects it. `init`, `migrate`, `info`, `verify` and `tier` all run, in classic and dedup mode. The CLI test matrix now has
+  a third backend: the same 19 scenarios that run against PostgreSQL and SQLite run against MySQL (19/19). The Python CLI has
+  no MySQL support, so there is no reference output; on-disk size comes from `information_schema` and is labelled
+  approximate (MySQL 8 caches those statistics for up to 24 hours).
+- `MySQLBackend.getInfo()` and `listImages()` (what the CLI uses): counts, sizes, per-format breakdown, dedup savings,
+  tiered counts, and filters by size, age (compared against `UTC_TIMESTAMP`, since stored times are naive UTC), sampling and
+  limit.
+
+### Fixed -- batch deletes could deadlock on MariaDB (found while building dedup; also affected classic mode in 0.7.0)
+
+- `deleteMany` used `SELECT ... FOR UPDATE` followed by `DELETE ... WHERE id IN (...)`. On **MariaDB 10.11**, with a small
+  table, that delete is planned as a full scan (`EXPLAIN`: `type=ALL`) while the ordered `SELECT` gets a range plan, and a
+  scan under REPEATABLE READ locks every row it passes, including rows another batch holds. Two overlapping `deleteMany`
+  calls then deadlocked: measured 126 deadlocks in 300 concurrent transactions. Retry hid it in normal use (a deadlock
+  rolls back and the call is re-run), but it cost latency and surfaced with `maxRetries: 0`.
+- **On MySQL 8.0.46 the same test does not deadlock**: it plans that delete as a `range` over just the listed keys. With
+  the old code restored, both deadlock tests passed there. So this was a MariaDB-plan problem, not a MySQL 8 one; the fix is
+  harmless on MySQL 8 and no longer depends on what the optimizer chooses.
+- Measured alternatives on MariaDB 10.11: `FORCE INDEX (PRIMARY)` alone, 142 deadlocks; `READ COMMITTED`, 142; **a
+  set-based `SELECT ... FOR UPDATE ... ORDER BY id` followed by point deletes by primary key, 0** (also 0 with a
+  concurrent writer on the same blobs, 450 transactions). Batches now do that, in classic and dedup mode. Dedup blob counts
+  are decremented, and blobs removed, one checksum at a time in sorted order.
+- The Python `MySQLBackend` has the same `IN`-list delete but did **not** deadlock when measured the same way (two
+  `delete_many` calls released together by a barrier, retry disabled, 300 calls each in classic and dedup mode: 0
+  failures). It has no `ORDER BY`, so both its statements get the same full-scan plan, take locks in the same order and
+  merely serialize; the Node deadlock needed the mixed plan (a range-planned `SELECT ... ORDER BY id` followed by a
+  scanned `DELETE`). That is a property of the optimizer on small tables, not a guarantee, and nothing here changes Python.
+- A regression test covers classic mode and was checked to be able to fail **on MariaDB**: with the old `IN`-list delete
+  restored it fails with the real "Deadlock found" error; with the fix it passes. The dedup suite's opposite-order test was checked
+  the same way for both halves: restoring the `IN`-list refs delete fails it, and removing the sort on the blob upserts
+  fails it (3 of 3 attempts).
+
+### Changed (tests)
+
+- The MySQL tests no longer assume the default test password. One test built its "wrong password" URL by string-replacing
+  `zerobucket:zerobucket@`, which silently did nothing with any other password and then failed because the "wrong"
+  password was correct. Found by running the suite with a custom password (needed on servers with a password policy such
+  as MySQL's `validate_password`); the URL is now parsed and its password replaced.
+
+### Verified
+
+- 46 more tests than 0.7.0 (323 in total with Postgres, MariaDB and a moto S3 server all live). The MySQL, dedup and CLI
+  test files (137 tests) were run five times back to back on the final code without a failure, using a database user with
+  no `PROCESS` or `SUPER` privilege.
+- **Real MySQL 8.0.46** (not just MariaDB): the MySQL, dedup and CLI test files pass 137/137, five times in a row; the
+  Node/Python conformance harness passes (classic and dedup); and `SHOW CREATE TABLE` is byte-identical between the Python-
+  and Node-created classic, blobs and refs tables. The account in that run existed only for `127.0.0.1` with the default
+  `caching_sha2_password` plugin, and both mysql2 and PyMySQL logged in.
+
 ## npm `zerobucket` [0.7.0] - 2026-10-10
 
 ### Added -- MySQL / MariaDB backend (classic mode)
@@ -38,8 +98,10 @@ version sequence from 0.1.0.
   in autocommit mode they open and commit their own transaction. Never retried, never commits your transaction.
 - Migration takes a server-side lock (`GET_LOCK`) and issues **no DDL when the schema is already current**. Even a no-op
   `ALTER TABLE` needs an exclusive metadata lock, which waits behind every open transaction while all later queries on the
-  table queue behind it, so starting an app instance during a long transaction could stall all traffic. (The Python
-  package runs `ALTER TABLE ... MODIFY data LONGBLOB NULL` on every startup and is exposed to this; see below.)
+  table queue behind it, so starting an app instance during a long transaction could stall all traffic. (Measured on the
+  Python package, which runs `ALTER TABLE ... MODIFY data LONGBLOB NULL` on every startup: with another transaction holding
+  the table, `MySQLBackend` startup did not return until that transaction ended, 8 s in the test, and its `pool_timeout`
+  does not apply to the DDL.)
 
 ### Security -- `mysql2` minimum
 
