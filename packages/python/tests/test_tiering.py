@@ -247,3 +247,67 @@ def test_plain_instance_get_stream_on_tiered_row_raises_clear_error(
 
     with pytest.raises(StorageError, match="object_storage"):
         images.get_stream(image_id)
+
+
+# ---- delete(connection=...) must not destroy the object before commit ----
+
+
+def test_delete_with_connection_keeps_object_until_caller_commits(
+    tiered_images, object_store
+):
+    """REGRESSION (data loss): delete(connection=...) used to remove the
+    object-storage copy immediately, before the caller's transaction
+    committed. A rollback restored the row but its object was gone, so
+    get() failed permanently. With connection= the object must be left in
+    place; the caller removes it after committing."""
+    import psycopg
+
+    data = _jpeg_bytes()
+    image_id = tiered_images.put(data)
+    tiered_images.tier_to_object_storage(image_id)
+
+    app_conn = psycopg.connect(TEST_DATABASE_URL)
+    app_conn.autocommit = False
+    try:
+        assert tiered_images.delete(image_id, connection=app_conn) is True
+        app_conn.rollback()
+    finally:
+        app_conn.close()
+
+    assert object_store.exists(str(image_id)) is True
+    assert tiered_images.get(image_id).data == data
+
+
+def test_delete_many_with_connection_keeps_objects_until_caller_commits(
+    tiered_images, object_store
+):
+    import psycopg
+
+    datas = [_jpeg_bytes(color=(i * 40, 10, 10)) for i in range(3)]
+    ids = [tiered_images.put(d) for d in datas]
+    for i in ids:
+        tiered_images.tier_to_object_storage(i)
+
+    app_conn = psycopg.connect(TEST_DATABASE_URL)
+    app_conn.autocommit = False
+    try:
+        results = tiered_images.delete_many(ids, connection=app_conn)
+        assert sorted(str(r.image_id) for r in results if r.deleted) == sorted(
+            str(i) for i in ids
+        )
+        app_conn.rollback()
+    finally:
+        app_conn.close()
+
+    for i, d in zip(ids, datas, strict=True):
+        assert object_store.exists(str(i)) is True
+        assert tiered_images.get(i).data == d
+
+
+def test_delete_without_connection_still_removes_object(tiered_images, object_store):
+    """The fix must not regress the normal path: no caller transaction means
+    the row delete is already committed, so the object is cleaned up."""
+    image_id = tiered_images.put(_jpeg_bytes())
+    tiered_images.tier_to_object_storage(image_id)
+    assert tiered_images.delete(image_id) is True
+    assert object_store.exists(str(image_id)) is False

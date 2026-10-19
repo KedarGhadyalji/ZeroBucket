@@ -574,21 +574,26 @@ def test_connection_participates_in_callers_transaction(mysql_backend, jpeg_byte
 # ---- dedup mode (Phase 3) -----------------------------------------------
 
 
-def _mysql_scalar(sql: str, params: tuple = ()):
-    """Small helper for assertions that need to look at
-    zerobucket_blobs/zerobucket_image_refs directly, bypassing the
-    ZeroBucket client. Reuses MySQLBackend's own URL parsing rather
-    than hardcoding connection kwargs a second time, so this stays in
-    sync with whatever ZEROBUCKET_TEST_MYSQL_URL actually points at."""
+def _mysql_row(sql: str, params: tuple = ()):
+    """Run one query and return its first row (or None), bypassing the
+    ZeroBucket client. Reuses MySQLBackend's own URL parsing rather than
+    hardcoding connection kwargs a second time, so this stays in sync with
+    whatever ZEROBUCKET_TEST_MYSQL_URL actually points at."""
     connect_kwargs = MySQLBackend(TEST_MYSQL_URL)._connect_kwargs.copy()  # noqa: SLF001
     conn = pymysql.connect(**connect_kwargs, autocommit=True)
     try:
         with conn.cursor() as cur:
             cur.execute(sql, params)
-            row = cur.fetchone()
-            return row[0] if row else None
+            return cur.fetchone()
     finally:
         conn.close()
+
+
+def _mysql_scalar(sql: str, params: tuple = ()):
+    """First column of the first row, or None. Used by assertions that need
+    to look at zerobucket_blobs/zerobucket_image_refs directly."""
+    row = _mysql_row(sql, params)
+    return row[0] if row else None
 
 
 @pytest.fixture
@@ -846,12 +851,10 @@ def _server_connection_count() -> int:
     """Total connections the SERVER has ever accepted (not currently
     open) -- lets a test prove connections are being reused, not just
     that operations succeed."""
-    return int(
-        _mysql_scalar(
-            "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS "
-            "WHERE VARIABLE_NAME = 'CONNECTIONS';"
-        )
-    )
+    # SHOW GLOBAL STATUS works on both MySQL and MariaDB. (The
+    # information_schema.GLOBAL_STATUS table is MariaDB-only; MySQL 8 moved
+    # it to performance_schema.)
+    return int(_mysql_row("SHOW GLOBAL STATUS LIKE 'Connections';")[1])
 
 
 def test_pool_reuses_connections_instead_of_opening_one_per_operation(
@@ -1311,3 +1314,90 @@ def test_get_stream_emits_one_event_per_chunk_plus_metadata_lookup(_mysql_availa
         assert all(e.success for e in stream_events)
     finally:
         zb.close()
+
+
+# ---- delete(connection=...) must not destroy the object before commit ----
+
+
+def test_delete_with_connection_keeps_object_until_caller_commits(
+    tiered_images, tiered_backend, object_store, jpeg_bytes
+):
+    """REGRESSION (data loss): see the Postgres twin in test_tiering.py."""
+    image_id = tiered_images.put(jpeg_bytes)
+    assert tiered_backend.tier_to_object_storage(image_id) is True
+
+    conn = tiered_backend._connect()  # noqa: SLF001
+    try:
+        assert tiered_images.delete(image_id, connection=conn) is True
+        conn.rollback()
+    finally:
+        conn.close()
+
+    assert object_store.exists(str(image_id)) is True
+    assert tiered_images.get(image_id).data == jpeg_bytes
+
+
+def test_delete_many_with_connection_keeps_objects_until_caller_commits(
+    tiered_images, tiered_backend, object_store, jpeg_bytes
+):
+    image_id = tiered_images.put(jpeg_bytes)
+    assert tiered_backend.tier_to_object_storage(image_id) is True
+
+    conn = tiered_backend._connect()  # noqa: SLF001
+    try:
+        results = tiered_images.delete_many([image_id], connection=conn)
+        assert [str(r.image_id) for r in results if r.deleted] == [str(image_id)]
+        conn.rollback()
+    finally:
+        conn.close()
+
+    assert object_store.exists(str(image_id)) is True
+    assert tiered_images.get(image_id).data == jpeg_bytes
+
+
+# ---- startup must not issue DDL when the schema is current ---------------
+
+
+def test_startup_does_not_block_behind_an_open_transaction(mysql_backend):
+    """REGRESSION: startup re-ran `ALTER TABLE ... MODIFY data LONGBLOB NULL`
+    every time. Even a no-op ALTER waits behind any open transaction that
+    has touched the table, and then blocks every other statement on it, so
+    an app restarting during a long transaction would stall. With a current
+    schema, startup must issue no DDL at all and return promptly."""
+    import threading
+
+    holder = pymysql.connect(
+        host="127.0.0.1",
+        port=int(TEST_MYSQL_URL.rsplit(":", 1)[1].split("/")[0]),
+        user="zerobucket",
+        password="zerobucket",
+        database=TEST_MYSQL_URL.rsplit("/", 1)[1],
+        autocommit=False,
+    )
+    try:
+        with holder.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM zerobucket_images;"
+            )  # holds a metadata lock
+            cur.fetchall()
+
+        result: dict = {}
+
+        def start():
+            try:
+                b = MySQLBackend(TEST_MYSQL_URL)
+                b.close()
+                result["ok"] = True
+            except Exception as exc:  # noqa: BLE001
+                result["err"] = exc
+
+        t = threading.Thread(target=start, daemon=True)
+        t.start()
+        t.join(timeout=8)
+        started = not t.is_alive()
+    finally:
+        holder.rollback()  # release, so a (failing) blocked ALTER can finish
+        holder.close()
+    t.join(timeout=15)
+    assert started, "startup blocked behind an open transaction (unconditional DDL)"
+    assert result.get("ok"), result

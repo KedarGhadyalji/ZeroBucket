@@ -336,11 +336,10 @@ def _server_connection_count() -> int:
     conn = backend._connect()  # noqa: SLF001
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS "
-                "WHERE VARIABLE_NAME = 'CONNECTIONS';"
-            )
-            return int(cur.fetchone()[0])
+            # SHOW GLOBAL STATUS works on MySQL and MariaDB; the
+            # information_schema.GLOBAL_STATUS table is MariaDB-only.
+            cur.execute("SHOW GLOBAL STATUS LIKE 'Connections';")
+            return int(cur.fetchone()[1])
     finally:
         conn.close()
         backend.close()
@@ -432,3 +431,34 @@ async def test_close_is_safe_before_first_use_and_twice(_mysql_available):
     await backend.exists("00000000-0000-0000-0000-000000000000")
     await backend.close()
     await backend.close()  # idempotent
+
+
+# ---- startup must not issue DDL when the schema is current ---------------
+
+
+async def test_async_startup_does_not_block_behind_an_open_transaction():
+    """REGRESSION: see the sync twin in test_mysql_adapter.py."""
+    import asyncio
+
+    import pymysql
+
+    holder = pymysql.connect(
+        host="127.0.0.1",
+        port=int(TEST_MYSQL_URL.rsplit(":", 1)[1].split("/")[0]),
+        user="zerobucket",
+        password="zerobucket",
+        database=TEST_MYSQL_URL.rsplit("/", 1)[1],
+        autocommit=False,
+    )
+    try:
+        with holder.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM zerobucket_images;")
+            cur.fetchall()
+        zb = AsyncZeroBucket(backend=AsyncMySQLBackend(TEST_MYSQL_URL))
+        try:
+            await asyncio.wait_for(zb.exists("00000000-0000-0000-0000-000000000000"), 8)
+        finally:
+            holder.rollback()
+            await zb.close()
+    finally:
+        holder.close()

@@ -153,9 +153,9 @@ def test_run_with_connection_never_retries_even_transient_error(fast_backend):
         attempts["count"] += 1
         raise psycopg.OperationalError("simulated, would normally be retried")
 
-    conn = psycopg.connect(
-        "postgresql://postgres:postgres@localhost:5432/zerobucket_test"
-    )
+    from tests.conftest import TEST_DATABASE_URL
+
+    conn = psycopg.connect(TEST_DATABASE_URL)
     try:
         with pytest.raises(psycopg.OperationalError):
             fast_backend._run(conn, always_transient, operation="test")

@@ -314,3 +314,159 @@ def test_migrate_classic_to_dedup_raises_clearly_if_no_classic_table(dedup_image
 
     with pytest.raises(StorageError, match="No classic zerobucket_images table"):
         migrate_classic_to_dedup(dedup_images._backend)  # noqa: SLF001
+
+
+# ---- overlapping batches must not deadlock ---------------------------------
+
+
+def _fake_row(i: int) -> dict:
+    return {
+        "data": f"blob-{i}".encode(),
+        "mime_type": "image/png",
+        "original_filename": None,
+        "size_bytes": len(f"blob-{i}".encode()),
+        "width": 1,
+        "height": 1,
+        "checksum_sha256": f"{i:064x}",
+    }
+
+
+def test_overlapping_dedup_put_many_batches_do_not_deadlock(dedup_images):
+    """REGRESSION: put_many upserted blobs in the caller's order, each upsert
+    holding a row lock until commit. Two overlapping batches in opposite
+    orders could deadlock. Retry is disabled here so a deadlock surfaces
+    instead of being silently re-run."""
+    from zerobucket.adapters.postgres import PostgresBackend
+
+    backend = PostgresBackend(TEST_DATABASE_URL, dedup=True, max_retries=0)
+    n, rounds = 150, 6
+    rows = [_fake_row(i) for i in range(n)]
+    errors: list[Exception] = []
+    try:
+        backend.put_many(rows)  # pre-create so every later upsert takes a row lock
+        for _ in range(rounds):
+            barrier = threading.Barrier(2)
+
+            def run(batch, barrier=barrier):
+                barrier.wait()
+                try:
+                    backend.put_many(batch)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=run, args=(rows,)),
+                threading.Thread(target=run, args=(list(reversed(rows)),)),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+    finally:
+        backend.close()
+    assert not errors, f"deadlock(s): {errors[:1]}"
+
+
+def test_overlapping_dedup_delete_many_batches_do_not_deadlock(dedup_images):
+    from zerobucket.adapters.postgres import PostgresBackend
+
+    backend = PostgresBackend(TEST_DATABASE_URL, dedup=True, max_retries=0)
+    n, rounds = 100, 6
+    errors: list[Exception] = []
+    try:
+        for _ in range(rounds):
+            # n ids all pointing at the same n blobs, twice over, so two
+            # overlapping delete batches share every blob.
+            ids_a = backend.put_many([_fake_row(i) for i in range(n)])
+            ids_b = backend.put_many([_fake_row(i) for i in reversed(range(n))])
+            barrier = threading.Barrier(2)
+
+            def run(batch, barrier=barrier):
+                barrier.wait()
+                try:
+                    backend.delete_many(batch)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            threads = [
+                threading.Thread(target=run, args=(ids_a,)),
+                threading.Thread(target=run, args=(ids_b,)),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+    finally:
+        backend.close()
+    assert not errors, f"deadlock(s): {errors[:1]}"
+
+
+# ---- migrate_classic_to_dedup: re-runs and tiered rows ---------------------
+
+
+def test_migrate_classic_to_dedup_can_be_run_twice(
+    dedup_images, images, jpeg_bytes, png_bytes
+):
+    """REGRESSION: a second run used to fail on duplicate primary keys (and
+    roll everything back). It must now be a safe no-op for rows already
+    migrated, and must not double-count blob ref_counts."""
+    from zerobucket.adapters.postgres import migrate_classic_to_dedup
+
+    id_a = images.put(jpeg_bytes)
+    id_b = images.put(jpeg_bytes)
+    images.put(png_bytes)
+
+    first = migrate_classic_to_dedup(dedup_images._backend)  # noqa: SLF001
+    assert first["images_migrated"] == 3
+
+    second = migrate_classic_to_dedup(dedup_images._backend)  # noqa: SLF001
+    assert second["images_migrated"] == 0
+    assert second["already_migrated_skipped"] == 3
+
+    # ref_count unchanged by the second run.
+    assert _raw_blob_row(dedup_images.metadata(id_a).checksum_sha256) == 2
+
+    # New classic rows added between runs ARE picked up.
+    id_d = images.put(jpeg_bytes)
+    third = migrate_classic_to_dedup(dedup_images._backend)  # noqa: SLF001
+    assert third["images_migrated"] == 1
+    assert third["already_migrated_skipped"] == 3
+    assert _raw_blob_row(dedup_images.metadata(id_a).checksum_sha256) == 3
+    assert dedup_images.get(id_b).data == jpeg_bytes
+    assert dedup_images.get(id_d).data == jpeg_bytes
+
+
+def test_migrate_classic_to_dedup_skips_tiered_rows_and_reports_them(
+    dedup_images, tiered_images, object_store, jpeg_bytes, png_bytes
+):
+    """REGRESSION: a tiered row has NULL data (its bytes are in object
+    storage), which made the migration fail on the NOT NULL blob column.
+    Dedup mode has no tiering, so such rows are skipped, left untouched in
+    the classic table, and counted in the summary."""
+    from zerobucket.adapters.postgres import migrate_classic_to_dedup
+
+    tiered_id = tiered_images.put(jpeg_bytes)
+    plain_id = tiered_images.put(png_bytes)
+    tiered_images.tier_to_object_storage(tiered_id)
+
+    summary = migrate_classic_to_dedup(dedup_images._backend)  # noqa: SLF001
+    assert summary["images_migrated"] == 1
+    assert summary["tiered_rows_skipped"] == 1
+
+    assert dedup_images.get(plain_id).data == png_bytes
+    assert dedup_images.exists(tiered_id) is False
+    # Still intact and readable in the classic table.
+    assert tiered_images.get(tiered_id).data == jpeg_bytes
+
+
+def test_migrate_classic_to_dedup_streams_in_batches(dedup_images, images, jpeg_bytes):
+    """Correct across more than one fetch batch."""
+    from zerobucket.adapters.postgres import migrate_classic_to_dedup
+
+    ids = [images.put(jpeg_bytes) for _ in range(7)]
+    summary = migrate_classic_to_dedup(
+        dedup_images._backend, batch_size=3  # noqa: SLF001
+    )
+    assert summary["images_migrated"] == 7
+    assert summary["distinct_blobs_created"] == 1
+    assert _raw_blob_row(dedup_images.metadata(ids[0]).checksum_sha256) == 7

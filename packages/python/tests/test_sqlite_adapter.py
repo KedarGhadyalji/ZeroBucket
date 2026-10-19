@@ -675,3 +675,26 @@ def test_dedup_before_get_hook_still_works(sqlite_path, jpeg_bytes):
     with pytest.raises(AccessDeniedError):
         zb.get(image_id)
     zb.close()
+
+
+# ---- delete(connection=...) must not destroy the object before commit ----
+
+
+def test_delete_with_connection_keeps_object_until_caller_commits(
+    tiered_images, tiered_backend, object_store, sqlite_path, jpeg_bytes
+):
+    """REGRESSION (data loss): see the Postgres twin in test_tiering.py."""
+    import sqlite3
+
+    image_id = tiered_images.put(jpeg_bytes)
+    assert tiered_backend.tier_to_object_storage(image_id) is True
+
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        assert tiered_images.delete(image_id, connection=conn) is True
+        conn.rollback()
+    finally:
+        conn.close()
+
+    assert object_store.exists(image_id) is True
+    assert tiered_images.get(image_id).data == jpeg_bytes

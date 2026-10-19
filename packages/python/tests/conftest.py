@@ -36,7 +36,6 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from zerobucket import AsyncZeroBucket, ZeroBucket
-from zerobucket.adapters.postgres import PostgresBackend
 
 TEST_DATABASE_URL = os.environ.get(
     "ZEROBUCKET_TEST_DATABASE_URL",
@@ -51,14 +50,68 @@ def _make_image_bytes(*, size=(64, 48), color=(255, 0, 0), fmt="JPEG") -> bytes:
     return buf.getvalue()
 
 
+def _probe_database() -> str | None:
+    """Try ONE direct connection (3 s limit, no pool, no retry loop).
+
+    Returns None if the test database is reachable, otherwise a short
+    reason. Deliberately not PostgresBackend: its pool keeps retrying for
+    ~10 s per attempt, which turns a wrong password into minutes of silent
+    waiting across a whole suite.
+    """
+    import psycopg
+
+    try:
+        with psycopg.connect(TEST_DATABASE_URL, connect_timeout=3):
+            return None
+    except Exception as exc:  # noqa: BLE001
+        return str(exc).strip().splitlines()[-1]
+
+
+_PROBE_RESULT: dict[str, str | None] = {}
+
+
+def _db_problem() -> str | None:
+    if "r" not in _PROBE_RESULT:
+        _PROBE_RESULT["r"] = _probe_database()
+    return _PROBE_RESULT["r"]
+
+
+def _redacted_url() -> str:
+    from urllib.parse import urlsplit
+
+    u = urlsplit(TEST_DATABASE_URL)
+    host = f"{u.hostname}:{u.port}" if u.port else (u.hostname or "")
+    return f"{u.scheme}://{u.username}:***@{host}{u.path}"
+
+
+def pytest_report_header(config):
+    problem = _db_problem()
+    if problem is None:
+        return f"zerobucket: PostgreSQL reachable ({_redacted_url()})"
+    return (
+        f"zerobucket: PostgreSQL NOT reachable ({_redacted_url()}): {problem}\n"
+        "zerobucket: every test that needs it will be SKIPPED, not failed. "
+        "Fix ZEROBUCKET_TEST_DATABASE_URL (note `set` only lasts for one "
+        "command window)."
+    )
+
+
 @pytest.fixture(scope="session")
 def _db_available():
     """Skip all integration tests cleanly if no test database is reachable."""
-    try:
-        backend = PostgresBackend(TEST_DATABASE_URL)
-        backend.close()
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"No reachable test database ({TEST_DATABASE_URL}): {exc}")
+    problem = _db_problem()
+    if problem is not None:
+        pytest.skip(f"No reachable test database ({_redacted_url()}): {problem}")
+
+
+@pytest.fixture(autouse=True)
+def _skip_when_postgres_unreachable(request):
+    """Tests in any module that imports TEST_DATABASE_URL talk to Postgres.
+    Some build ZeroBucket directly instead of using the `images` fixtures,
+    so they would bypass `_db_available` and fail slowly one by one. Route
+    them through the same single fast check."""
+    if hasattr(request.module, "TEST_DATABASE_URL"):
+        request.getfixturevalue("_db_available")
 
 
 @pytest.fixture
