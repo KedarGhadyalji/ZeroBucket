@@ -6,6 +6,41 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.8.1] - 2026-10-19
+
+Documentation and parity release. One small additive feature, no behaviour change unless you opt in.
+
+### Added
+
+- **`migrateClassicToDedup({ skipTiered: true })` and `zerobucket migrate --to-dedup --skip-tiered`.** Classic images
+  already tiered to object storage cannot be migrated (their bytes are not in the database, and dedup mode has no
+  tiering). The default is unchanged: the migration **refuses** and changes nothing, and the error message now names the
+  opt-in. With `skipTiered`, those images are skipped, left untouched in the classic table, and counted in the new
+  `tieredSkipped` field of the result (the CLI prints it); they will not exist in the dedup tables. This gives npm the
+  same capability the Python package gained in 0.25.1, which always skips. New types `MigrateToDedupOptions` and
+  `MigrateToDedupResult` are exported.
+- **Operations Guide for every backend** (`docs/OPERATIONS.md`, linked from the README). It previously covered only
+  PostgreSQL. It now also covers the dedup tables, MySQL/MariaDB (`mysqldump`, `max_allowed_packet`, `OPTIMIZE TABLE`)
+  and SQLite (backing up a WAL database, `VACUUM`). The figures in it were measured, not assumed: SQLite's main-file copy
+  contained no table while data was still in the `-wal` file; a 2 MB SQLite file stayed 2 MB after deleting every row and
+  fell to 8 KB after `VACUUM`; an InnoDB file stayed at 32 MB after deleting 29 of 30 rows and fell to 4 MB after
+  `OPTIMIZE TABLE`; `max_allowed_packet` defaults to 16 MB on MariaDB 10.11 and 64 MB on MySQL 8.0.
+- **A "Limitations (read before using in production)" section** in the README, replacing "What's not here yet" (whose
+  planned MySQL operations guide now exists).
+
+### Changed
+
+- `MigrateToDedupResult` gains `tieredSkipped` (always `0` unless `skipTiered` is set). Code that compares the whole
+  result object with strict equality needs the new field.
+- The README's "Differences from the Python package" table was brought up to date with Python 0.25.1. Four rows were
+  stale: migration re-runs and batching, dedup lock ordering, `delete(connection=...)` on tiered images, and CLI
+  `verify` on tiered rows are now the same in both packages or differ only as described. It also gains rows for MySQL
+  retry/metrics and tiered-row handling in migration.
+
+### Verified
+
+- The new migration and CLI tests pass against PostgreSQL 16; typecheck and build are clean.
+
 ## npm `zerobucket` [0.8.0] - 2026-10-11
 
 ### Added -- MySQL / MariaDB: dedup mode and the CLI
@@ -369,6 +404,13 @@ fixes, to fail again with the fix removed).
 - The `tier_to_object_storage()` docstring wrongly said a concurrent `get()` blocks. Measured on PostgreSQL: a `get()`
   returned in about 1 ms while the row was locked; a concurrent `delete()` or `tier_to_object_storage()` on the same id
   does wait.
+
+### Tests
+
+- The test suite now probes PostgreSQL once, directly (3 s limit), and prints the result in the pytest header. If
+  the login fails, every test that needs Postgres is skipped immediately with the reason, instead of each one waiting out
+  a 10 s pool timeout. Before, `test_access_control.py` and six other modules built `ZeroBucket` directly and bypassed the
+  skip guard, so a wrong password meant minutes of slow failures.
 
 ### Not changed
 

@@ -410,8 +410,14 @@ on GitHub.
 - **Deduplication is opt-in, not automatic.** Default `dedup=False`
   stores every upload as a separate row; pass `dedup=True` for
   content-addressed, reference-counted storage (see above).
-- **PostgreSQL only, for now.** The storage layer is abstracted for
-  future adapters, but only Postgres exists today.
+- **Backups and disk space need attention.** Image bytes live in your
+  database, so a whole-database dump includes every image, and deleting
+  images does not give disk space back on its own. See the
+  [Operations Guide](https://github.com/KedarGhadyalji/ZeroBucket/blob/main/docs/OPERATIONS.md)
+  (PostgreSQL, MySQL/MariaDB and SQLite).
+- **Backends:** PostgreSQL, SQLite and MySQL/MariaDB are supported (sync
+  and async; MySQL async is classic-mode core CRUD + streaming only, with
+  pooling but no retry or metrics yet).
 
 See the full
 [README](https://github.com/KedarGhadyalji/ZeroBucket#readme) and

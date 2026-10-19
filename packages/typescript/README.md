@@ -236,6 +236,7 @@ zerobucket tier IMAGE_ID --bucket my-images                         # move one i
 zerobucket tier --older-than 90 --min-size 500000 --bucket my-images --dry-run   # preview a bulk move
 zerobucket tier --all --limit 1000 --bucket my-images --endpoint-url https://<acct>.r2.cloudflarestorage.com
 zerobucket migrate --to-dedup   # PostgreSQL: copy classic images into the dedup tables (non-destructive, re-runnable)
+zerobucket migrate --to-dedup --skip-tiered   # ...skipping images tiered to object storage instead of refusing
 ```
 
 - **Exit codes:** `0` success, `1` problems found or an operation failed, `2` usage or connection error. That makes
@@ -390,7 +391,11 @@ await images.delete(b); // last reference gone: blob removed
 
 **Moving existing data in:** `await images.migrateClassicToDedup()` copies every classic image into the dedup tables,
 keeping each id, and never modifies the classic table. It runs in small batches (bounded memory), is safe to re-run
-(already-migrated ids are skipped and counted), and refuses up front if any classic image is tiered to object storage.
+(already-migrated ids are skipped and counted), and refuses up front if any classic image is tiered to object storage
+(their bytes are not in the database to copy, and dedup mode has no tiering), changing nothing. If you would rather
+migrate everything else, pass `{ skipTiered: true }` (CLI: `--skip-tiered`): tiered images are left untouched in the
+classic table, counted in `tieredSkipped`, and **will not exist in the dedup tables**, so only use it if you can live
+without them there.
 
 ## Object-storage tiering
 
@@ -440,30 +445,52 @@ same corpus of valid and corrupt files identically.
 
 ## Differences from the Python package
 
-|                                                | Python                                                                     | npm                                                                                                              |
-| ---------------------------------------------- | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| API                                            | sync + async clients                                                       | one async client                                                                                                 |
-| Malformed id (`"abc"`)                         | `StorageError` from Postgres                                               | treated as not found (`ImageNotFoundError`, no DB round trip), friendlier for `/images/:id` routes               |
-| `optimize`                                     | Pillow; EXIF stripped, not applied                                         | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                                         |
-| `putMany` inserts                              | pipelined                                                                  | one transaction, statements run sequentially                                                                     |
-| Formats                                        | JPEG, PNG, WebP, HEIC (`[heic]` extra)                                     | JPEG, PNG, WebP, HEIC (optional `libheif-js`)                                                                    |
-| Convert TO HEIC with `optimize`                | yes (pillow-heif)                                                          | no (no HEVC encoder for Node); converting FROM HEIC works; `optimize: true` on a HEIC needs an explicit `format` |
-| Event duration                                 | `duration_seconds`                                                         | `durationMs`                                                                                                     |
-| `migrateClassicToDedup`                        | loads the whole table into memory; fails if re-run or if any row is tiered | batched, safe to re-run, refuses tiered rows with a clear message                                                |
-| Dedup `putMany` / `deleteMany` locking         | arbitrary order (overlapping batches can deadlock)                         | sorted checksum order (cannot deadlock)                                                                          |
-| SQLite API                                     | synchronous `SQLiteBackend` + separate async backend                       | one async client; the sync driver runs on the event loop, lock waits are async (never block it)                  |
-| SQLite `onOperation` / busy retry              | none                                                                       | `onOperation` events and async `SQLITE_BUSY` retry (`busyTimeoutMs`)                                             |
-| SQLite stream deleted mid-read                 | sync adapter keeps reading a WAL snapshot (async adapter raises)           | raises `StorageError`, like Postgres; use `connection` in a transaction for a snapshot                           |
-| CLI                                            | PostgreSQL, classic mode only; `verify` crashes on tiered rows             | PostgreSQL **and** SQLite, classic **and** dedup; `info`/`verify` understand tiered rows; `migrate --to-dedup`   |
-| `connection=` without an open transaction      | multi-statement ops rely on the driver's implicit transaction              | always atomic (own transaction or savepoint)                                                                     |
-| `delete(id, connection=...)` on a tiered image | deletes the S3 object immediately                                          | leaves the object until you delete it after commit (a rolled-back transaction can never lose data)               |
-| S3 delete failure after `delete()`             | raises after the row is gone                                               | never fails the delete; reported via `onOperation`                                                               |
-| Options                                        | snake_case kwargs                                                          | camelCase options object                                                                                         |
+Python column = zerobucket on PyPI **0.25.1 or later** (several of its behaviours below were fixed in 0.25.1; older versions
+differ).
 
-## What's not here yet
+|                                              | Python                                                                | npm                                                                                                                                |
+| -------------------------------------------- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| API                                          | sync + async clients                                                  | one async client                                                                                                                   |
+| Malformed id (`"abc"`)                       | `StorageError` from Postgres                                          | treated as not found (`ImageNotFoundError`, no DB round trip), friendlier for `/images/:id` routes                                 |
+| `optimize`                                   | Pillow; EXIF stripped, not applied                                    | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                                                           |
+| `putMany` inserts                            | pipelined                                                             | one transaction, statements run sequentially                                                                                       |
+| Formats                                      | JPEG, PNG, WebP, HEIC (`[heic]` extra)                                | JPEG, PNG, WebP, HEIC (optional `libheif-js`)                                                                                      |
+| Convert TO HEIC with `optimize`              | yes (pillow-heif)                                                     | no (no HEVC encoder for Node); converting FROM HEIC works; `optimize: true` on a HEIC needs an explicit `format`                   |
+| Event duration                               | `duration_seconds`                                                    | `durationMs`                                                                                                                       |
+| `migrateClassicToDedup`, tiered classic rows | always **skips** them and reports `tiered_rows_skipped`               | **refuses** by default (changes nothing); `skipTiered: true` / `--skip-tiered` skips and reports like Python                       |
+| `migrateClassicToDedup`, other behaviour     | batched, safe to re-run (server-side cursor)                          | batched, safe to re-run (keyset paging, advisory lock so concurrent runs cannot race)                                              |
+| SQLite API                                   | synchronous `SQLiteBackend` + separate async backend                  | one async client; the sync driver runs on the event loop, lock waits are async (never block it)                                    |
+| SQLite `onOperation` / busy retry            | none                                                                  | `onOperation` events and async `SQLITE_BUSY` retry (`busyTimeoutMs`)                                                               |
+| SQLite stream deleted mid-read               | sync adapter keeps reading a WAL snapshot (async adapter raises)      | raises `StorageError`, like Postgres; use `connection` in a transaction for a snapshot                                             |
+| MySQL `onOperation` / retry                  | sync `MySQLBackend` yes; `AsyncMySQLBackend` none                     | yes (same client for everything)                                                                                                   |
+| CLI                                          | PostgreSQL, classic mode only; `verify` skips tiered rows with a note | PostgreSQL, SQLite **and** MySQL/MariaDB, classic **and** dedup; `verify --bucket` also checks tiered images; `migrate --to-dedup` |
+| `connection=` without an open transaction    | multi-statement ops rely on the driver's implicit transaction         | always atomic (own transaction or savepoint)                                                                                       |
+| S3 delete failure after `delete()`           | raises after the row is gone                                          | never fails the delete; reported via `onOperation`                                                                                 |
+| Options                                      | snake_case kwargs                                                     | camelCase options object                                                                                                           |
 
-Planned for MySQL/MariaDB: a MySQL-specific operations guide, and `migrate --to-dedup` (PostgreSQL-only today, as in the
-Python package). Tiering and dedup cannot be combined (same rule as the Python package).
+Both packages now leave a tiered image's object in place on `delete(id, connection=...)` (a rolled-back transaction can
+never lose data), take dedup batch locks in sorted checksum order (overlapping batches cannot deadlock), and skip the
+MySQL `ALTER TABLE` at startup when the schema is current.
+
+## Limitations (read before using in production)
+
+- **Images live in your database.** That is the point (one backup, one transaction, no extra service), but it means
+  this is not built for very large files or high-volume media: every image goes through the database and counts toward
+  its size, its backups and its replication. The default size limit is 8 MiB (`maxBytes`). For large video or
+  millions of big files, use object storage directly.
+- **Backups and space need attention.** A whole-database dump now includes every image, and deleting images does not
+  give disk space back on its own (PostgreSQL needs autovacuum, MySQL `OPTIMIZE TABLE`, SQLite `VACUUM`). SQLite
+  files must be backed up with `.backup`, not copied. See the
+  [Operations Guide](https://github.com/KedarGhadyalji/ZeroBucket/blob/main/docs/OPERATIONS.md).
+- **Dedup and tiering cannot be combined** (a shared blob has many owners): `dedup: true` with `objectStorage` throws.
+- **`migrate --to-dedup` is PostgreSQL-only**, as in the Python package. Tiered classic images cannot be migrated (see
+  Deduplication for `skipTiered`).
+- **HEIC can be read and converted from, but not written.** There is no HEVC encoder for Node, so `optimize` cannot
+  produce HEIC.
+- **SQLite allows one writer at a time**; lock waits are async and never block the event loop, but write-heavy
+  workloads belong on PostgreSQL or MySQL/MariaDB.
+- **Tested versions:** CI runs PostgreSQL 16 and MariaDB 10.11; MySQL 8.0.46 was also run by hand. Other versions are
+  expected to behave the same but have not been run.
 
 ## Runtime notes
 
