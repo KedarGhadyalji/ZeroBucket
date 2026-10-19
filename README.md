@@ -1050,6 +1050,8 @@ zerobucket/
 │   └── RESULTS.md
 ├── docs/
 └── examples/
+    ├── zerobucket_integration/   # Python full-stack example (Flask)
+    └── node-integration/         # npm full-stack example (node:http); `npm run verify` checks it end to end
 ```
 
 ## Development
@@ -1118,7 +1120,7 @@ and autovacuum tuning notes specific to a BYTEA-heavy table.
 
 Not yet built, tracked honestly rather than implied:
 
-- [ ] TypeScript/npm package with an equivalent API -- **in progress**: `zerobucket@0.8.1` ships PostgreSQL, SQLite and MySQL/MariaDB (each in classic + dedup mode), streaming/ranges, hooks, HTTP helpers, S3 tiering, HEIC and a CLI (see `packages/typescript/`)
+- [ ] TypeScript/npm package with an equivalent API -- **in progress**: `zerobucket@0.8.2` ships PostgreSQL, SQLite and MySQL/MariaDB (each in classic + dedup mode), streaming/ranges, hooks, HTTP helpers, S3 tiering, HEIC and a CLI (see `packages/typescript/`)
 - [x] Optional resize/format-conversion pipeline (`optimize=True, max_width=...`)
 - [x] Optional HEIC/HEIF support (`pip install zerobucket[heic]`)
 - [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)

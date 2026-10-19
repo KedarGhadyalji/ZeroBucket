@@ -6,6 +6,28 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.8.2] - 2026-10-19
+
+Documentation-only release: **no code in the package changed.** It exists so the fixes below reach the npm page, which
+only updates when a new version is published.
+
+### Documentation
+
+- **Documented a trap in `beforeGet` hooks.** The hook receives the id exactly as the caller supplied it, before
+  ZeroBucket validates it, so it can be a malformed string such as one taken straight from a URL. A hook that uses it in
+  SQL (`WHERE id = $1` on a `uuid` column) turns a request for `/images/garbage` into a database error and a `500`. The
+  README's Access control section now says to check the format first, and to return `true` for a malformed id so
+  ZeroBucket answers "not found".
+- The README links the new example app (below).
+
+### Repo only (not part of the npm package)
+
+- **A runnable full-stack example**, `examples/node-integration`: a post, an image and a PDF written in one transaction
+  (a failed upload leaves nothing behind), ETag/304 and Range/206 serving, image optimizing, a PDF validator, and a
+  `beforeGet` hook that stops `/images/:id` serving a PDF and vice versa. `npm run verify` drives it over real HTTP with
+  18 checks, and CI runs it against the packed build on Node 22. It is the npm counterpart of the Python
+  `examples/zerobucket_integration`.
+
 ## npm `zerobucket` [0.8.1] - 2026-10-19
 
 Documentation and parity release. One small additive feature, no behaviour change unless you opt in.

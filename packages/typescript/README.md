@@ -123,6 +123,12 @@ await images.get(id, { context: { userId } }); // throws AccessDeniedError if th
 **A hook that throws fails closed**: the original exception propagates; it is never treated as
 "allow". Denied calls never reach the database. `exists()` is deliberately not gated.
 
+**Your hook receives the id exactly as the caller supplied it**, before ZeroBucket validates it, so it can be a
+malformed string such as one taken straight from a URL. Check the format before using it in SQL (for example against a
+UUID pattern, returning `true` for a malformed id so ZeroBucket answers "not found"); otherwise a request for
+`/images/garbage` becomes a database error and a `500`. The [example app](https://github.com/KedarGhadyalji/ZeroBucket/tree/main/examples/node-integration)
+shows a working hook, plus transactional uploads and serving.
+
 ## Streaming and ranges
 
 ```ts
