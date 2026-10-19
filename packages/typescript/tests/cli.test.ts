@@ -317,6 +317,46 @@ for (const kind of kinds) {
           (await run(["migrate", "--to-dedup", ...target()])).out,
         ).toContain("Already migrated (skipped): 3"); // re-runnable
       });
+      it("migrate --to-dedup refuses tiered images unless --skip-tiered; --skip-tiered alone is a usage error", async () => {
+        await reset();
+        if (kind !== "postgres") {
+          const r = await run(["migrate", "--skip-tiered", ...target()]);
+          expect(r).toMatchObject({ code: 2 });
+          return;
+        }
+        await raw!.query("DELETE FROM zerobucket_image_refs").catch(() => {});
+        await raw!.query("DELETE FROM zerobucket_blobs").catch(() => {});
+        const zb = client();
+        await zb.put(await makeImage("png", 32, 32, { seed: 3 }));
+        await zb.close();
+        await raw!.query(
+          `INSERT INTO zerobucket_images (data, mime_type, size_bytes, checksum_sha256, storage_backend, object_storage_bucket, object_storage_key)
+           VALUES (NULL, 'image/png', 10, $1, 'object_storage', 'b', 'k')`,
+          ["a".repeat(64)],
+        );
+        const refused = await run(["migrate", "--to-dedup", ...target()]);
+        expect(refused.code).toBe(1);
+        expect(refused.err).toMatch(/--skip-tiered/);
+        const ok = await run([
+          "migrate",
+          "--to-dedup",
+          "--skip-tiered",
+          ...target(),
+        ]);
+        expect(ok.code).toBe(0);
+        expect(ok.out).toContain(
+          "Migrated 1 image(s) into 1 distinct blob(s).",
+        );
+        expect(ok.out).toMatch(
+          /Tiered to object storage \(skipped, NOT in the dedup tables\): 1/,
+        );
+        const alone = await run(["migrate", "--skip-tiered", ...target()]);
+        expect(alone.code).toBe(2);
+        expect(alone.err).toMatch(/only applies with --to-dedup/);
+        await raw!.query(
+          "DELETE FROM zerobucket_images WHERE storage_backend = 'object_storage'",
+        );
+      });
     });
 
     describe("info", () => {

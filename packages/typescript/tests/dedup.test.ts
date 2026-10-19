@@ -445,6 +445,7 @@ describe.skipIf(!DATABASE_URL)("dedup mode against real Postgres", () => {
         distinctBlobsCreated: 4,
         duplicateReferencesFound: 1,
         alreadyMigrated: 0,
+        tieredSkipped: 0,
       });
       expect(await classicCount()).toBe(5); // untouched
       // exact timestamps survive (microseconds, not truncated to JS milliseconds)
@@ -466,6 +467,7 @@ describe.skipIf(!DATABASE_URL)("dedup mode against real Postgres", () => {
         distinctBlobsCreated: 0,
         duplicateReferencesFound: 0,
         alreadyMigrated: 5,
+        tieredSkipped: 0,
       });
       expect((await blob(dup))!.ref_count).toBe(2); // not double-counted
     });
@@ -501,6 +503,65 @@ describe.skipIf(!DATABASE_URL)("dedup mode against real Postgres", () => {
         (await raw.query("SELECT count(*)::int n FROM zerobucket_image_refs"))
           .rows[0].n,
       ).toBe(0);
+    });
+
+    it("skipTiered: migrates the rows that are in the database, skips and counts the tiered ones, leaves them untouched", async () => {
+      const keep = await makeImage("png", 36, 36, { seed: 70 });
+      const keepId = await classic.put(keep);
+      await classic.put(await makeImage("png", 37, 37, { seed: 71 }));
+      await raw.query(
+        `INSERT INTO zerobucket_images (data, mime_type, size_bytes, checksum_sha256, storage_backend, object_storage_bucket, object_storage_key)
+         VALUES (NULL, 'image/png', 10, $1, 'object_storage', 'b', 'k1'), (NULL, 'image/png', 10, $2, 'object_storage', 'b', 'k2')`,
+        ["d".repeat(64), "e".repeat(64)],
+      );
+      const stats = await zb.migrateClassicToDedup({ skipTiered: true });
+      expect(stats).toEqual({
+        imagesMigrated: 2,
+        distinctBlobsCreated: 2,
+        duplicateReferencesFound: 0,
+        alreadyMigrated: 0,
+        tieredSkipped: 2,
+      });
+      expect((await zb.get(keepId)).data.equals(keep)).toBe(true);
+      expect(await classicCount()).toBe(4); // classic table untouched, tiered rows included
+      expect(
+        (
+          await raw.query(
+            "SELECT count(*)::int n FROM zerobucket_images WHERE storage_backend = 'object_storage'",
+          )
+        ).rows[0].n,
+      ).toBe(2);
+      expect(await violations()).toEqual([]);
+
+      // re-running with skipTiered is still safe and reports the same skipped rows
+      const again = await zb.migrateClassicToDedup({ skipTiered: true });
+      expect(again).toMatchObject({
+        imagesMigrated: 0,
+        alreadyMigrated: 2,
+        tieredSkipped: 2,
+      });
+    });
+
+    it("skipTiered with nothing tiered behaves exactly like the default", async () => {
+      await classic.put(await makeImage("png", 38, 38, { seed: 72 }));
+      expect(await zb.migrateClassicToDedup({ skipTiered: true })).toEqual({
+        imagesMigrated: 1,
+        distinctBlobsCreated: 1,
+        duplicateReferencesFound: 0,
+        alreadyMigrated: 0,
+        tieredSkipped: 0,
+      });
+    });
+
+    it("the refusal message tells you about the skipTiered opt-in", async () => {
+      await raw.query(
+        `INSERT INTO zerobucket_images (data, mime_type, size_bytes, checksum_sha256, storage_backend, object_storage_bucket, object_storage_key)
+         VALUES (NULL, 'image/png', 10, $1, 'object_storage', 'b', 'k')`,
+        ["f".repeat(64)],
+      );
+      await expect(zb.migrateClassicToDedup()).rejects.toThrow(
+        /skipTiered: true/,
+      );
     });
 
     it("errors clearly on a non-dedup instance or when there is no classic table", async () => {
