@@ -752,6 +752,13 @@ finally:
     conn.close()
 ```
 
+**Tiered images and `delete(connection=...)`:** when you pass `connection=`
+to `delete()` or `delete_many()`, the object-storage copy of a tiered image is
+**not** removed, because only you know whether your transaction will commit
+(deleting the object first would leave a rolled-back row pointing at nothing).
+After you commit, remove it yourself with `ObjectStorage.delete(key)`. Without
+`connection=`, the object is removed automatically after the row delete commits.
+
 Without `connection=`, this is exactly the "orphaned upload, DB row never
 got created" class of bug that a separate object-storage service is also
 prone to -- the _possibility_ of avoiding it is one of the real
@@ -890,7 +897,9 @@ from zerobucket import ZeroBucket, migrate_classic_to_dedup
 
 dedup_images = ZeroBucket(database_url=DATABASE_URL, dedup=True)
 summary = migrate_classic_to_dedup(dedup_images._backend)
-print(summary)  # {'images_migrated': N, 'distinct_blobs_created': M, 'duplicate_references_found': N-M}
+print(summary)
+# {'images_migrated': N, 'distinct_blobs_created': M, 'duplicate_references_found': N-M,
+#  'already_migrated_skipped': K, 'tiered_rows_skipped': T}
 ```
 
 **Non-destructive** -- copies every row from the classic
@@ -898,9 +907,13 @@ print(summary)  # {'images_migrated': N, 'distinct_blobs_created': M, 'duplicate
 existing id exactly (so anything already referencing those ids keeps
 working), and does not modify or delete the original table. Verify the
 result, then clean up the old table yourself once you're confident.
-Known limitation, stated plainly: this loads the whole classic table
-into memory as one transaction -- fine for typical small/medium
-datasets, not built as a streaming tool for huge tables.
+Safe to re-run: ids already present in the dedup tables are skipped (and
+not counted twice in any blob's `ref_count`), so a second run only picks up
+classic rows added since the first. Tiered rows (bytes in object storage,
+NULL `data`) are skipped and reported as `tiered_rows_skipped`, since dedup
+mode has no tiering; they stay untouched in the classic table. Rows stream
+from the server in batches (`batch_size=200`), so memory use does not grow
+with table size. The migration is still one transaction: all rows, or none.
 
 ## Tuning and observability
 

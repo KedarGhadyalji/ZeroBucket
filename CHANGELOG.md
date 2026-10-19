@@ -332,6 +332,54 @@ New, independently-versioned package in `packages/typescript/`
   warning ever returns.
 - Not yet: dedup, tiering, SQLite, MySQL, HEIC. See `packages/typescript/README.md`.
 
+## [0.25.1] - 2026-10-18
+
+Bug-fix release: the Python half of the "fix both sides" pass that began while building the npm package. Every item
+below was reproduced with a failing test first and checked to pass after the fix (and, for the S3 and lock-ordering
+fixes, to fail again with the fix removed).
+
+### Fixed
+
+- **Data loss: `delete(connection=...)` / `delete_many(connection=...)` removed the object-storage copy of a tiered image
+  before the caller's transaction committed.** If the caller then rolled back, the row came back but its object was gone,
+  so `get()` failed permanently. With `connection=` the object is now left in place (the caller owns the transaction, so
+  only the caller knows the outcome); remove it yourself after committing with `ObjectStorage.delete(key)`. Without
+  `connection=` nothing changes: the row delete commits first, then the object is removed. Fixed in the PostgreSQL,
+  MySQL and SQLite backends. This mirrors the npm package.
+- **Dedup batches could deadlock on PostgreSQL.** `put_many` and `delete_many` took blob row locks in the caller's order, so
+  two overlapping batches in opposite orders deadlocked. Reproduced with retry disabled (2 threads, 150 shared blobs,
+  fails 3 of 3 runs without the fix, passes 3 of 3 with it). Blob upserts and decrements now run in sorted checksum order
+  in the PostgreSQL and MySQL backends; returned ids still follow the caller's order. (An earlier note here said this was
+  unreproduced for Python; that was an inference about MySQL, and PostgreSQL does deadlock.)
+- **`migrate_classic_to_dedup`**: re-running it failed with a duplicate-key error and rolled everything back; it now skips
+  ids already migrated and does not double-count any blob's `ref_count`. Tiered rows (NULL `data`) made it fail on the NOT
+  NULL blob column; they are now skipped and reported as `tiered_rows_skipped`, and stay untouched in the classic table.
+  It also loaded the whole table into memory; it now streams from a server-side cursor in batches (`batch_size=200`). The
+  summary gains `already_migrated_skipped` and `tiered_rows_skipped`; existing keys are unchanged.
+- **CLI `verify` crashed on tiered rows** (`TypeError` from `bytes(None)`). Tiered rows are now skipped and counted in the
+  output; rows stored in the database are still checked.
+- **MySQL/MariaDB startup could stall all traffic.** Startup ran `ALTER TABLE ... MODIFY data LONGBLOB NULL` every time.
+  Even a no-op ALTER waits behind any open transaction that has touched the table and blocks every other statement on it
+  meanwhile. It now runs only when `data` is still NOT NULL, so a current schema issues no DDL. Sync and async; the
+  regression test holds an open transaction and fails (blocks) with the old code. This is the same issue found in the
+  npm adapter.
+
+### Changed
+
+- The `tier_to_object_storage()` docstring wrongly said a concurrent `get()` blocks. Measured on PostgreSQL: a `get()`
+  returned in about 1 ms while the row was locked; a concurrent `delete()` or `tier_to_object_storage()` on the same id
+  does wait.
+
+### Not changed
+
+- The author email in `pyproject.toml` (this package and `django-zerobucket`) is still the `your-email@example.com`
+  placeholder; it needs the real address.
+- The `UTC`-on-3.10 and CI-service fixes from 0.21.1 are unaffected; Python 3.10 and 3.11 were not available to run here.
+
+### Verified
+
+- 413 tests pass (14 new) against PostgreSQL 16, MariaDB 10.11 and a moto S3 server.
+
 ## [0.25.0] - 2026-09-29
 
 ### Added -- MySQL/MariaDB on_operation metrics and automatic retry/backoff
