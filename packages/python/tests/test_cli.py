@@ -421,3 +421,27 @@ def test_tier_without_boto3_installed_gives_clear_error(
     assert exc_info.value.code == 2
     err = capsys.readouterr().err
     assert "zerobucket[s3]" in err
+
+
+# ---- verify with tiered rows ---------------------------------------------
+
+
+def test_verify_does_not_crash_on_tiered_rows(images, s3_bucket, capsys):
+    """REGRESSION: verify read `data` for every row, but a tiered row's
+    `data` is NULL (its bytes live in object storage), so bytes(None)
+    raised TypeError and the whole command crashed. Tiered rows are now
+    skipped and reported; untiered rows are still checked."""
+    from tests.conftest import TEST_DATABASE_URL
+
+    tiered_id = images.put(_jpeg_bytes((9, 9, 9)))
+    plain_id = images.put(_jpeg_bytes((1, 1, 1)))
+    cmd_tier(_tier_args(TEST_DATABASE_URL, s3_bucket, image_id=tiered_id))
+    capsys.readouterr()
+
+    cmd_verify(_args(TEST_DATABASE_URL))
+    out = capsys.readouterr().out
+    assert "OK: all 1 image(s) verified" in out
+    assert "1 tiered image(s) skipped" in out
+
+    images.delete(tiered_id)
+    images.delete(plain_id)

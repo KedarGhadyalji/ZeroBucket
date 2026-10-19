@@ -123,6 +123,7 @@ def cmd_verify(args: argparse.Namespace) -> None:
 
     mismatches: list[str] = []
     checked = 0
+    tiered_skipped = 0
     try:
         with conn.cursor() as id_cur:
             if args.sample:
@@ -146,13 +147,20 @@ def cmd_verify(args: argparse.Namespace) -> None:
         for i, image_id in enumerate(ids, 1):
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT data, checksum_sha256 FROM zerobucket_images WHERE id = %s;",
+                    "SELECT data, checksum_sha256, storage_backend "
+                    "FROM zerobucket_images WHERE id = %s;",
                     (image_id,),
                 )
                 row = cur.fetchone()
             if row is None:
                 continue  # deleted between listing and checking -- not corruption
-            data, stored_checksum = row
+            data, stored_checksum, storage_backend = row
+            if storage_backend != "postgres" or data is None:
+                # Tiered: the bytes live in object storage, and `data` is
+                # NULL here. verify only checks bytes stored in the
+                # database, so skip and report these rather than crash.
+                tiered_skipped += 1
+                continue
             actual_checksum = hashlib.sha256(bytes(data)).hexdigest()
             checked += 1
             if actual_checksum != stored_checksum:
@@ -163,6 +171,12 @@ def cmd_verify(args: argparse.Namespace) -> None:
         conn.close()
 
     print()
+    tiered_note = (
+        f" {tiered_skipped} tiered image(s) skipped (their bytes live in "
+        "object storage, not in the database)."
+        if tiered_skipped
+        else ""
+    )
     if mismatches:
         print(
             f"FAILED: {len(mismatches)} of {checked} image(s) have a checksum "
@@ -170,9 +184,13 @@ def cmd_verify(args: argparse.Namespace) -> None:
         )
         for image_id in mismatches:
             print(f"  {image_id}")
+        if tiered_note:
+            print(tiered_note.strip())
         sys.exit(1)
     else:
-        print(f"OK: all {checked} image(s) verified, no checksum mismatches.")
+        print(
+            f"OK: all {checked} image(s) verified, no checksum mismatches.{tiered_note}"
+        )
 
 
 def _select_tier_candidates(
