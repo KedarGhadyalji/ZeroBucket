@@ -153,3 +153,14 @@ jobs:
         run: |
           pip install -e "../python[s3,heic,mysql]"
           bash conformance/run.sh
+
+      - name: Example app (typecheck + end-to-end verify against the packed build)
+        if: matrix.node-version == 22
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/zerobucket_test
+        run: |
+          (cd packages/typescript && npm pack --pack-destination "$RUNNER_TEMP")
+          cd examples/node-integration
+          npm install --no-audit --no-fund "$RUNNER_TEMP"/zerobucket-*.tgz
+          npm run typecheck
+          npm run verify
