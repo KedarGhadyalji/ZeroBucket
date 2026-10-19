@@ -1,0 +1,26 @@
+{
+  "name": "zerobucket-node-integration-example",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Runnable full-stack example for the zerobucket npm package: transactional uploads, ETag/Range serving, access control.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "verify": "tsx src/verify.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pg": "^8.11.0",
+    "sharp": "^0.35.5",
+    "zerobucket": "^0.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
