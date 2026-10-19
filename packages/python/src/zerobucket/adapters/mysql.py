@@ -383,12 +383,13 @@ WHERE r.id = %s;
 _DEDUP_EXISTS = "SELECT 1 FROM zerobucket_image_refs WHERE id = %s;"
 
 
-def _table_columns(cur) -> set[str]:
+def _table_columns(cur) -> dict[str, str]:
+    """Column name -> IS_NULLABLE ('YES'/'NO') for zerobucket_images."""
     cur.execute(
-        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+        "SELECT COLUMN_NAME, IS_NULLABLE FROM information_schema.COLUMNS "
         "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'zerobucket_images';"
     )
-    return {row[0] for row in cur.fetchall()}
+    return {row[0]: row[1] for row in cur.fetchall()}
 
 
 def _constraint_exists(cur, name: str) -> bool:
@@ -423,9 +424,13 @@ def _migrate_tiering(cur) -> None:
         cur.execute(
             "ALTER TABLE zerobucket_images ADD COLUMN object_storage_key VARCHAR(512);"
         )
-    # Idempotent by nature -- re-running MODIFY on an already-nullable
-    # column is a harmless no-op, so no existence check needed here.
-    cur.execute("ALTER TABLE zerobucket_images MODIFY data LONGBLOB NULL;")
+    # Only issue the MODIFY when `data` is still NOT NULL. Even a no-op
+    # ALTER TABLE waits behind every open transaction that has touched the
+    # table (metadata lock), and while it waits it blocks every other
+    # statement on that table -- so running it on every startup could stall
+    # all traffic whenever an app restarted during a long transaction.
+    if existing.get("data") == "NO":
+        cur.execute("ALTER TABLE zerobucket_images MODIFY data LONGBLOB NULL;")
     if not _constraint_exists(cur, _TIERING_CHECK_CONSTRAINT):
         cur.execute(
             f"ALTER TABLE zerobucket_images ADD CONSTRAINT {_TIERING_CHECK_CONSTRAINT} "
@@ -946,7 +951,13 @@ class MySQLBackend(StorageBackend):
 
         def work(conn):
             with conn.cursor() as cur:
-                for image_id, row in prepared:
+                # Process rows in sorted checksum order so overlapping
+                # batches take their blob row locks in one global order
+                # (no lock cycle, so no deadlock). The ids returned below
+                # stay in the caller's order.
+                for image_id, row in sorted(
+                    prepared, key=lambda pair: pair[1]["checksum_sha256"]
+                ):
                     cur.execute(
                         _DEDUP_UPSERT_BLOB,
                         (
@@ -1422,7 +1433,11 @@ class MySQLBackend(StorageBackend):
         if row is None:
             return False
         storage_backend, object_storage_key = row
-        if storage_backend == "object_storage" and self._object_storage is not None:
+        if (
+            connection is None
+            and storage_backend == "object_storage"
+            and self._object_storage is not None
+        ):
             self._object_storage.delete(object_storage_key)
         return True
 
@@ -1522,7 +1537,11 @@ class MySQLBackend(StorageBackend):
         deleted_ids = []
         for row_id, storage_backend, object_storage_key in rows:
             deleted_ids.append(str(row_id))
-            if storage_backend == "object_storage" and self._object_storage is not None:
+            if (
+                connection is None
+                and storage_backend == "object_storage"
+                and self._object_storage is not None
+            ):
                 self._object_storage.delete(object_storage_key)
         return deleted_ids
 
@@ -1556,7 +1575,8 @@ class MySQLBackend(StorageBackend):
                 )
                 checksum_counts = Counter(row[1] for row in rows)
                 empty_checksums = []
-                for checksum, count in checksum_counts.items():
+                # Sorted: consistent blob lock order across batches.
+                for checksum, count in sorted(checksum_counts.items()):
                     cur.execute(
                         "SELECT ref_count FROM zerobucket_blobs WHERE checksum_sha256 = %s "
                         "FOR UPDATE;",

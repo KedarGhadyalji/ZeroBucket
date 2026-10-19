@@ -870,7 +870,11 @@ class SQLiteBackend(StorageBackend):
         if row is None:
             return False
         storage_backend, object_storage_key = row
-        if storage_backend == "object_storage" and self._object_storage is not None:
+        if (
+            connection is None
+            and storage_backend == "object_storage"
+            and self._object_storage is not None
+        ):
             # Same best-effort, after-the-fact ordering as PostgresBackend's
             # delete() -- see its docstring for the reasoning (a harmless
             # orphaned S3 object beats a row that claims to exist but
@@ -928,7 +932,11 @@ class SQLiteBackend(StorageBackend):
         for row in rows:
             image_id, storage_backend, object_storage_key = row
             deleted_ids.append(str(image_id))
-            if storage_backend == "object_storage" and self._object_storage is not None:
+            if (
+                connection is None
+                and storage_backend == "object_storage"
+                and self._object_storage is not None
+            ):
                 self._object_storage.delete(object_storage_key)
         return deleted_ids
 

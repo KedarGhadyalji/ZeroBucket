@@ -611,10 +611,10 @@ async def _migrate_tiering_async(cur) -> None:
     async/await can't be sprinkled onto a sync function after the fact.
     """
     await cur.execute(
-        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+        "SELECT COLUMN_NAME, IS_NULLABLE FROM information_schema.COLUMNS "
         "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'zerobucket_images';"
     )
-    existing = {row[0] for row in await cur.fetchall()}
+    existing = {row[0]: row[1] for row in await cur.fetchall()}
     if "storage_backend" not in existing:
         await cur.execute(
             "ALTER TABLE zerobucket_images "
@@ -628,7 +628,10 @@ async def _migrate_tiering_async(cur) -> None:
         await cur.execute(
             "ALTER TABLE zerobucket_images ADD COLUMN object_storage_key VARCHAR(512);"
         )
-    await cur.execute("ALTER TABLE zerobucket_images MODIFY data LONGBLOB NULL;")
+    # Only when still NOT NULL -- see mysql.py's _migrate_tiering() for why
+    # an unconditional ALTER on every startup can stall all traffic.
+    if existing.get("data") == "NO":
+        await cur.execute("ALTER TABLE zerobucket_images MODIFY data LONGBLOB NULL;")
     await cur.execute(
         "SELECT 1 FROM information_schema.TABLE_CONSTRAINTS "
         "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'zerobucket_images' "

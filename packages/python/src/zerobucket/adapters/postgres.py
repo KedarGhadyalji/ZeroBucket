@@ -666,17 +666,26 @@ class PostgresBackend(StorageBackend):
         self, rows: list[dict], *, connection: psycopg.Connection | None
     ) -> list[str]:
         def work(cur):
-            blob_params = [
+            # Upsert blobs in sorted checksum order. Each upsert takes a
+            # row lock on its blob that is held until commit, so two
+            # overlapping batches that touch the same blobs in different
+            # orders can deadlock (A holds x wants y, B holds y wants x).
+            # A single global order removes the cycle. Refs below still go
+            # in the caller's order, so the returned ids line up with it.
+            blob_params = sorted(
                 (
-                    row["checksum_sha256"],
-                    row["data"],
-                    row["mime_type"],
-                    row["size_bytes"],
-                    row["width"],
-                    row["height"],
-                )
-                for row in rows
-            ]
+                    (
+                        row["checksum_sha256"],
+                        row["data"],
+                        row["mime_type"],
+                        row["size_bytes"],
+                        row["width"],
+                        row["height"],
+                    )
+                    for row in rows
+                ),
+                key=lambda params: params[0],
+            )
             cur.executemany(_DEDUP_UPSERT_BLOB, blob_params)
 
             ref_params = [
@@ -963,9 +972,12 @@ class PostgresBackend(StorageBackend):
         TRADEOFF, stated directly: this holds a Postgres row-level lock
         (via SELECT ... FOR UPDATE) for the entire duration of the
         object-storage upload -- a real network call, potentially slow
-        for a large image. A concurrent get()/delete()/tier_to_object_storage()
-        call on this SAME image_id will block until this finishes; every
-        OTHER row is completely unaffected. This is a deliberate
+        for a large image. A concurrent delete() or tier_to_object_storage()
+        on this SAME image_id waits until this finishes. Plain reads
+        (get()/get_stream()/exists()) are NOT blocked: they are ordinary
+        SELECTs, which never wait on a FOR UPDATE row lock under
+        PostgreSQL's MVCC (measured: a get() returned in ~1 ms while the
+        row was locked). Every OTHER row is completely unaffected. This is a deliberate
         simplicity/safety tradeoff for what's expected to be an
         infrequent, explicitly-triggered maintenance operation, not
         something called on a hot request path.
@@ -1034,7 +1046,17 @@ class PostgresBackend(StorageBackend):
         if row is None:
             return False
         storage_backend, object_storage_key = row
-        if storage_backend == "object_storage" and self._object_storage is not None:
+        if (
+            connection is None
+            and storage_backend == "object_storage"
+            and self._object_storage is not None
+        ):
+            # With connection= the caller owns the transaction, so we cannot
+            # know whether it will commit: deleting the object here could
+            # leave a rolled-back row pointing at nothing (data loss). In
+            # that case the object is left for the caller to remove after
+            # committing (ObjectStorage.delete(key)).
+            #
             # Best-effort, AFTER the Postgres row is already gone -- a
             # deliberate ordering choice, not an oversight. The row being
             # gone is what makes the image correctly "not found" to every
@@ -1100,7 +1122,11 @@ class PostgresBackend(StorageBackend):
         for row in rows:
             image_id, storage_backend, object_storage_key = row
             deleted_ids.append(str(image_id))
-            if storage_backend == "object_storage" and self._object_storage is not None:
+            if (
+                connection is None
+                and storage_backend == "object_storage"
+                and self._object_storage is not None
+            ):
                 # Same best-effort, after-the-fact ordering as delete()
                 # above, one at a time -- not batched into a single S3
                 # DeleteObjects call in this first pass. See delete()'s
@@ -1130,7 +1156,9 @@ class PostgresBackend(StorageBackend):
             checksum_counts = Counter(row[1] for row in deleted_rows)
 
             checksums_to_check_for_deletion = []
-            for checksum, count in checksum_counts.items():
+            # Sorted for the same reason as put_many: a consistent lock
+            # order across overlapping batches prevents deadlocks.
+            for checksum, count in sorted(checksum_counts.items()):
                 cur.execute(_DEDUP_DECREMENT_BLOB, (count, checksum))
                 new_ref_count = cur.fetchone()[0]
                 if new_ref_count <= 0:
@@ -1168,7 +1196,9 @@ class PostgresBackend(StorageBackend):
         self._pool.close()
 
 
-def migrate_classic_to_dedup(dedup_backend: PostgresBackend) -> dict:
+def migrate_classic_to_dedup(
+    dedup_backend: PostgresBackend, *, batch_size: int = 200
+) -> dict:
     """One-time, NON-DESTRUCTIVE migration: copy every row from the
     classic zerobucket_images table into `dedup_backend`'s dedup tables
     (zerobucket_blobs / zerobucket_image_refs), preserving every
@@ -1180,82 +1210,109 @@ def migrate_classic_to_dedup(dedup_backend: PostgresBackend) -> dict:
     table. Safe to run, inspect the results, and only clean up the old
     table yourself once you're confident -- this is deliberately
     conservative: an in-place ALTER/destructive migration risks data
-    loss if anything goes wrong partway through, and this function has
-    no way to test against a specific deployment's real production data
-    ahead of time.
+    loss if anything goes wrong partway through.
 
     `dedup_backend` must already be a PostgresBackend constructed with
     dedup=True (so zerobucket_blobs/zerobucket_image_refs already
     exist) and pointed at the SAME database that has the classic
     zerobucket_images table.
 
-    Runs as one transaction (all rows migrated, or none) -- known
-    limitation: loads all classic-table rows into memory at once, same
-    memory-pressure principle as everything else in this project's BYTEA
-    approach (see docs/OPERATIONS.md). Fine for typical small/medium
-    datasets consistent with ZeroBucket's own stated positioning; not
-    designed as a streaming migration tool for huge tables.
+    Safe to re-run: ids that already exist in the dedup tables are
+    skipped (and not counted again in any blob's ref_count), so a second
+    run only picks up classic rows added since the first.
 
-    Returns {"images_migrated": int, "distinct_blobs_created": int,
-    "duplicate_references_found": int}.
+    Tiered rows (storage_backend='object_storage', NULL data) are
+    skipped and counted in `tiered_rows_skipped`: dedup mode has no
+    tiering, and their bytes are not in the database to copy. They stay
+    untouched in the classic table.
+
+    Rows are streamed from the server in batches of `batch_size`, so
+    memory use does not grow with table size. The whole migration is
+    still ONE transaction (all rows migrated, or none).
+
+    Returns {"images_migrated", "distinct_blobs_created",
+    "duplicate_references_found", "already_migrated_skipped",
+    "tiered_rows_skipped"}. `distinct_blobs_created` is the number of
+    distinct checksums among the rows migrated by THIS call.
     """
-    with dedup_backend._pool.connection() as conn, conn.cursor() as cur:  # noqa: SLF001
-        cur.execute("SELECT to_regclass('zerobucket_images');")
-        if cur.fetchone()[0] is None:
-            raise StorageError(
-                "No classic zerobucket_images table found in this database -- "
-                "nothing to migrate."
-            )
+    with dedup_backend._pool.connection() as conn:  # noqa: SLF001
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('zerobucket_images');")
+            if cur.fetchone()[0] is None:
+                raise StorageError(
+                    "No classic zerobucket_images table found in this database -- "
+                    "nothing to migrate."
+                )
 
-        cur.execute(
-            "SELECT id, data, mime_type, original_filename, size_bytes, "
-            "width, height, checksum_sha256, created_at FROM zerobucket_images "
-            "ORDER BY created_at;"
-        )
-        classic_rows = cur.fetchall()
-
-        if not classic_rows:
-            return {
-                "images_migrated": 0,
-                "distinct_blobs_created": 0,
-                "duplicate_references_found": 0,
-            }
-
+        migrated = 0
+        already = 0
+        tiered = 0
         seen_checksums: set[str] = set()
-        for row in classic_rows:
-            (
-                image_id,
-                data,
-                mime_type,
-                original_filename,
-                size_bytes,
-                width,
-                height,
-                checksum,
-                created_at,
-            ) = row
 
-            cur.execute(
-                _DEDUP_UPSERT_BLOB,
-                (checksum, data, mime_type, size_bytes, width, height),
+        # Server-side (named) cursor: rows are fetched `batch_size` at a
+        # time rather than all at once. Writes go through a second plain
+        # cursor on the same connection, so everything stays one
+        # transaction.
+        with conn.cursor(name="zerobucket_migrate") as src, conn.cursor() as cur:
+            src.execute(
+                "SELECT id, data, mime_type, original_filename, size_bytes, "
+                "width, height, checksum_sha256, created_at, storage_backend "
+                "FROM zerobucket_images ORDER BY created_at, id;"
             )
-            seen_checksums.add(checksum)
+            while True:
+                batch = src.fetchmany(batch_size)
+                if not batch:
+                    break
+                for row in batch:
+                    (
+                        image_id,
+                        data,
+                        mime_type,
+                        original_filename,
+                        size_bytes,
+                        width,
+                        height,
+                        checksum,
+                        created_at,
+                        storage_backend,
+                    ) = row
 
-            # Preserve the ORIGINAL id and created_at exactly -- this is
-            # what makes the migration safe for anything that already
-            # references these ids (URLs, foreign keys in the caller's
-            # own app tables, etc.).
-            cur.execute(
-                "INSERT INTO zerobucket_image_refs "
-                "(id, checksum_sha256, original_filename, created_at) "
-                "VALUES (%s, %s, %s, %s);",
-                (image_id, checksum, original_filename, created_at),
-            )
+                    if storage_backend != "postgres" or data is None:
+                        tiered += 1
+                        continue
+
+                    cur.execute(
+                        "SELECT 1 FROM zerobucket_image_refs WHERE id = %s;",
+                        (image_id,),
+                    )
+                    if cur.fetchone() is not None:
+                        already += 1
+                        continue
+
+                    cur.execute(
+                        _DEDUP_UPSERT_BLOB,
+                        (checksum, data, mime_type, size_bytes, width, height),
+                    )
+                    seen_checksums.add(checksum)
+
+                    # Preserve the ORIGINAL id and created_at exactly --
+                    # what makes the migration safe for anything that
+                    # already references these ids (URLs, foreign keys in
+                    # the caller's own app tables, etc.).
+                    cur.execute(
+                        "INSERT INTO zerobucket_image_refs "
+                        "(id, checksum_sha256, original_filename, created_at) "
+                        "VALUES (%s, %s, %s, %s);",
+                        (image_id, checksum, original_filename, created_at),
+                    )
+                    migrated += 1
 
         conn.commit()
 
     return {
-        "images_migrated": len(classic_rows),
+        "images_migrated": migrated,
         "distinct_blobs_created": len(seen_checksums),
-        "duplicate_references_found": len(classic_rows) - len(seen_checksums),
+        "duplicate_references_found": migrated - len(seen_checksums),
+        "already_migrated_skipped": already,
+        "tiered_rows_skipped": tiered,
     }
