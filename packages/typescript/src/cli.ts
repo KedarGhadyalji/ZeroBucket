@@ -65,6 +65,7 @@ Commands:
   init       Create the schema (tables and indexes) if missing.
   migrate    Apply schema migrations (currently: same as init).
              --to-dedup  copy every classic image into the dedup tables (PostgreSQL only; non-destructive)
+             --skip-tiered  with --to-dedup: skip images tiered to object storage instead of refusing
   info       Show storage stats: count, size, breakdown by format.
   verify     Re-checksum stored images to detect corruption.
                --sample N        check a random sample of N images instead of every image
@@ -95,6 +96,7 @@ const OPTIONS = {
   help: { type: "boolean", short: "h" },
   version: { type: "boolean", short: "v" },
   "to-dedup": { type: "boolean" },
+  "skip-tiered": { type: "boolean" },
   sample: { type: "string" },
   bucket: { type: "string" },
   "endpoint-url": { type: "string" },
@@ -115,7 +117,7 @@ type Values = ReturnType<
 /** Which options each command accepts (besides the database options). Anything else is a usage error, not silently ignored. */
 const COMMAND_OPTIONS: Record<string, string[]> = {
   init: [],
-  migrate: ["to-dedup"],
+  migrate: ["to-dedup", "skip-tiered"],
   info: [],
   verify: [
     "sample",
@@ -281,6 +283,8 @@ async function cmdMigrate(
   env: CliIO["env"],
   io: CliIO,
 ): Promise<number> {
+  if (v["skip-tiered"] && !v["to-dedup"])
+    throw usageError("Error: --skip-tiered only applies with --to-dedup.");
   if (v["to-dedup"]) {
     const target = resolveTarget(v, env);
     if (target.kind !== "postgres")
@@ -288,7 +292,9 @@ async function cmdMigrate(
     const backend = openBackend(target, { dedup: true, autoMigrate: true });
     await connect(backend, "connect");
     try {
-      const r = await backend.migrateClassicToDedup!();
+      const r = await backend.migrateClassicToDedup!({
+        skipTiered: Boolean(v["skip-tiered"]),
+      });
       io.out(
         `Migrated ${num(r.imagesMigrated)} image(s) into ${num(r.distinctBlobsCreated)} distinct blob(s).`,
       );
@@ -296,6 +302,10 @@ async function cmdMigrate(
         `  Duplicate references found: ${num(r.duplicateReferencesFound)}`,
       );
       io.out(`  Already migrated (skipped): ${num(r.alreadyMigrated)}`);
+      if (r.tieredSkipped > 0)
+        io.out(
+          `  Tiered to object storage (skipped, NOT in the dedup tables): ${num(r.tieredSkipped)}`,
+        );
       io.out("The classic table was not modified.");
       return 0;
     } catch (exc) {
