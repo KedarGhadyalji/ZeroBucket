@@ -39,6 +39,8 @@ import type {
   CallOptions,
   ImageListEntry,
   ImageListOptions,
+  MigrateToDedupOptions,
+  MigrateToDedupResult,
   StorageBackend,
   StorageInfo,
   StoredRecord,
@@ -1004,18 +1006,15 @@ export class PostgresBackend implements StorageBackend {
    * dedup instance's tables, preserving every id (external references keep working) and
    * deduplicating identical content on the way. The classic table is never modified.
    *
-   * Differences from the Python version, all deliberate: rows are copied in small batches (bounded
-   * memory instead of loading the whole table); re-running is safe (already-migrated ids are
-   * skipped and reported, not an error); and classic rows already tiered to object storage are
-   * refused up front with a clear message (their bytes are not in the database to copy).
+   * Rows are copied in small batches (bounded memory instead of loading the whole table);
+   * re-running is safe (already-migrated ids are skipped and reported, not an error). Classic rows
+   * already tiered to object storage are refused up front with a clear message (their bytes are
+   * not in the database to copy) unless `skipTiered: true`, which skips and counts them instead.
    * Still all-or-nothing: one transaction.
    */
-  async migrateClassicToDedup(): Promise<{
-    imagesMigrated: number;
-    distinctBlobsCreated: number;
-    duplicateReferencesFound: number;
-    alreadyMigrated: number;
-  }> {
+  async migrateClassicToDedup(
+    opts: MigrateToDedupOptions = {},
+  ): Promise<MigrateToDedupResult> {
     if (!this.dedup) {
       throw new StorageError(
         "migrateClassicToDedup() must be called on an instance created with dedup: true.",
@@ -1037,6 +1036,7 @@ export class PostgresBackend implements StorageBackend {
           "No classic zerobucket_images table found in this database -- nothing to migrate.",
         );
       }
+      let tieredSkipped = 0;
       const hasTierCol = (
         await client.query(
           "SELECT 1 FROM information_schema.columns WHERE table_name = 'zerobucket_images' AND column_name = 'storage_backend'",
@@ -1048,13 +1048,17 @@ export class PostgresBackend implements StorageBackend {
             "SELECT count(*)::int AS n FROM zerobucket_images WHERE storage_backend <> 'postgres'",
           )
         ).rows[0].n;
-        if (tiered > 0) {
+        if (tiered > 0 && !opts.skipTiered) {
           throw new StorageError(
             `${tiered} classic image(s) are tiered to object storage, so their bytes are not in the database to migrate. ` +
-              "Dedup mode does not support tiering. Migrate only an un-tiered table, or bring those images back first.",
+              "Dedup mode does not support tiering. Migrate only an un-tiered table, bring those images back first, " +
+              "or pass skipTiered: true (CLI: --skip-tiered) to skip them and migrate the rest.",
           );
         }
+        tieredSkipped = tiered;
       }
+      // Only reached with tiered rows present when skipTiered is set: leave them out of the copy.
+      const onlyInDb = hasTierCol && tieredSkipped > 0;
 
       const seen = new Set<string>();
       let migrated = 0;
@@ -1067,12 +1071,12 @@ export class PostgresBackend implements StorageBackend {
         const page: { rows: any[] } = cursor
           ? await client.query(
               `SELECT id, data, mime_type, original_filename, size_bytes, width, height, checksum_sha256, created_at::text AS created_at_txt
-               FROM zerobucket_images WHERE (created_at, id) > ($1::timestamptz, $2::uuid) ORDER BY created_at, id LIMIT ${BATCH}`,
+               FROM zerobucket_images WHERE (created_at, id) > ($1::timestamptz, $2::uuid)${onlyInDb ? " AND storage_backend = 'postgres'" : ""} ORDER BY created_at, id LIMIT ${BATCH}`,
               [cursor.createdAt, cursor.id],
             )
           : await client.query(
               `SELECT id, data, mime_type, original_filename, size_bytes, width, height, checksum_sha256, created_at::text AS created_at_txt
-               FROM zerobucket_images ORDER BY created_at, id LIMIT ${BATCH}`,
+               FROM zerobucket_images${onlyInDb ? " WHERE storage_backend = 'postgres'" : ""} ORDER BY created_at, id LIMIT ${BATCH}`,
             );
         if (page.rows.length === 0) break;
         const last = page.rows[page.rows.length - 1];
@@ -1131,6 +1135,7 @@ export class PostgresBackend implements StorageBackend {
         distinctBlobsCreated: seen.size,
         duplicateReferencesFound: migrated - seen.size,
         alreadyMigrated: already,
+        tieredSkipped,
       };
     } catch (exc) {
       try {

@@ -11,7 +11,12 @@ import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { basename } from "node:path";
 import type { Pool } from "pg";
-import type { CallOptions, StorageBackend } from "./adapters/base.js";
+import type {
+  CallOptions,
+  MigrateToDedupOptions,
+  MigrateToDedupResult,
+  StorageBackend,
+} from "./adapters/base.js";
 import type { ObjectStorageLike } from "./object-storage.js";
 import { PostgresBackend } from "./adapters/postgres.js";
 import { SQLiteBackend } from "./adapters/sqlite.js";
@@ -670,15 +675,15 @@ export class ZeroBucket<C = unknown> {
    * One-time, non-destructive copy of classic-mode images into a dedup instance's tables, keeping every
    * id. Call it on an instance created with `dedup: true`. Safe to re-run. See PostgresBackend for details.
    */
-  async migrateClassicToDedup(): ReturnType<
-    NonNullable<StorageBackend["migrateClassicToDedup"]>
-  > {
+  async migrateClassicToDedup(
+    opts?: MigrateToDedupOptions,
+  ): Promise<MigrateToDedupResult> {
     if (!this.backend.migrateClassicToDedup) {
       throw new StorageError(
         "This backend does not support migrateClassicToDedup().",
       );
     }
-    return this.backend.migrateClassicToDedup();
+    return this.backend.migrateClassicToDedup(opts);
   }
 
   /** Release the pool (if ZeroBucket created it). */

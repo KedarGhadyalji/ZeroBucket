@@ -23,6 +23,8 @@ export type {
   StoredRecord,
   StoredRecordMetadata,
   CallOptions,
+  MigrateToDedupOptions,
+  MigrateToDedupResult,
 } from "./adapters/base.js";
 
 export { ObjectStorage } from "./object-storage.js";

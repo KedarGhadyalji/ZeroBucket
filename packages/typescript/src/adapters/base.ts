@@ -71,6 +71,26 @@ export interface StorageInfo {
   dedup?: { blobs: number; storedBytes: number };
 }
 
+export interface MigrateToDedupOptions {
+  /**
+   * Classic rows already tiered to object storage cannot be migrated (their bytes are not in the
+   * database, and dedup mode has no tiering). By default the migration REFUSES, changing nothing.
+   * With `skipTiered: true` it skips them instead, leaves them untouched in the classic table, and
+   * reports the count in `tieredSkipped`. Skipped images will not exist in the dedup tables.
+   */
+  skipTiered?: boolean;
+}
+
+export interface MigrateToDedupResult {
+  imagesMigrated: number;
+  distinctBlobsCreated: number;
+  duplicateReferencesFound: number;
+  /** Ids already present in the dedup tables (a re-run): skipped, never double-counted. */
+  alreadyMigrated: number;
+  /** Tiered classic rows skipped because `skipTiered` was set; always 0 otherwise. */
+  tieredSkipped: number;
+}
+
 export interface StorageBackend {
   /** Resolve once the backend is connected and migrated. Safe to call repeatedly. */
   ready(): Promise<void>;
@@ -99,12 +119,7 @@ export interface StorageBackend {
   /** null = no such image, false = already tiered (no-op), true = tiered now. Needs object storage configured. */
   tierToObjectStorage(id: string, opts?: CallOptions): Promise<boolean | null>;
   /** Dedup-mode instances only: copy the classic table into the dedup tables (non-destructive). */
-  migrateClassicToDedup?(): Promise<{
-    imagesMigrated: number;
-    distinctBlobsCreated: number;
-    duplicateReferencesFound: number;
-    alreadyMigrated: number;
-  }>;
+  migrateClassicToDedup?(opts?: MigrateToDedupOptions): Promise<MigrateToDedupResult>;
   /** Maintenance: storage statistics, or null if the tables do not exist yet. */
   getInfo?(): Promise<StorageInfo | null>;
   /** Maintenance: list ids matching the filters (oldest first, or random when sampling). */
