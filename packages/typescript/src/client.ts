@@ -21,7 +21,7 @@ import type { ObjectStorageLike } from "./object-storage.js";
 import { PostgresBackend } from "./adapters/postgres.js";
 import { SQLiteBackend } from "./adapters/sqlite.js";
 import { MySQLBackend } from "./adapters/mysql.js";
-import { DEFAULT_STREAM_CHUNK_SIZE } from "./adapters/shared.js";
+import { DEFAULT_STREAM_CHUNK_SIZE, isValidId } from "./adapters/shared.js";
 import {
   AccessDeniedError,
   ImageNotFoundError,
@@ -133,7 +133,9 @@ export interface ZeroBucketOptions<C = unknown> {
    * Authorization hook for get / getMany (per id) / getStream / streamTo / metadata.
    * Return false to deny. A hook that THROWS fails closed: the exception
    * propagates (or is captured per item in getMany) and is never treated as allow.
-   * NOT called for exists().
+   * NOT called for exists(). Only ever called with a well-formed UUID: a malformed id is
+   * "not found" (ImageNotFoundError, or `error: "not found"` per item in getMany) and never
+   * reaches the hook.
    */
   beforeGet?: BeforeGetHook<C>;
   /** Authorization hook for put / putMany (evaluated once per call). Same fail-closed rule. */
@@ -264,6 +266,11 @@ export class ZeroBucket<C = unknown> {
     imageId: string,
     context: C | undefined,
   ): Promise<void> {
+    // A malformed id can never exist, so it is "not found" and your hook is never
+    // called with it. The hook therefore only ever sees well-formed UUIDs, and can
+    // safely use the id in SQL (`WHERE id = $1` on a uuid column) without first
+    // validating a string that may have come straight from a URL.
+    if (!isValidId(imageId)) throw new ImageNotFoundError(imageId);
     if (!this.beforeGet) return;
     if (!(await this.beforeGet(imageId, context)))
       throw new AccessDeniedError("get", imageId);
@@ -455,6 +462,11 @@ export class ZeroBucket<C = unknown> {
 
     for (let i = 0; i < imageIds.length; i++) {
       const imageId = imageIds[i]!;
+      if (!isValidId(imageId)) {
+        // Same as a missing id, and the hook never sees it (see checkBeforeGet).
+        results[i] = { imageId, image: null, error: "not found", success: false };
+        continue;
+      }
       if (this.beforeGet) {
         try {
           if (!(await this.beforeGet(imageId, options.context))) {
