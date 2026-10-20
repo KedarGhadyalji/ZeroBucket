@@ -47,7 +47,7 @@ after itself. It checks, among other things, that:
 - an upload with an image and a PDF succeeds, and the image is re-encoded as WebP;
 - `If-None-Match` returns `304` and `Range: bytes=0-9` returns `206` with 10 bytes;
 - an image id is refused (`403`) on the documents route and a PDF id on the images route;
-- a malformed id is a `404`, not a `500`;
+- a malformed id is a `404`, not a `500` (this exercises the library, not example code);
 - **a failed upload leaves nothing behind**: an upload whose image is valid but whose "PDF" is not returns `400`, and
   afterwards there is no post row **and** the already-written image is gone too.
 
@@ -57,9 +57,9 @@ after itself. It checks, among other things, that:
 
 - **No login.** A real app would put the signed-in user in the call context and check ownership in `beforeGet`. The
   hook here only checks that an id belongs to the right kind of attachment.
-- **Your hook gets raw ids.** `beforeGet` runs before ZeroBucket validates the id, so it receives whatever string is in
-  the URL. Validate it before using it in SQL (see the comment in `src/db.ts`), or a request for `/images/garbage`
-  becomes a `500`.
+- **Your hook only sees well-formed ids.** ZeroBucket answers a malformed id with "not found" before `beforeGet` runs,
+  so the hook can use the id in SQL as-is. (On zerobucket 0.8.x the hook received the raw string and had to validate it
+  first, which is why this example requires 0.9.0.)
 - **A denied id is a `403`.** The handler answers `403` when the hook says no, including for ids that no post
   references, so a missing id and a forbidden id look the same to the caller.
 - **Upload size.** The body is capped at 25 MB and ZeroBucket's `maxBytes` at 20 MiB. Adjust both to your needs.

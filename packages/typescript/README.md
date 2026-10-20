@@ -123,11 +123,13 @@ await images.get(id, { context: { userId } }); // throws AccessDeniedError if th
 **A hook that throws fails closed**: the original exception propagates; it is never treated as
 "allow". Denied calls never reach the database. `exists()` is deliberately not gated.
 
-**Your hook receives the id exactly as the caller supplied it**, before ZeroBucket validates it, so it can be a
-malformed string such as one taken straight from a URL. Check the format before using it in SQL (for example against a
-UUID pattern, returning `true` for a malformed id so ZeroBucket answers "not found"); otherwise a request for
-`/images/garbage` becomes a database error and a `500`. The [example app](https://github.com/KedarGhadyalji/ZeroBucket/tree/main/examples/node-integration)
-shows a working hook, plus transactional uploads and serving.
+**Your hook only ever sees a well-formed UUID.** A malformed id (such as one taken straight from a URL) can never
+exist, so it is "not found" (`ImageNotFoundError`, or `error: "not found"` for that item in `getMany`) and your hook is
+never called with it. You can use the id in SQL (`WHERE id = $1` on a `uuid` column) without validating it first. _(Before
+0.9.0 the hook received the raw string, so on 0.8.x guard against a malformed id yourself: a request for
+`/images/garbage` otherwise became a database error and a `500`.)_ The
+[example app](https://github.com/KedarGhadyalji/ZeroBucket/tree/main/examples/node-integration) shows a working hook, plus
+transactional uploads and serving.
 
 ## Streaming and ranges
 
@@ -458,6 +460,7 @@ differ).
 | -------------------------------------------- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | API                                          | sync + async clients                                                  | one async client                                                                                                                   |
 | Malformed id (`"abc"`)                       | `StorageError` from Postgres                                          | treated as not found (`ImageNotFoundError`, no DB round trip), friendlier for `/images/:id` routes                                 |
+| Malformed id and the `beforeGet` hook        | the hook **is** called with the raw string (validate it yourself)     | never reaches the hook: not found, so the hook only sees well-formed UUIDs (0.9.0+)                                                |
 | `optimize`                                   | Pillow; EXIF stripped, not applied                                    | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                                                           |
 | `putMany` inserts                            | pipelined                                                             | one transaction, statements run sequentially                                                                                       |
 | Formats                                      | JPEG, PNG, WebP, HEIC (`[heic]` extra)                                | JPEG, PNG, WebP, HEIC (optional `libheif-js`)                                                                                      |

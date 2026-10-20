@@ -15,7 +15,7 @@
   "dependencies": {
     "pg": "^8.11.0",
     "sharp": "^0.35.5",
-    "zerobucket": "^0.8.1"
+    "zerobucket": "^0.9.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

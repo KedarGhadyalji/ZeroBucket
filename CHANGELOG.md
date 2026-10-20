@@ -6,6 +6,35 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.9.0] - 2026-10-20
+
+### Changed (behaviour change)
+
+- **`beforeGet` is now only ever called with a well-formed UUID.** A malformed id (such as one taken straight from a
+  URL: `/images/garbage`) can never exist, so `get`, `getStream`, `streamTo` and `metadata` now throw
+  `ImageNotFoundError`, and `getMany` returns `error: "not found"` for that item, **before your hook runs**. Previously
+  the hook received the raw string, which made an ordinary hook a trap: one that uses the id in SQL
+  (`WHERE id = $1` on a `uuid` column) turned a request for `/images/garbage` into a database error and a `500`, a
+  deny-all hook turned it into a `403`, and a hook that logged or counted accesses saw junk. Measured with the fix
+  reverted: a deny-all hook answered `/images/not-a-uuid` with `403`.
+  - What changes for you: a hook no longer needs to validate the id format, and a malformed id is now consistently a
+    plain `404` over HTTP whatever the hook would have said. Well-formed ids are unaffected: the hook is still called,
+    its denial still wins (`AccessDeniedError` / `403`), and `exists()` is still not gated.
+  - If you worked around the old behaviour with your own format check, it is now redundant but harmless.
+  - The Python package still passes the raw id to its hooks (see the README's Differences table).
+
+### Documentation
+
+- The README's Access control section states the new contract, and the example app (`examples/node-integration`) drops
+  its format-check workaround and now requires `zerobucket@^0.9.0`.
+
+### Verified
+
+- Tests fail without the change and pass with it: hooks never called for 7 kinds of malformed id across `get`,
+  `metadata`, `getStream`, `streamTo` and `getMany`; the realistic SQL-casting hook no longer errors; well-formed and
+  upper-case ids still reach the hook; and the HTTP handler answers `404` for malformed ids even with a deny-all or a
+  throwing hook.
+
 ## npm `zerobucket` [0.8.2] - 2026-10-19
 
 Documentation-only release: **no code in the package changed.** It exists so the fixes below reach the npm page, which

@@ -30,19 +30,14 @@ export type Kind = "image" | "document";
  * allowed. Only requests that carry a context are checked. A hook that
  * throws fails closed: the request is never treated as allowed.
  */
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 export const files = new ZeroBucket<{ kind: Kind }>({
   pool,
   // PDFs are bounded by this too (PDFValidator caps at min(maxBytes, 20 MiB)).
   maxBytes: 20 * 1024 * 1024,
   beforeGet: async (id, ctx) => {
     if (!ctx) return true;
-    // Your hook runs BEFORE ZeroBucket looks at the id, so it receives whatever
-    // string the caller put in the URL, malformed or not. Casting "garbage" to a
-    // uuid in SQL would throw (a 500). Letting a malformed id through is safe:
-    // there is no such row, so ZeroBucket answers 404 and nothing is revealed.
-    if (!UUID.test(id)) return true;
+    // `id` is always a well-formed UUID here: ZeroBucket answers a malformed id with
+    // "not found" before your hook runs, so it is safe to use in SQL as-is.
     const column = ctx.kind === "image" ? "image_id" : "document_id";
     const { rowCount } = await pool.query(
       `SELECT 1 FROM example_posts WHERE ${column} = $1`,
