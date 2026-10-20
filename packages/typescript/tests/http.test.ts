@@ -198,6 +198,44 @@ describe.skipIf(!DATABASE_URL)(
       expect(res.status).toBe(200);
     });
 
+    it("a malformed id in the URL is a plain 404 and never reaches beforeGet (even a deny-all or throwing hook)", async () => {
+      const wellFormed = "00000000-0000-4000-8000-000000000000";
+      const cases: {
+        name: string;
+        hook: (i: string) => boolean;
+        expectWellFormed: number;
+      }[] = [
+        { name: "deny-all", hook: () => false, expectWellFormed: 403 },
+        {
+          name: "throwing",
+          hook: () => {
+            throw new Error("hook blew up");
+          },
+          expectWellFormed: 500,
+        },
+      ];
+      for (const c of cases) {
+        const seen: string[] = [];
+        const g = newBucket<Ctx>({
+          beforeGet: (i) => (seen.push(i), c.hook(i)),
+        });
+        const h = createImageHandler(g);
+        for (const bad of ["not-a-uuid", "%27%20OR%201%3D1--", "123"])
+          for (const method of ["GET", "HEAD"])
+            expect(
+              (await h(new Request(url(bad), { method }))).status,
+              `${c.name} ${method} ${bad}`,
+            ).toBe(404);
+        expect(seen, c.name).toEqual([]); // the hook never saw any of them
+        // a well-formed id is still gated exactly as before
+        expect((await h(new Request(url(wellFormed)))).status, c.name).toBe(
+          c.expectWellFormed,
+        );
+        expect(seen, c.name).toEqual([wellFormed]);
+        await g.close();
+      }
+    });
+
     it("403 when beforeGet denies, driven by getContext; no bytes leak", async () => {
       owners.set(id, "alice");
       const h = createImageHandler(zb, {

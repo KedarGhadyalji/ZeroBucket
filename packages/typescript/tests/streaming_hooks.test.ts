@@ -352,3 +352,89 @@ describe.skipIf(!DATABASE_URL)("access-control hooks", () => {
     await g.close();
   });
 });
+
+describe.skipIf(!DATABASE_URL)("beforeGet never sees a malformed id", () => {
+  const MALFORMED = [
+    "not-a-uuid",
+    "",
+    "' OR 1=1 --",
+    "../../etc/passwd",
+    "00000000-0000-4000-8000-00000000000", // one character short
+    "00000000-0000-4000-8000-0000000000000", // one character long
+    "g0000000-0000-4000-8000-000000000000", // non-hex
+  ];
+  const WELL_FORMED_UNKNOWN = "00000000-0000-4000-8000-000000000000";
+
+  it("get / metadata / getStream / streamTo: ImageNotFoundError, hook never called", async () => {
+    const seen: string[] = [];
+    const g = newBucket({
+      beforeGet: (id) => (seen.push(id), true),
+    });
+    for (const bad of MALFORMED) {
+      await expect(g.get(bad)).rejects.toBeInstanceOf(ImageNotFoundError);
+      await expect(g.metadata(bad)).rejects.toBeInstanceOf(ImageNotFoundError);
+      await expect(g.getStream(bad)).rejects.toBeInstanceOf(ImageNotFoundError);
+      await expect(
+        g.streamTo(bad, new Writable({ write: (_c, _e, cb) => cb() })),
+      ).rejects.toBeInstanceOf(ImageNotFoundError);
+    }
+    expect(seen).toEqual([]);
+    await g.close();
+  });
+
+  it("the typical hook, which uses the id in SQL, no longer turns garbage into a database error", async () => {
+    const pool = new pg.Pool({ connectionString: DATABASE_URL });
+    try {
+      const g = newBucket({
+        // Throws "invalid input syntax for type uuid" if it ever receives a malformed id.
+        beforeGet: async (id) =>
+          ((await pool.query("SELECT $1::uuid AS id", [id])).rowCount ?? 0) > 0,
+      });
+      for (const bad of MALFORMED)
+        await expect(g.get(bad)).rejects.toBeInstanceOf(ImageNotFoundError);
+      await g.close();
+    } finally {
+      await pool.end();
+    }
+  });
+
+  it("getMany: a malformed id is a per-item 'not found'; the hook only sees the well-formed ids", async () => {
+    const seen: string[] = [];
+    const g = newBucket({ beforeGet: (id) => (seen.push(id), true) });
+    const res = await g.getMany([
+      "not-a-uuid",
+      WELL_FORMED_UNKNOWN,
+      "",
+      "' OR 1=1 --",
+    ]);
+    expect(res.map((r) => [r.imageId, r.success, r.error])).toEqual([
+      ["not-a-uuid", false, "not found"],
+      [WELL_FORMED_UNKNOWN, false, "not found"],
+      ["", false, "not found"],
+      ["' OR 1=1 --", false, "not found"],
+    ]);
+    expect(seen).toEqual([WELL_FORMED_UNKNOWN]);
+    await g.close();
+  });
+
+  it("nothing changes for well-formed ids: the hook is still called, and its denial still wins", async () => {
+    const seen: string[] = [];
+    const g = newBucket({ beforeGet: (id) => (seen.push(id), false) });
+    await expect(g.get(WELL_FORMED_UNKNOWN)).rejects.toBeInstanceOf(
+      AccessDeniedError,
+    );
+    const upper = WELL_FORMED_UNKNOWN.replace(/0/g, "A");
+    await expect(g.get(upper)).rejects.toBeInstanceOf(AccessDeniedError); // case-insensitive, as before
+    expect(seen).toEqual([WELL_FORMED_UNKNOWN, upper]);
+    const many = await g.getMany([WELL_FORMED_UNKNOWN]);
+    expect(many[0]).toMatchObject({ success: false, error: "access denied" });
+    await g.close();
+  });
+
+  it("without a hook, a malformed id is still ImageNotFoundError (unchanged)", async () => {
+    const g = newBucket({});
+    for (const bad of MALFORMED)
+      await expect(g.get(bad)).rejects.toBeInstanceOf(ImageNotFoundError);
+    await g.close();
+  });
+});
