@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import BinaryIO, Union
 
+from ._ids import is_valid_id
 from .adapters.base import StorageBackend
 from .adapters.postgres import (
     DEFAULT_STREAM_CHUNK_SIZE,
@@ -130,7 +131,12 @@ class ZeroBucket:
             raises instead of returning a bool, that exception propagates
             (or is captured per-item for get_many()) rather than being
             treated as an implicit allow -- see AccessDeniedError's
-            docstring for why. Denied/erroring calls never reach the
+            docstring for why. The hook is only ever called with a
+            well-formed UUID: a malformed id can never exist, so it is
+            "not found" (ImageNotFoundError, or error="not found" for
+            that item in get_many()) and never reaches the hook -- you
+            can use the id in SQL without validating it first.
+            Denied/erroring calls never reach the
             database, so they do NOT produce an on_operation event.
         before_put: Optional authorization hook, called as
             before_put(context) -> bool before put() and put_many().
@@ -204,6 +210,12 @@ class ZeroBucket:
         denies this image_id. No-op if no hook is configured. Does NOT
         catch exceptions raised by the hook itself -- see
         AccessDeniedError's docstring for why."""
+        # A malformed id can never exist, so it is "not found" and the hook is
+        # never called with it: the hook only ever sees well-formed UUIDs and
+        # can safely use the id in SQL without validating a string that may
+        # have come straight from a URL.
+        if not is_valid_id(image_id):
+            raise ImageNotFoundError(image_id)
         if self._before_get is None:
             return
         if not self._before_get(image_id, context):
@@ -536,6 +548,12 @@ class ZeroBucket:
 
         if self._before_get is not None:
             for i, image_id in enumerate(image_ids):
+                if not is_valid_id(image_id):
+                    # Same as a missing id; the hook never sees it.
+                    results[i] = BatchGetResult(
+                        image_id=image_id, image=None, error="not found"
+                    )
+                    continue
                 try:
                     allowed = self._before_get(image_id, context)
                 except Exception as exc:  # noqa: BLE001
@@ -827,7 +845,7 @@ def _read_image_input(
     """
     if isinstance(image, bytes):
         return image, filename
-    if isinstance(image, (str, os.PathLike)):
+    if isinstance(image, str | os.PathLike):
         path = Path(image)
         data = path.read_bytes()
         return data, filename or path.name
