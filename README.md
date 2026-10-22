@@ -651,6 +651,17 @@ What's gated and what isn't:
   returns no image data or metadata, which was judged low-sensitivity
   enough not to need authorization by default. Gate it yourself at the
   call site if your use case needs that.
+- **A malformed id never reaches your hook.** Ids are always UUIDs, so a
+  string that isn't one (for example `"garbage"` taken from a URL) can
+  never exist: it is "not found" (`ImageNotFoundError`, or
+  `error="not found"` for that item in `get_many()`) and `before_get` is
+  never called with it. Your hook therefore only ever sees well-formed
+  UUIDs (or a `uuid.UUID` object, if that is what you passed) and can use
+  the id in SQL without validating it first. _(Before 0.26.0 the hook
+  received the raw string, and the PostgreSQL backends raised
+  `StorageError` for a malformed id on every operation, including
+  `exists()` and `delete()`; they now answer "not found" / `False`, like
+  SQLite and MySQL always did.)_
 
 The one behavior worth calling out explicitly: **if your hook raises an
 exception instead of returning `True`/`False`, that exception propagates

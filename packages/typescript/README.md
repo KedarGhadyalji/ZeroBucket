@@ -453,14 +453,12 @@ same corpus of valid and corrupt files identically.
 
 ## Differences from the Python package
 
-Python column = zerobucket on PyPI **0.25.1 or later** (several of its behaviours below were fixed in 0.25.1; older versions
-differ).
+Python column = zerobucket on PyPI **0.26.0 or later** (several of its behaviours below were fixed in 0.25.1 and 0.26.0; older
+versions differ).
 
 |                                              | Python                                                                | npm                                                                                                                                |
 | -------------------------------------------- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | API                                          | sync + async clients                                                  | one async client                                                                                                                   |
-| Malformed id (`"abc"`)                       | `StorageError` from Postgres                                          | treated as not found (`ImageNotFoundError`, no DB round trip), friendlier for `/images/:id` routes                                 |
-| Malformed id and the `beforeGet` hook        | the hook **is** called with the raw string (validate it yourself)     | never reaches the hook: not found, so the hook only sees well-formed UUIDs (0.9.0+)                                                |
 | `optimize`                                   | Pillow; EXIF stripped, not applied                                    | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                                                           |
 | `putMany` inserts                            | pipelined                                                             | one transaction, statements run sequentially                                                                                       |
 | Formats                                      | JPEG, PNG, WebP, HEIC (`[heic]` extra)                                | JPEG, PNG, WebP, HEIC (optional `libheif-js`)                                                                                      |
@@ -477,7 +475,8 @@ differ).
 | S3 delete failure after `delete()`           | raises after the row is gone                                          | never fails the delete; reported via `onOperation`                                                                                 |
 | Options                                      | snake_case kwargs                                                     | camelCase options object                                                                                                           |
 
-Both packages now leave a tiered image's object in place on `delete(id, connection=...)` (a rolled-back transaction can
+Both packages treat a malformed id as "not found" on every backend (Python 0.26.0+, npm 0.9.0+) and never pass one to a
+`before_get`/`beforeGet` hook. Both packages now leave a tiered image's object in place on `delete(id, connection=...)` (a rolled-back transaction can
 never lose data), take dedup batch locks in sorted checksum order (overlapping batches cannot deadlock), and skip the
 MySQL `ALTER TABLE` at startup when the schema is current.
 

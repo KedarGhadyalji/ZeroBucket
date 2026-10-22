@@ -134,6 +134,11 @@ on GitHub for exactly what's gated (`get`/`get_many`/`get_stream`/
 `stream_to`/`metadata`, NOT `exists`) and the `put_many`/`get_many`
 batch evaluation semantics.
 
+Your hook only ever sees a well-formed UUID: a malformed id (say,
+`"garbage"` from a URL) is simply "not found" and never reaches it, so
+you can use the id in SQL without validating it first (new in 0.26.0;
+the npm package does the same as of 0.9.0).
+
 ### Object-storage tiering
 
 ```python
