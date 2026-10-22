@@ -66,4 +66,7 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "tests.django_settings"
+# Put this folder on sys.path so `tests.django_settings` is importable whether pytest is started
+# as `pytest` or `python -m pytest` (only the latter adds the current directory on its own).
+pythonpath = ["."]
 testpaths = ["tests"]
