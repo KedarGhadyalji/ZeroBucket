@@ -442,12 +442,9 @@ async def test_async_startup_does_not_block_behind_an_open_transaction():
 
     import pymysql
 
+    # Same login as the backend under test: parsed from ZEROBUCKET_TEST_MYSQL_URL, never hard-coded.
     holder = pymysql.connect(
-        host="127.0.0.1",
-        port=int(TEST_MYSQL_URL.rsplit(":", 1)[1].split("/")[0]),
-        user="zerobucket",
-        password="zerobucket",
-        database=TEST_MYSQL_URL.rsplit("/", 1)[1],
+        **MySQLBackend(TEST_MYSQL_URL)._connect_kwargs,  # noqa: SLF001
         autocommit=False,
     )
     try:

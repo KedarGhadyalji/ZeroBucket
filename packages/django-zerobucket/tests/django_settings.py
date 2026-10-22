@@ -12,19 +12,28 @@ Postgres server for convenience).
 from __future__ import annotations
 
 import os
+from urllib.parse import unquote, urlparse
 
 SECRET_KEY = "test-secret-key-not-for-production"
 DEBUG = True
 ALLOWED_HOSTS = ["*"]
 
+# One connection string drives BOTH roles (see the module docstring), so changing your
+# PostgreSQL password only means changing ZEROBUCKET_TEST_DATABASE_URL.
+ZEROBUCKET_DATABASE_URL = os.environ.get(
+    "ZEROBUCKET_TEST_DATABASE_URL",
+    "postgresql://postgres:postgres@localhost:5432/zerobucket_test",
+)
+_url = urlparse(ZEROBUCKET_DATABASE_URL)
+
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
-        "NAME": "zerobucket_test",
-        "USER": "postgres",
-        "PASSWORD": "postgres",
-        "HOST": "localhost",
-        "PORT": "5432",
+        "NAME": _url.path.lstrip("/") or "zerobucket_test",
+        "USER": unquote(_url.username or "postgres"),
+        "PASSWORD": unquote(_url.password or ""),
+        "HOST": _url.hostname or "localhost",
+        "PORT": str(_url.port or 5432),
     }
 }
 
@@ -38,10 +47,5 @@ INSTALLED_APPS = [
 ROOT_URLCONF = "tests.urls"
 
 USE_TZ = True
-
-ZEROBUCKET_DATABASE_URL = os.environ.get(
-    "ZEROBUCKET_TEST_DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/zerobucket_test",
-)
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
