@@ -45,6 +45,7 @@ from dataclasses import dataclass
 import psycopg
 from psycopg_pool import ConnectionPool
 
+from .._ids import is_valid_id
 from ..exceptions import StorageError
 from ..object_storage import ObjectStorage
 from .base import StorageBackend, StoredRecord, StoredRecordMetadata
@@ -707,6 +708,8 @@ class PostgresBackend(StorageBackend):
     def get(
         self, image_id: str, *, connection: psycopg.Connection | None = None
     ) -> StoredRecord | None:
+        if not is_valid_id(image_id):
+            return None  # can never exist; no database round trip
         select_sql = _DEDUP_SELECT_FULL if self._dedup else _SELECT_FULL
 
         def work(cur):
@@ -771,6 +774,9 @@ class PostgresBackend(StorageBackend):
         (most of a typical dataset stays in Postgres; only large/old
         images get explicitly tiered).
         """
+        # Malformed ids can never exist: drop them rather than let the whole
+        # batch fail with an invalid-uuid error.
+        image_ids = [i for i in image_ids if is_valid_id(i)]
         if not image_ids:
             return []
 
@@ -813,6 +819,8 @@ class PostgresBackend(StorageBackend):
     def get_metadata(
         self, image_id: str, *, connection: psycopg.Connection | None = None
     ) -> StoredRecordMetadata | None:
+        if not is_valid_id(image_id):
+            return None
         select_sql = _DEDUP_SELECT_METADATA if self._dedup else _SELECT_METADATA
 
         def work(cur):
@@ -1002,6 +1010,8 @@ class PostgresBackend(StorageBackend):
                 "constructed with object_storage=... -- see ObjectStorage "
                 "in object_storage.py."
             )
+        if not is_valid_id(image_id):
+            return None  # can never exist -> same as a missing id
 
         object_storage = self._object_storage  # narrow for closures below
 
@@ -1032,6 +1042,8 @@ class PostgresBackend(StorageBackend):
     def delete(
         self, image_id: str, *, connection: psycopg.Connection | None = None
     ) -> bool:
+        if not is_valid_id(image_id):
+            return False
         if self._dedup:
             return self._delete_dedup(image_id, connection=connection)
 
@@ -1100,6 +1112,7 @@ class PostgresBackend(StorageBackend):
         that were ACTUALLY deleted (a subset of the input if some ids
         didn't exist) -- not an error for missing ids, same semantics as
         delete() returning False for a missing id."""
+        image_ids = [i for i in image_ids if is_valid_id(i)]
         if not image_ids:
             return []
 
@@ -1181,6 +1194,8 @@ class PostgresBackend(StorageBackend):
     def exists(
         self, image_id: str, *, connection: psycopg.Connection | None = None
     ) -> bool:
+        if not is_valid_id(image_id):
+            return False
         exists_sql = _DEDUP_EXISTS if self._dedup else _EXISTS
 
         def work(cur):

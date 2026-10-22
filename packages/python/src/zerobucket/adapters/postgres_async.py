@@ -28,6 +28,7 @@ from collections.abc import AsyncIterator
 
 from psycopg_pool import AsyncConnectionPool
 
+from .._ids import is_valid_id
 from ..exceptions import StorageError
 from .base import StoredRecord, StoredRecordMetadata
 from .base_async import AsyncStorageBackend
@@ -242,6 +243,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
     # ---- get --------------------------------------------------------------
 
     async def get(self, image_id: str) -> StoredRecord | None:
+        if not is_valid_id(image_id):
+            return None  # can never exist; no database round trip
+
         async def work(cur):
             await cur.execute(_SELECT_FULL, (image_id,))
             return await cur.fetchone()
@@ -268,6 +272,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
     async def get_many(self, image_ids: list[str]) -> list[StoredRecord]:
         """Order of results is NOT guaranteed to match `image_ids` -- same
         caveat as the sync adapter; async_client.py re-correlates by id."""
+        # Malformed ids can never exist: drop them rather than let the whole
+        # batch fail with an invalid-uuid error.
+        image_ids = [i for i in image_ids if is_valid_id(i)]
         if not image_ids:
             return []
 
@@ -298,6 +305,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
         ]
 
     async def get_metadata(self, image_id: str) -> StoredRecordMetadata | None:
+        if not is_valid_id(image_id):
+            return None
+
         async def work(cur):
             await cur.execute(_SELECT_METADATA, (image_id,))
             return await cur.fetchone()
@@ -373,6 +383,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
     # ---- delete -------------------------------------------------------------
 
     async def delete(self, image_id: str) -> bool:
+        if not is_valid_id(image_id):
+            return False
+
         async def work(cur):
             await cur.execute(_DELETE, (image_id,))
             return cur.rowcount > 0
@@ -385,6 +398,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             raise StorageError(f"Failed to delete image: {exc}") from exc
 
     async def delete_many(self, image_ids: list[str]) -> list[str]:
+        image_ids = [i for i in image_ids if is_valid_id(i)]
         if not image_ids:
             return []
 
@@ -405,6 +419,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
     # ---- exists -------------------------------------------------------------
 
     async def exists(self, image_id: str) -> bool:
+        if not is_valid_id(image_id):
+            return False
+
         async def work(cur):
             await cur.execute(_EXISTS, (image_id,))
             return (await cur.fetchone()) is not None
