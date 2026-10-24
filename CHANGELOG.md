@@ -6,6 +6,35 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.9.1] - 2026-10-23
+
+Documentation-only release: **no code in the package changed.** It exists so the new Performance section and the corrected
+Differences table reach the npm page.
+
+### Added (repository only, not shipped in the package)
+
+- **`benchmarks/node/`**, a runnable benchmark project for the npm package, installed against the packed build like
+  `examples/node-integration`: latency, memory, event-loop stall and throughput on PostgreSQL, SQLite and MySQL/MariaDB
+  across six sizes from 10KB to 10MB (`npm run bench`), a compression and SSIM sweep (`npm run compression`), a timing of each
+  validation stage (`npm run validation-cost`), and a Pillow comparison on identical files (`compare_python.py`). Results are
+  in `benchmarks/node/RESULTS.md` and `COMPRESSION_RESULTS.md`. CI runs a quick smoke pass of both so the harness cannot rot.
+
+### Documentation
+
+- The npm README has a **Performance** section with the measured size guidance, and its Differences table gains a row for the
+  JPEG encoder.
+- The root README points to the npm results.
+
+### Findings recorded (no behaviour changed)
+
+- On the same machine and database, npm `put()` is several times slower than Python's. The cause is `validateImage()`
+  forcing a full decode with sharp's `stats()`, which also computes entropy, sharpness and dominant colour: about 5-6x the cost
+  of a bare decode, which matches Pillow. On 12 truncated, corrupted and intact JPEG/PNG/WebP cases a bare decode accepted and
+  rejected exactly what `stats()` did. A faster validation is a possible follow-up; it is not part of this release.
+- `optimize` encodes JPEG with mozjpeg: on smooth photos about half the size of Python's output at about the same SSIM.
+  WebP is effectively identical between the two packages.
+- Peak memory during `put()` scales with decoded pixels (about 130MB for an 11.5MB, 45-megapixel JPEG).
+
 ## npm `zerobucket` [0.9.0] - 2026-10-20
 
 ### Changed (behaviour change)

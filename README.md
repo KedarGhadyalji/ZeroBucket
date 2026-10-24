@@ -997,6 +997,11 @@ memory cost across image sizes. In short:
 | 5-8MB      | Real latency and memory cost per request. Usable, but don't put it in a tight request loop.           |
 | above 8MB  | Rejected by default. Raise `max_bytes` if you understand the tradeoff, or use object storage instead. |
 
+The table above is measured on the Python package. The npm package validates images differently and is measured
+separately: see [`benchmarks/node/RESULTS.md`](benchmarks/node/RESULTS.md) (latency, memory, event-loop impact) and
+[`benchmarks/node/COMPRESSION_RESULTS.md`](benchmarks/node/COMPRESSION_RESULTS.md). On the same machine its `put()` is
+several times slower than Python's, because of a full-decode step it does not strictly need; the results explain it.
+
 ## Limitations
 
 Be honest with yourself about whether ZeroBucket fits your workload:
@@ -1058,7 +1063,8 @@ zerobucket/
 │       └── tests/
 ├── benchmarks/
 │   ├── run_benchmark.py
-│   └── RESULTS.md
+│   ├── RESULTS.md
+│   └── node/                 # npm package benchmarks: runner, compression/SSIM sweep, results
 ├── docs/
 └── examples/
     ├── zerobucket_integration/   # Python full-stack example (Flask)
