@@ -1,0 +1,33 @@
+{
+  "name": "zerobucket-node-benchmarks",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Benchmarks for the zerobucket npm package: put/get latency, memory, event-loop impact and compression quality.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "bench": "tsx --expose-gc src/run.ts",
+    "bench:quick": "tsx --expose-gc src/run.ts --quick --no-write",
+    "compression": "tsx src/compression.ts",
+    "validation-cost": "tsx src/validation-cost.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pg": "^8.11.0",
+    "sharp": "^0.35.5",
+    "zerobucket": "^0.9.0"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^13.0.3",
+    "mysql2": "^3.24.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
