@@ -6,6 +6,80 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.10.0] - 2026-10-24
+
+Faster, lighter image validation, and a validation hole closed. This is a minor version because one behaviour changes (see
+**Behaviour change**); everything else is the same API.
+
+### Changed
+
+- **`validateImage()` (and so `put()` and `optimize`) decodes images much more cheaply.** After reading the header it used
+  to force a full pixel decode with sharp's `stats()`, which also computes entropy, sharpness and the dominant colour (none of
+  it used) and keeps the whole decoded image in memory. It now streams every scanline through a one-pixel-wide extract and
+  discards it: the same decode work, nothing kept. On the maintainer's single-core benchmark box:
+  - validation is 4.6x to 7.8x faster (155ms instead of 1208ms for an 11.5MB, 45-megapixel JPEG);
+  - `put()` is 2.5x to 3.9x faster (353ms instead of 1383ms at that size on PostgreSQL; 210ms instead of 1273ms on SQLite);
+  - `put()` throughput at 100KB rose from about 60-70 to about 190-375 per second;
+  - peak memory while validating a baseline JPEG or non-interlaced PNG fell by 80-95% (11MB instead of 148MB for the 45-megapixel
+    JPEG). WebP, progressive JPEG and interlaced PNG cannot be streamed by their decoders and still need roughly the decoded
+    image in memory.
+  - The npm package is now about as fast as the Python package for `put()` of images of 1MB and up.
+
+### Fixed
+
+- **A truncated or damaged interlaced PNG passed validation and was stored.** sharp's `stats()` did not detect it (an
+  interlaced PNG cut to 30% was accepted; in a 2,462-file test it accepted every damaged variant of one interlaced PNG that a
+  plain decode rejected). The Python package already rejected these. A bit-flipped palette PNG that a full decode rejects is now
+  rejected too. A generic libvips "Unknown error" for such files is reported as "the decoder stopped before the end of the image".
+
+### Behaviour change
+
+- A damaged **interlaced PNG** (and, rarely, a PNG with a corrupted palette) that 0.9.x stored now fails `put()` with
+  `CorruptedImageError`. Images already stored are not re-validated: `zerobucket verify` re-checksums bytes only, so nothing
+  existing is flagged. Nothing else changes: for every damaged file the old check rejected, the new one rejects it with the
+  identical message (1,250 of 1,250 in the test), and it never accepts a file the old check rejected (0 of 2,462).
+- A JPEG missing only its last 1-2 bytes (the end-of-image marker) is still rejected, as before. The Python package accepts it;
+  that difference is recorded in the Differences table and not changed here.
+
+### Added
+
+- `tests/validation.test.ts` (22 tests): an intact-image check for 16 format variants; a comparison with a plain full decode on 400
+  seeded damaged files; regression tests for an interrupted JPEG upload and a truncated interlaced PNG; the pixel-limit path;
+  and a fresh-process memory check that fails if the decoded image is held again. They were confirmed to fail against the
+  old `stats()` version and against a faster `resize(1, 1)` version that was tried and rejected because it accepts JPEGs missing
+  their last few bytes.
+- Benchmarks (repository only): `npm run validation-cost` now times the old and new steps side by side, and results are kept per
+  version in `benchmarks/node/results/<version>/` (0.9.0 is the baseline). `benchmarks/node/RESULTS.md` has the full before and after.
+
+### Tooling (tests only; nothing here ships in the package)
+
+- **`npm test` now reads `.env`.** Vitest never put `.env` values into `process.env`, so the documented "copy `.env.example` to
+  `.env`" step did nothing: the tests read `process.env.ZEROBUCKET_TEST_*` directly and either skipped a backend or used a stale
+  value left in the shell by an old `set`/`setx`, which showed up as "password authentication failed" after changing a password.
+  `vitest.config.ts` now loads the repo root's `.env` and `.env.local` (and the same two in `packages/typescript/`) through
+  `tests/support/loadTestEnv.ts`, with no new dependency. A value in a file wins over an inherited shell value, and
+  `ZEROBUCKET_IGNORE_DOTENV=1` hands control back to the shell. Only `ZEROBUCKET_*` and `AWS_*` keys are read. CI has no `.env`
+  and the loader prints nothing there.
+- **The loader reports everything it cannot find or read, because the failures it prevents were silent.** It prints which files
+  it read and which values it used (passwords and secret keys hidden, including a password that wrongly contains an unencoded
+  `@` or `/`), says when it replaced a different shell value, says when no `.env` was found and what the shell supplies
+  instead, warns about a file called `.env.txt`, warns about an `.env.example` placeholder or a URL whose password is not
+  URL-encoded, and states which test groups will be **skipped** because their setting is missing. It reads UTF-16 files, which
+  Windows PowerShell's `echo ... > .env` writes and which would otherwise yield no settings.
+- **`npm run test:env`** (`tests/support/checkEnv.ts`) shows the same picture on demand and then connects to PostgreSQL,
+  MySQL/MariaDB and the S3 endpoint, printing what each answered with a hint for the usual causes (wrong password, missing
+  database, nothing listening). Plain ASCII output; exits 1 if a configured service rejects its settings.
+- 29 tests (`tests/env.test.ts`). `.env.example` is rewritten (placeholders, the MySQL and S3 settings, URL-encoding of special
+  characters in passwords) and `CONTRIBUTING.md` gains a section on running the npm tests. The Python tests still do not read
+  `.env`.
+
+### Verified
+
+- 386 tests pass on PostgreSQL 16, MariaDB 10.11 and an S3 emulator, started from an empty environment with every setting taken
+  from `.env`; typecheck and build are clean; `npm pack` lists 20 files.
+  HEIC validation is a separate code path and was not touched (its tests pass).
+- Not verified: Windows, MySQL 8 (the package's own tests), and multi-core throughput.
+
 ## npm `zerobucket` [0.9.1] - 2026-10-23
 
 Documentation-only release: **no code in the package changed.** It exists so the new Performance section and the corrected

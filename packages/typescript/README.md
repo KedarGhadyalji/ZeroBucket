@@ -456,25 +456,26 @@ same corpus of valid and corrupt files identically.
 Python column = zerobucket on PyPI **0.26.0 or later** (several of its behaviours below were fixed in 0.25.1 and 0.26.0; older
 versions differ).
 
-|                                              | Python                                                                | npm                                                                                                                                 |
-| -------------------------------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| API                                          | sync + async clients                                                  | one async client                                                                                                                    |
-| `optimize`                                   | Pillow; EXIF stripped, not applied                                    | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                                                            |
-| JPEG encoder in `optimize`                   | Pillow, progressive + optimized                                       | sharp with `mozjpeg`, progressive: on smooth photos roughly **half the size** at about the same SSIM (measured); WebP and PNG match |
-| `putMany` inserts                            | pipelined                                                             | one transaction, statements run sequentially                                                                                        |
-| Formats                                      | JPEG, PNG, WebP, HEIC (`[heic]` extra)                                | JPEG, PNG, WebP, HEIC (optional `libheif-js`)                                                                                       |
-| Convert TO HEIC with `optimize`              | yes (pillow-heif)                                                     | no (no HEVC encoder for Node); converting FROM HEIC works; `optimize: true` on a HEIC needs an explicit `format`                    |
-| Event duration                               | `duration_seconds`                                                    | `durationMs`                                                                                                                        |
-| `migrateClassicToDedup`, tiered classic rows | always **skips** them and reports `tiered_rows_skipped`               | **refuses** by default (changes nothing); `skipTiered: true` / `--skip-tiered` skips and reports like Python                        |
-| `migrateClassicToDedup`, other behaviour     | batched, safe to re-run (server-side cursor)                          | batched, safe to re-run (keyset paging, advisory lock so concurrent runs cannot race)                                               |
-| SQLite API                                   | synchronous `SQLiteBackend` + separate async backend                  | one async client; the sync driver runs on the event loop, lock waits are async (never block it)                                     |
-| SQLite `onOperation` / busy retry            | none                                                                  | `onOperation` events and async `SQLITE_BUSY` retry (`busyTimeoutMs`)                                                                |
-| SQLite stream deleted mid-read               | sync adapter keeps reading a WAL snapshot (async adapter raises)      | raises `StorageError`, like Postgres; use `connection` in a transaction for a snapshot                                              |
-| MySQL `onOperation` / retry                  | sync `MySQLBackend` yes; `AsyncMySQLBackend` none                     | yes (same client for everything)                                                                                                    |
-| CLI                                          | PostgreSQL, classic mode only; `verify` skips tiered rows with a note | PostgreSQL, SQLite **and** MySQL/MariaDB, classic **and** dedup; `verify --bucket` also checks tiered images; `migrate --to-dedup`  |
-| `connection=` without an open transaction    | multi-statement ops rely on the driver's implicit transaction         | always atomic (own transaction or savepoint)                                                                                        |
-| S3 delete failure after `delete()`           | raises after the row is gone                                          | never fails the delete; reported via `onOperation`                                                                                  |
-| Options                                      | snake_case kwargs                                                     | camelCase options object                                                                                                            |
+|                                                                | Python                                                                | npm                                                                                                                                 |
+| -------------------------------------------------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| API                                                            | sync + async clients                                                  | one async client                                                                                                                    |
+| `optimize`                                                     | Pillow; EXIF stripped, not applied                                    | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                                                            |
+| JPEG encoder in `optimize`                                     | Pillow, progressive + optimized                                       | sharp with `mozjpeg`, progressive: on smooth photos roughly **half the size** at about the same SSIM (measured); WebP and PNG match |
+| JPEG missing only its last 1-2 bytes (the end-of-image marker) | accepted (Pillow reads every pixel)                                   | **rejected** (libvips treats a premature end as an error); truncated interlaced PNGs are rejected by both since npm 0.10.0          |
+| `putMany` inserts                                              | pipelined                                                             | one transaction, statements run sequentially                                                                                        |
+| Formats                                                        | JPEG, PNG, WebP, HEIC (`[heic]` extra)                                | JPEG, PNG, WebP, HEIC (optional `libheif-js`)                                                                                       |
+| Convert TO HEIC with `optimize`                                | yes (pillow-heif)                                                     | no (no HEVC encoder for Node); converting FROM HEIC works; `optimize: true` on a HEIC needs an explicit `format`                    |
+| Event duration                                                 | `duration_seconds`                                                    | `durationMs`                                                                                                                        |
+| `migrateClassicToDedup`, tiered classic rows                   | always **skips** them and reports `tiered_rows_skipped`               | **refuses** by default (changes nothing); `skipTiered: true` / `--skip-tiered` skips and reports like Python                        |
+| `migrateClassicToDedup`, other behaviour                       | batched, safe to re-run (server-side cursor)                          | batched, safe to re-run (keyset paging, advisory lock so concurrent runs cannot race)                                               |
+| SQLite API                                                     | synchronous `SQLiteBackend` + separate async backend                  | one async client; the sync driver runs on the event loop, lock waits are async (never block it)                                     |
+| SQLite `onOperation` / busy retry                              | none                                                                  | `onOperation` events and async `SQLITE_BUSY` retry (`busyTimeoutMs`)                                                                |
+| SQLite stream deleted mid-read                                 | sync adapter keeps reading a WAL snapshot (async adapter raises)      | raises `StorageError`, like Postgres; use `connection` in a transaction for a snapshot                                              |
+| MySQL `onOperation` / retry                                    | sync `MySQLBackend` yes; `AsyncMySQLBackend` none                     | yes (same client for everything)                                                                                                    |
+| CLI                                                            | PostgreSQL, classic mode only; `verify` skips tiered rows with a note | PostgreSQL, SQLite **and** MySQL/MariaDB, classic **and** dedup; `verify --bucket` also checks tiered images; `migrate --to-dedup`  |
+| `connection=` without an open transaction                      | multi-statement ops rely on the driver's implicit transaction         | always atomic (own transaction or savepoint)                                                                                        |
+| S3 delete failure after `delete()`                             | raises after the row is gone                                          | never fails the delete; reported via `onOperation`                                                                                  |
+| Options                                                        | snake_case kwargs                                                     | camelCase options object                                                                                                            |
 
 Both packages treat a malformed id as "not found" on every backend (Python 0.26.0+, npm 0.9.0+) and never pass one to a
 `before_get`/`beforeGet` hook. Both packages now leave a tiered image's object in place on `delete(id, connection=...)` (a rolled-back transaction can
@@ -484,19 +485,22 @@ MySQL `ALTER TABLE` at startup when the schema is current.
 ## Performance
 
 Measured on one single-core container, so treat it as directional; the full tables (PostgreSQL, SQLite, MariaDB, per size,
-memory, event-loop impact, throughput) are in the
+memory, event-loop impact, throughput, and the 0.9.0 to 0.10.0 before and after) are in the
 [benchmark results](https://github.com/KedarGhadyalji/ZeroBucket/blob/main/benchmarks/node/RESULTS.md).
 
-| Image size   | `put()` (PostgreSQL) | `get()`     | Notes                                                               |
-| ------------ | -------------------- | ----------- | ------------------------------------------------------------------- |
-| up to ~500KB | under 60ms           | under 5ms   | Feels like any other write.                                         |
-| 0.5-1.5MB    | about 60-160ms       | under 10ms  | Fine for uploads.                                                   |
-| about 5MB    | about 0.6s           | about 45ms  | About 58MB of transient memory per upload.                          |
-| about 10MB   | about 1.2-1.4s       | about 120ms | About 130MB of transient memory per upload. Default limit is 8 MiB. |
+| Image size   | `put()` (PostgreSQL) | `get()`     | Notes                                                             |
+| ------------ | -------------------- | ----------- | ----------------------------------------------------------------- |
+| up to ~500KB | under 20ms           | under 5ms   | Feels like any other write.                                       |
+| 0.5-1.5MB    | about 20-45ms        | under 10ms  | Fine for uploads, including in a loop.                            |
+| about 5MB    | about 170ms          | about 50ms  | A few MB of transient memory for baseline JPEG and PNG.           |
+| about 10MB   | about 350ms          | about 135ms | Default limit is 8 MiB. Memory depends on the format (see below). |
 
-- `put()` time is mostly image validation (a full decode), so it follows the image's pixel count, not the database you pick.
-- The decode runs off the main thread: the event loop stalled at most about 16ms during a 10MB `put()`.
-- Memory is the decoded image, roughly 11x the file size for a 45-megapixel JPEG. Cap `maxBytes` and `maxPixels` on public endpoints.
+- Since 0.10.0, `put()` is 2.5-4x faster than 0.9.x and about as fast as the Python package for large images. Validation is now
+  roughly half of `put()` on PostgreSQL.
+- The decode runs off the main thread: the event loop stalled at most about 14ms during a 10MB `put()`.
+- Transient memory depends on the format. A baseline JPEG or non-interlaced PNG validates in streaming fashion (about 11MB for a
+  45-megapixel JPEG, down from about 148MB in 0.9.x). WebP, progressive JPEG and interlaced PNG still need roughly the decoded
+  image in memory, so cap `maxBytes` and `maxPixels` on public endpoints.
 - Stored size equals the file size: JPEG, PNG and WebP are already compressed, so the database cannot shrink them further.
 - Compression quality of `optimize` is measured in the
   [compression results](https://github.com/KedarGhadyalji/ZeroBucket/blob/main/benchmarks/node/COMPRESSION_RESULTS.md).

@@ -997,10 +997,10 @@ memory cost across image sizes. In short:
 | 5-8MB      | Real latency and memory cost per request. Usable, but don't put it in a tight request loop.           |
 | above 8MB  | Rejected by default. Raise `max_bytes` if you understand the tradeoff, or use object storage instead. |
 
-The table above is measured on the Python package. The npm package validates images differently and is measured
-separately: see [`benchmarks/node/RESULTS.md`](benchmarks/node/RESULTS.md) (latency, memory, event-loop impact) and
-[`benchmarks/node/COMPRESSION_RESULTS.md`](benchmarks/node/COMPRESSION_RESULTS.md). On the same machine its `put()` is
-several times slower than Python's, because of a full-decode step it does not strictly need; the results explain it.
+The table above is measured on the Python package. The npm package is measured separately: see
+[`benchmarks/node/RESULTS.md`](benchmarks/node/RESULTS.md) (latency, memory, event-loop impact) and
+[`benchmarks/node/COMPRESSION_RESULTS.md`](benchmarks/node/COMPRESSION_RESULTS.md). Since npm 0.10.0 its `put()` is on par
+with Python's for images of 1MB and up on the same machine.
 
 ## Limitations
 
@@ -1137,7 +1137,7 @@ and autovacuum tuning notes specific to a BYTEA-heavy table.
 
 Not yet built, tracked honestly rather than implied:
 
-- [ ] TypeScript/npm package with an equivalent API -- **in progress**: `zerobucket@0.9.0` ships PostgreSQL, SQLite and MySQL/MariaDB (each in classic + dedup mode), streaming/ranges, hooks, HTTP helpers, S3 tiering, HEIC and a CLI (see `packages/typescript/`)
+- [ ] TypeScript/npm package with an equivalent API -- **in progress**: `zerobucket@0.10.0` ships PostgreSQL, SQLite and MySQL/MariaDB (each in classic + dedup mode), streaming/ranges, hooks, HTTP helpers, S3 tiering, HEIC and a CLI (see `packages/typescript/`)
 - [x] Optional resize/format-conversion pipeline (`optimize=True, max_width=...`)
 - [x] Optional HEIC/HEIF support (`pip install zerobucket[heic]`)
 - [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)
