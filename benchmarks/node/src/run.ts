@@ -53,7 +53,6 @@ const CONC_LEVELS = (opt("concurrency") ?? (QUICK ? "1,5" : "1,5,20"))
   .split(",")
   .map(Number);
 const WANT = (opt("backend") ?? "postgres,sqlite,mysql").split(",");
-const OUT_DIR = path.resolve(opt("out") ?? path.join(HERE, "..", "results"));
 
 for (const l of SIZE_LABELS)
   if (!(l in TARGET_SIZES))
@@ -505,6 +504,10 @@ async function main() {
   }
 
   if (WRITE) {
+    // One folder per zerobucket version, so a before/after comparison keeps both sets of raw numbers.
+    const OUT_DIR = path.resolve(
+      opt("out") ?? path.join(HERE, "..", "results", zbVersion),
+    );
     fs.mkdirSync(OUT_DIR, { recursive: true });
     const csv = (rows: object[]) => {
       const keys = Object.keys(rows[0]!);

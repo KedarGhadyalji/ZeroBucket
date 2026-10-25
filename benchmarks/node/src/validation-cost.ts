@@ -1,9 +1,9 @@
 /**
  * Where does validation time go?
  *
- * validateImage() reads the header with metadata(), then forces a full pixel decode with stats() to catch truncated
- * files. This times each stage, plus a bare full decode, on the same bytes, so the cost of the "full decode" step can
- * be compared with what a decode alone costs. Optionally writes the images out (--dump DIR) so another tool, such as
+ * validateImage() reads the header with metadata(), then forces a full pixel decode to catch truncated files. Before
+ * 0.10.0 it did that with stats(); since 0.10.0 it streams every scanline through a one-pixel-wide extract. This times
+ * each option on the same bytes, next to a bare decode, so the cost of the "full decode" step can be compared. Optionally writes the images out (--dump DIR) so another tool, such as
  * Pillow, can be timed on exactly the same files.
  *
  *   npm run validation-cost
@@ -35,19 +35,23 @@ async function time(fn: () => Promise<unknown>): Promise<number> {
   return median(out);
 }
 
-const stages: [string, (d: Buffer) => Promise<unknown>][] = [
+const stages: [string, (d: Buffer, h: number) => Promise<unknown>][] = [
   ["metadata()", (d) => make(d).metadata()],
-  ["stats() (what validateImage does)", (d) => make(d).stats()],
-  ["raw().toBuffer() (bare full decode)", (d) => make(d).raw().toBuffer()],
+  ["stats() (validateImage before 0.10.0)", (d) => make(d).stats()],
+  ["bare decode: raw().toBuffer()", (d) => make(d).raw().toBuffer()],
   [
-    "sequentialRead + raw().toBuffer()",
-    (d) => sharp(d, { failOn: "error", sequentialRead: true }).raw().toBuffer(),
-  ],
-  [
-    "resize(1,1).raw() (decode, then shrink)",
+    "resize(1,1) (faster, but misses truncated JPEG tails: rejected)",
     (d) =>
       sharp(d, { failOn: "error", sequentialRead: true })
         .resize(1, 1, { fastShrinkOnLoad: false })
+        .raw()
+        .toBuffer(),
+  ],
+  [
+    "column extract (validateImage since 0.10.0)",
+    (d, h) =>
+      sharp(d, { failOn: "error", sequentialRead: true })
+        .extract({ left: 0, top: 0, width: 1, height: h })
         .raw()
         .toBuffer(),
   ],
@@ -64,7 +68,7 @@ for (const label of Object.keys(TARGET_SIZES)) {
   const meta = await sharp(data).metadata();
   const cells: string[] = [];
   for (const [, fn] of stages)
-    cells.push(`${(await time(() => fn(data))).toFixed(1)}ms`);
+    cells.push(`${(await time(() => fn(data, meta.height!))).toFixed(1)}ms`);
   console.log(
     `| ${label} (${(data.length / 1024).toFixed(0)}KB) | ${((meta.width! * meta.height!) / 1e6).toFixed(1)}MP | ${cells.join(" | ")} |`,
   );

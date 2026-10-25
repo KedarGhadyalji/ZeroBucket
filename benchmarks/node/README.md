@@ -3,7 +3,7 @@
 Measures the [`zerobucket`](https://www.npmjs.com/package/zerobucket) npm package: `put()` and `get()` latency,
 memory, how long the event loop stalls, throughput under concurrency, and how well `optimize` compresses. Results from
 the maintainer's runs are in [RESULTS.md](RESULTS.md) and [COMPRESSION_RESULTS.md](COMPRESSION_RESULTS.md); raw numbers
-are in `results/`.
+are in `results/<zerobucket version>/` (one folder per version, so before and after comparisons keep both).
 
 This is a separate project, like `examples/node-integration`, that installs `zerobucket` as a dependency, so it measures
 what users actually install. Nothing here ships in the npm package.
@@ -30,11 +30,11 @@ npm run bench                 # full run: six sizes, 7 measured runs each, write
 npm run bench:quick           # smoke run (two small sizes), writes nothing
 npm run bench -- --backend postgres --sizes 100KB,1MB --repeats 9
 npm run compression           # compression and SSIM sweep
-npm run validation-cost       # where validation time goes (see RESULTS.md)
+npm run validation-cost       # time of each validation step, old and new (see RESULTS.md)
 ```
 
 Options for `npm run bench`: `--backend postgres,sqlite,mysql`, `--sizes 10KB,100KB,...`, `--repeats N`, `--warmup N`,
-`--concurrency 1,5,20`, `--concurrency-ops N`, `--sqlite-path FILE`, `--out DIR`, `--no-write`, `--quick`.
+`--concurrency 1,5,20`, `--concurrency-ops N`, `--sqlite-path FILE`, `--out DIR` (default `results/<version>`), `--no-write`, `--quick`.
 
 The benchmark only touches the `zerobucket_images` table and only the rows it creates: it never truncates or drops
 anything, and it deletes its own rows when it finishes. It creates the table if it does not exist, so point it at a
@@ -69,9 +69,9 @@ original images and `python compare_python.py ./fixtures` runs Pillow on those e
 ```
 src/run.ts               latency, memory, event-loop and throughput runner
 src/compression.ts       compression and SSIM sweep
-src/validation-cost.ts   timing of each stage of validation
+src/validation-cost.ts   timing of each validation step (old stats(), bare decode, the new pipeline)
 src/images.ts            seeded test-image generators
 src/ssim.ts              SSIM, matching scikit-image's defaults
 compare_python.py        Pillow on the same originals, for the compression comparison
-results/                 results.csv, concurrency.csv, environment.json from the maintainer's run
+results/<version>/       results.csv, concurrency.csv, environment.json from the maintainer's runs (0.9.0 = baseline, 0.10.0)
 ```
