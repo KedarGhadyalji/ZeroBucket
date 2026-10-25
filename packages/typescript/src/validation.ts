@@ -121,15 +121,30 @@ export async function validateImage(
     throw new CorruptedImageError("Image has no readable dimensions");
 
   // Header parsing is not enough: force a full pixel decode to catch truncated bodies.
+  //
+  // How the decode is forced matters a lot, and was measured (benchmarks/node, `npm run validation-cost`):
+  //  - `.stats()` (used before 0.10.0) also computes entropy, sharpness and the dominant colour, and holds the whole
+  //    decoded image in memory: ~1.1 s and ~150 MB for a 45-megapixel JPEG. It also silently accepts a truncated
+  //    interlaced PNG.
+  //  - `.resize(1, 1)` is fast, but JPEG/WebP shrink-on-load decodes at reduced scale and then misses a file that is
+  //    only missing its last few bytes (an interrupted upload), so it is NOT used.
+  //  - Extracting a one-pixel-wide column of the full height is read sequentially, so every scanline is decoded at
+  //    full resolution and then discarded: the same decode work as a bare decode, with nothing kept and a ~1 KB output.
+  // tests/validation.test.ts pins both properties: damaged files are still rejected, and memory stays flat.
   try {
-    await make().stats();
+    await sharp(data, {
+      limitInputPixels: maxPixels,
+      failOn: "error",
+      sequentialRead: true,
+    })
+      .extract({ left: 0, top: 0, width: 1, height })
+      .raw()
+      .toBuffer();
   } catch (exc) {
     if (isPixelLimit(exc)) throw new ImageTooLargeError(sizeBytes, maxBytes);
     throw new CorruptedImageError(
-      `Image data is truncated or corrupted: ${errMessage(exc)}`,
-      {
-        cause: exc,
-      },
+      `Image data is truncated or corrupted: ${decodeDetail(exc)}`,
+      { cause: exc },
     );
   }
 
@@ -180,6 +195,14 @@ async function validateHeic(
     );
   }
   return { mimeType: FORMAT_TO_MIME.heic!, width, height, sizeBytes };
+}
+
+/** libvips reports some decoder failures (for example a damaged interlaced PNG) only as "Unknown error". */
+function decodeDetail(exc: unknown): string {
+  const msg = errMessage(exc).trim();
+  return /^unknown error$/i.test(msg)
+    ? "the decoder stopped before the end of the image"
+    : msg;
 }
 
 function isPixelLimit(exc: unknown): boolean {
