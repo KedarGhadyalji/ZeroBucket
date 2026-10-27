@@ -6,6 +6,60 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.10.1] - 2026-10-26
+
+Reading images back from PostgreSQL uses less memory and, for large images, less time. No API or behaviour change: the bytes
+returned are identical.
+
+### Changed
+
+- **PostgreSQL reads ask for base64 instead of hex text.** PostgreSQL sends a `bytea` column as hex by default, two characters per
+  byte, so an 11.5MB image crossed the wire as about 24MB, became one 24MB string, and was decoded back. `get()`, `getMany()` and
+  the 1MB chunk reads behind `getStream()` (the path `createImageHandler` serves images through), in classic and dedup mode, now
+  select `encode(data, 'base64')` and decode it with `Buffer.from(..., 'base64')`: 33% fewer bytes on the wire. Measured on the
+  maintainer's single-core box, PostgreSQL on the same machine, both builds read alternately in one process:
+  - **`get()` and streaming are about 20-30% faster from about 2MB up** (11.5MB: `get()` 103 to 72ms, streaming 81 to 65ms).
+  - **`get()` needs 37-47% less peak memory at every size** (11.5MB: 110 to 66MB; 96MB: 1027 to 646MB). It had been about ten
+    times the image's size.
+  - **Streaming memory is bounded either way** (roughly 10-75MB whatever the image size) and is not claimed to improve.
+  - **From about 0.5MB to 1.3MB there is no reliable gain and probably a small cost**: 201 interleaved rounds gave 516KB `get()` 2.4
+    to 2.8ms and 1.3MB streaming 6.8 to 7.5ms. Under a millisecond, cause unknown, and measured on localhost, where fewer bytes on the
+    wire cost nothing; over a real network the 33% saving should help at every size, but that is reasoning, not a measurement.
+  - SQLite and MySQL/MariaDB reads are unchanged.
+- Not changed: migration and tiering still read `bytea` as hex. They are rare maintenance operations that write the bytes straight
+  back.
+
+### Findings recorded
+
+- 0.10.0's benchmarks showed PostgreSQL reads as the slowest backend (136ms for 11.5MB against 13ms on MariaDB) with the cause
+  unknown. The cause is the hex transport, roughly linear at 7-11ms per MB, about a third of it PostgreSQL formatting the hex.
+  Decoding the hex is not the cost, and the protocol parser does not copy quadratically.
+- **node-postgres's `binary: true` corrupts `bytea`**: its parser turns every field into a UTF-8 string before any column parser
+  runs, so the bytes come back wrong (and slower). It is not an option; 9 byte-exact tests guard the path that is used instead.
+
+### Added
+
+- `tests/pg_bytes.test.ts` (9 tests): arbitrary bytes inserted straight into the tables (every byte value, lengths around base64
+  padding and PostgreSQL's 76-character line wrapping, 20MB, all-zero and escape-looking data) must come back exactly from `get`,
+  `getMany`, ranged and tiny-chunk `getStream`, and dedup mode; the result is independent of the session's `bytea_output`; tiered
+  rows and missing or malformed ids behave as before; and a guard fails if the SQL falls back to hex. Confirmed to fail on a wrong
+  decoder and, for the guard, on the 0.10.0 adapter.
+- Benchmarks (repository only): `npm run read-cost` (PostgreSQL read time and fresh-process peak memory) and
+  `npm run compare-builds` (two builds read alternately in one process). Results in `benchmarks/node/results/<version>/postgres-reads.csv`.
+
+### Fixed (tests only)
+
+- The 0.10.0 memory test for validation started its measuring process directly from a large test worker. On Linux a child begins with
+  its parent's current size as its peak-memory counter, so a large parent could hide the growth and let the test pass without
+  detecting anything. It now goes through a small launcher; confirmed to fail on the old `stats()` implementation (114MB against a
+  40MB limit). `read-cost` uses the same launcher.
+
+### Verified
+
+- 395 tests pass on PostgreSQL 16, MariaDB 10.11 and an S3 emulator, from an empty environment with every setting taken from `.env`.
+  The package is still 20 files. Not verified: Windows, MySQL 8 (the package's own tests), a real network between application and
+  database, multi-core behaviour.
+
 ## npm `zerobucket` [0.10.0] - 2026-10-24
 
 Faster, lighter image validation, and a validation hole closed. This is a minor version because one behaviour changes (see

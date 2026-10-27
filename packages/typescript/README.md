@@ -485,18 +485,22 @@ MySQL `ALTER TABLE` at startup when the schema is current.
 ## Performance
 
 Measured on one single-core container, so treat it as directional; the full tables (PostgreSQL, SQLite, MariaDB, per size,
-memory, event-loop impact, throughput, and the 0.9.0 to 0.10.0 before and after) are in the
+memory, event-loop impact, throughput, and the before and after of each release) are in the
 [benchmark results](https://github.com/KedarGhadyalji/ZeroBucket/blob/main/benchmarks/node/RESULTS.md).
 
-| Image size   | `put()` (PostgreSQL) | `get()`     | Notes                                                             |
-| ------------ | -------------------- | ----------- | ----------------------------------------------------------------- |
-| up to ~500KB | under 20ms           | under 5ms   | Feels like any other write.                                       |
-| 0.5-1.5MB    | about 20-45ms        | under 10ms  | Fine for uploads, including in a loop.                            |
-| about 5MB    | about 170ms          | about 50ms  | A few MB of transient memory for baseline JPEG and PNG.           |
-| about 10MB   | about 350ms          | about 135ms | Default limit is 8 MiB. Memory depends on the format (see below). |
+| Image size   | `put()` (PostgreSQL) | `get()` (PostgreSQL) | Notes                                                             |
+| ------------ | -------------------- | -------------------- | ----------------------------------------------------------------- |
+| up to ~500KB | under 20ms           | under 5ms            | Feels like any other write.                                       |
+| 0.5-1.5MB    | about 20-45ms        | under 10ms           | Fine for uploads, including in a loop.                            |
+| about 5MB    | about 170ms          | about 35ms           | A few MB of transient memory to write a baseline JPEG or PNG.     |
+| about 10MB   | about 350ms          | about 70ms           | Default limit is 8 MiB. Memory depends on the format (see below). |
 
 - Since 0.10.0, `put()` is 2.5-4x faster than 0.9.x and about as fast as the Python package for large images. Validation is now
   roughly half of `put()` on PostgreSQL.
+- Since 0.10.1, reading from PostgreSQL asks for base64 instead of PostgreSQL's default hex text: about 30% faster for images over
+  2MB, and `get()` needs 37-47% less memory (about 6.5 times the image size, down from about 10). Streaming, which is how
+  `createImageHandler` serves images, is bounded in memory either way. Between roughly 0.5MB and 1.3MB there is no reliable
+  difference (a cost of under a millisecond may exist). SQLite and MySQL/MariaDB were already fast readers and are unchanged.
 - The decode runs off the main thread: the event loop stalled at most about 14ms during a 10MB `put()`.
 - Transient memory depends on the format. A baseline JPEG or non-interlaced PNG validates in streaming fashion (about 11MB for a
   45-megapixel JPEG, down from about 148MB in 0.9.x). WebP, progressive JPEG and interlaced PNG still need roughly the decoded
