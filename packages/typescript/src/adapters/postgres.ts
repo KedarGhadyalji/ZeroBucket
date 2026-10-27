@@ -99,13 +99,23 @@ INSERT INTO zerobucket_images
 VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING id;`;
 
+// How image bytes are read (measured: benchmarks/node, 0.10.1 notes in the CHANGELOG).
+//
+// A bytea column is sent as HEX TEXT by default: two characters per byte, so an 11.5 MB image crosses the wire as ~24 MB,
+// becomes one 24 MB string, and is decoded back (about 110 MB of transient memory). Reading it as base64 instead sends
+// ~16 MB and decodes it with Buffer.from(..., "base64"): about a third faster and about 40% less memory, byte-for-byte
+// identical. node-postgres's "binary: true" is NOT an option: its protocol parser turns every field into a UTF-8 string
+// first, so bytea comes back corrupted (and slower). The server-side encode costs the same as hex output.
+//
+// Postgres wraps base64 output every 76 characters; Buffer.from(..., "base64") ignores the line breaks.
+// The column is aliased data_b64 (full rows) / chunk (ranged reads) and decoded in hydrate() / getStream().
 const SELECT_FULL = `
-SELECT id, data, mime_type, original_filename, size_bytes, width, height,
+SELECT id, encode(data, 'base64') AS data_b64, mime_type, original_filename, size_bytes, width, height,
        checksum_sha256, storage_backend, object_storage_bucket, object_storage_key
 FROM zerobucket_images WHERE id = $1;`;
 
 const SELECT_MANY = `
-SELECT id, data, mime_type, original_filename, size_bytes, width, height,
+SELECT id, encode(data, 'base64') AS data_b64, mime_type, original_filename, size_bytes, width, height,
        checksum_sha256, storage_backend, object_storage_bucket, object_storage_key
 FROM zerobucket_images WHERE id = ANY($1::uuid[]);`;
 
@@ -114,7 +124,7 @@ SELECT id, mime_type, original_filename, size_bytes, width, height, checksum_sha
 FROM zerobucket_images WHERE id = $1;`;
 
 // substring() is 1-indexed and clamps `length` at the value's end.
-const SELECT_CHUNK = `SELECT substring(data FROM $1::int FOR $2::int) AS chunk FROM zerobucket_images WHERE id = $3;`;
+const SELECT_CHUNK = `SELECT encode(substring(data FROM $1::int FOR $2::int), 'base64') AS chunk FROM zerobucket_images WHERE id = $3;`;
 const SELECT_STREAM_INFO = `SELECT size_bytes, storage_backend, object_storage_key FROM zerobucket_images WHERE id = $1;`;
 const DELETE_RETURNING = `DELETE FROM zerobucket_images WHERE id = $1 RETURNING storage_backend, object_storage_key;`;
 const DELETE_MANY = `DELETE FROM zerobucket_images WHERE id = ANY($1::uuid[]) RETURNING id, storage_backend, object_storage_key;`;
@@ -155,7 +165,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (checksum_sha256) DO UPDATE SET ref_count = zerobucket_blobs.ref_count + EXCLUDED.ref_count;`;
 const D_INSERT_REF = `INSERT INTO zerobucket_image_refs (checksum_sha256, original_filename) VALUES ($1, $2) RETURNING id;`;
 // Aliased to the classic column names so one row mapper serves both modes.
-const D_COLS = `r.id, b.data, b.mime_type, r.original_filename, b.size_bytes, b.width, b.height, r.checksum_sha256,
+const D_COLS = `r.id, encode(b.data, 'base64') AS data_b64, b.mime_type, r.original_filename, b.size_bytes, b.width, b.height, r.checksum_sha256,
        'postgres'::text AS storage_backend, NULL::text AS object_storage_bucket, NULL::text AS object_storage_key`;
 const D_FROM = `FROM zerobucket_image_refs r JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256`;
 const D_DELETE_REF = `DELETE FROM zerobucket_image_refs WHERE id = $1 RETURNING checksum_sha256;`;
@@ -187,7 +197,7 @@ const DEDUP_SQL: SqlSet = {
   selectMany: `SELECT ${D_COLS} ${D_FROM} WHERE r.id = ANY($1::uuid[]);`,
   selectMetadata: `SELECT r.id, b.mime_type, r.original_filename, b.size_bytes, b.width, b.height, r.checksum_sha256 ${D_FROM} WHERE r.id = $1;`,
   selectStreamInfo: `SELECT b.size_bytes, 'postgres'::text AS storage_backend, NULL::text AS object_storage_key ${D_FROM} WHERE r.id = $1;`,
-  selectChunk: `SELECT substring(b.data FROM $1::int FOR $2::int) AS chunk ${D_FROM} WHERE r.id = $3;`,
+  selectChunk: `SELECT encode(substring(b.data FROM $1::int FOR $2::int), 'base64') AS chunk ${D_FROM} WHERE r.id = $3;`,
   exists: `SELECT 1 FROM zerobucket_image_refs WHERE id = $1;`,
 };
 
@@ -752,7 +762,9 @@ export class PostgresBackend implements StorageBackend {
               "Pass connection with your own open transaction if you need a consistent read across concurrent writers.",
           );
         }
-        const chunk: Buffer = row.chunk;
+        // base64 text from encode(substring(...)); null when the row has no bytes, "" when the range is past the end
+        const chunk: Buffer | null =
+          row.chunk == null ? null : Buffer.from(row.chunk, "base64");
         if (!chunk || chunk.length === 0) {
           throw new StorageError(
             `Image ${JSON.stringify(id)} ended early while streaming (delivered ${delivered} of ${wanted} bytes).`,
@@ -1156,6 +1168,11 @@ export class PostgresBackend implements StorageBackend {
   // ---- helpers ---------------------------------------------------------
 
   private hydrate(row: any, id: string): Promise<StoredRecord> {
+    // The shared row mapper expects a Buffer in `data`; the query returns it base64-encoded (see SELECT_FULL). A tiered
+    // row has no bytes in the database, so encode(NULL) is NULL and `data` stays null.
+    row.data =
+      row.data_b64 == null ? null : Buffer.from(row.data_b64, "base64");
+    delete row.data_b64;
     return hydrateRow(row, id, this.opts.objectStorage);
   }
 
