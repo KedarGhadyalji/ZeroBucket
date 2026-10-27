@@ -264,14 +264,22 @@ describe("validateImage: memory", () => {
       console.log("RESULT " + v.width + "x" + v.height + " growthMB=" + Math.round((after - before) / 1024));`;
     const file = join(dir, "mem-check.mts");
     writeFileSync(file, script);
+    // The measuring process is started by a tiny launcher, not directly by this (large) test worker: on Linux a child
+    // starts with its parent's current size as its peak-memory counter, so a big parent would hide the very growth being
+    // measured and the test could pass without detecting anything.
+    const launcher = `import { spawnSync } from "node:child_process";
+      const r = spawnSync(process.execPath, ["--import", "tsx", process.argv[1]], { stdio: ["ignore", "inherit", "inherit"] });
+      process.exit(r.status ?? 1);`;
     const r = await new Promise<{
       code: number | null;
       out: string;
       err: string;
     }>((resolve) => {
-      const c = spawn(process.execPath, ["--import", "tsx", file], {
-        cwd: process.cwd(),
-      });
+      const c = spawn(
+        process.execPath,
+        ["--input-type=module", "-e", launcher, file],
+        { cwd: process.cwd() },
+      );
       let out = "";
       let err = "";
       c.stdout.on("data", (d) => (out += d));
