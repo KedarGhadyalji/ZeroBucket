@@ -31,6 +31,8 @@ npm run bench:quick           # smoke run (two small sizes), writes nothing
 npm run bench -- --backend postgres --sizes 100KB,1MB --repeats 9
 npm run compression           # compression and SSIM sweep
 npm run validation-cost       # time of each validation step, old and new (see RESULTS.md)
+npm run read-cost             # PostgreSQL: time and fresh-process memory of get() and a full stream, per size
+npm run compare-builds -- --a ../a --b ../b   # two installed builds, reads interleaved: the fair way to compare them
 ```
 
 Options for `npm run bench`: `--backend postgres,sqlite,mysql`, `--sizes 10KB,100KB,...`, `--repeats N`, `--warmup N`,
@@ -58,6 +60,23 @@ Run with `npm run bench` (which passes `--expose-gc`) for steadier memory number
 Memory is resident-memory growth, not a heap profile, and the allocator can reuse memory freed by an earlier call, so small
 or zero values on later calls are a lower bound.
 
+## Comparing two builds of zerobucket
+
+Timing one build and then the other, minutes apart, lets machine noise pose as a difference: on identical images the two
+measurements disagreed by up to 25 percentage points. `compare-builds` loads both builds in one process and alternates their
+reads, so drift affects both equally.
+
+```bash
+mkdir ..\a ..\b                  # (or mkdir -p ../a ../b)
+cd ../a && npm init -y && npm install zerobucket@0.10.0 pg sharp && cd ../node
+cd ../b && npm init -y && npm install zerobucket@0.10.1 pg sharp && cd ../node
+npm run compare-builds -- --a ../a --b ../b --rounds 41 --sizes 100KB,1MB,5MB,10MB
+```
+
+Sizes can be a preset (`1MB`) or any number with a unit (`700KB`, `1.5MB`). For memory, use `read-cost`: it measures each read in a
+fresh process started by a tiny launcher, because on Linux a child process begins with its parent's current size as its peak-memory
+counter, which would hide the read entirely if the parent were large.
+
 ## Comparing with the Python package
 
 The Python harness is `benchmarks/run_benchmark.py` in the repo root. Run it against the same database on the same machine,
@@ -70,8 +89,10 @@ original images and `python compare_python.py ./fixtures` runs Pillow on those e
 src/run.ts               latency, memory, event-loop and throughput runner
 src/compression.ts       compression and SSIM sweep
 src/validation-cost.ts   timing of each validation step (old stats(), bare decode, the new pipeline)
+src/read-cost.ts         PostgreSQL read time and peak memory (each in a fresh process)
+src/compare-builds.ts    two builds in one process, reads alternated round by round
 src/images.ts            seeded test-image generators
 src/ssim.ts              SSIM, matching scikit-image's defaults
 compare_python.py        Pillow on the same originals, for the compression comparison
-results/<version>/       results.csv, concurrency.csv, environment.json from the maintainer's runs (0.9.0 = baseline, 0.10.0)
+results/<version>/       results.csv, concurrency.csv, environment.json, postgres-reads.csv from the maintainer's runs (0.9.0 = baseline)
 ```

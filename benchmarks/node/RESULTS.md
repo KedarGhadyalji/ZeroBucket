@@ -1,6 +1,7 @@
 # ZeroBucket npm Benchmark Results
 
-**Package measured:** `zerobucket` **0.10.0**, installed from the packed tarball. The 0.9.0 baseline (the version before
+**Package measured:** `zerobucket` **0.10.0** for writes, validation and the SQLite and MariaDB tables, and **0.10.1** for reads from
+PostgreSQL (see [Reading from PostgreSQL](#reading-from-postgresql-0100-to-0101)), installed from the packed tarball. The 0.9.0 baseline (the version before
 the validation change described below) is kept in `results/0.9.0/` so the before and after can be reproduced.
 
 **Environment:** one container, **1 vCPU** (Intel Xeon), 4 GB RAM, Linux, Node 22.22.2, sharp 0.35.5 (libvips 8.18.7),
@@ -89,7 +90,7 @@ produces. A fuzz run over 2,462 damaged files found 9 JPEGs, missing their last 
 - **The tests fail on the bad versions.** `tests/validation.test.ts` (22 tests) was run against the old `stats()` version (3
   fail: the oracle comparison, the interlaced-PNG case and memory at 118MB against a 40MB limit) and against the `resize(1,1)`
   version (2 fail: the oracle comparison and the interrupted-upload test), and passes on the new one.
-- The full suite passes: **386 tests** on PostgreSQL 16, MariaDB 10.11 and an S3 emulator.
+- The full suite passes: **395 tests** (0.10.1) on PostgreSQL 16, MariaDB 10.11 and an S3 emulator.
 
 ### A hole this closed, and a behaviour change
 
@@ -104,7 +105,68 @@ not re-validated (`zerobucket verify` re-checksums bytes), so nothing existing i
 still rejected by npm, as before. The Python package accepts it. That is a real difference between the packages, recorded in
 the README's Differences table, not something this release alters.
 
-## PostgreSQL 16
+## Reading from PostgreSQL: 0.10.0 to 0.10.1
+
+The 0.10.0 tables below showed PostgreSQL reads as the slowest of the three backends (136ms to read a 11.5MB image, against 13ms on
+MariaDB and 5ms on SQLite) and I had not found out why. 0.10.1 is the result of finding out.
+
+**Why it is slow.** PostgreSQL sends a `bytea` column as **hex text**, two characters per byte, so an 11.5MB image crosses the wire as
+about 24MB, is built into one 24MB string by node-postgres, and is decoded back. The cost is roughly linear (7 to 11ms per MB, from 1MB
+to 46MB) and about a third of it is PostgreSQL itself formatting the hex (38ms of 104ms for this image, measured with a query that
+returns only the length of the encoded value). Things I expected to matter and measured not to:
+
+- **Decoding the hex** is not the cost: reading it and not decoding it took as long.
+- **A quadratic buffer copy** in the protocol parser: it grows its buffer by doubling.
+- **node-postgres's binary mode** (`binary: true`) is not an option. It converts every field to a UTF-8 string before any column parser
+  runs, so a `bytea` comes back **corrupted** (wrong bytes, not just slow), and it was slower too (279ms against 111ms).
+
+**What changed.** Reads of whole images and of ranges now ask PostgreSQL for `encode(data, 'base64')` and decode it with
+`Buffer.from(..., 'base64')`: 33% fewer bytes on the wire, and byte-for-byte identical results (9 new tests insert arbitrary bytes
+directly and demand an exact match from `get`, `getMany`, ranged `getStream` and dedup mode, at every length around base64 padding and
+PostgreSQL's 76-character line wrapping).
+
+**Speed**, both builds loaded in one process and read alternately (41 rounds, medians), PostgreSQL on the same machine:
+
+| Size   | `get()` 0.10.0 | `get()` 0.10.1 | change | full stream 0.10.0 | full stream 0.10.1 | change |
+| ------ | -------------- | -------------- | ------ | ------------------ | ------------------ | ------ |
+| 88KB   | 1.0ms          | 0.8ms          | -17%   | 1.2ms              | 1.0ms              | -16%   |
+| 516KB  | 2.5ms          | 2.8ms          | +13%   | 4.1ms              | 3.1ms              | -23%   |
+| 1.3MB  | 7.8ms          | 8.8ms          | +13%   | 7.9ms              | 9.0ms              | +14%   |
+| 2.2MB  | 16.8ms         | 13.1ms         | -22%   | 18.7ms             | 13.0ms             | -30%   |
+| 5.5MB  | 47.4ms         | 33.3ms         | -30%   | 36.7ms             | 29.5ms             | -20%   |
+| 11.5MB | 103.4ms        | 72.3ms         | -30%   | 81.4ms             | 65.2ms             | -20%   |
+
+"Full stream" is how `createImageHandler` serves an image: `metadata()` then 1MB chunk reads. The gain is solid from about 2MB up
+(20 to 30%) and small below 300KB. **In the middle, roughly 0.5MB to 1.3MB, there is no reliable gain and probably a small cost.** The
+rows for 516KB and 1.3MB changed sign between runs, so I repeated just those two with 201 interleaved rounds: 516KB `get()` 2.4 to
+2.8ms (+15%) and streaming 2.9 to 3.1ms (+8%); 1.3MB `get()` 8.6 to 8.0ms (-7%) and streaming 6.8 to 7.5ms (+10%). That is a cost of
+under a millisecond, I do not know its cause, and it is on localhost, where fewer bytes on the wire cost nothing. Over a real network
+between the application and the database 33% fewer bytes should help at every size, but that is reasoning, not something I measured.
+
+**Memory**, each case in a fresh process using the operating system's peak-memory counter (so allocator reuse cannot hide anything),
+median of 5, real JPEGs from `npm run read-cost`:
+
+| Size   | `get()` 0.10.0 | `get()` 0.10.1 | full stream 0.10.0 | full stream 0.10.1 |
+| ------ | -------------- | -------------- | ------------------ | ------------------ |
+| 516KB  | 7MB            | 4MB            | 7MB                | 4MB                |
+| 1.3MB  | 18MB           | 10MB           | 15MB               | 9MB                |
+| 5.5MB  | 52MB           | 43MB           | 21MB               | 23MB               |
+| 11.5MB | 110MB          | 66MB           | 26MB               | 43MB               |
+
+`get()` needs 37 to 47% less memory at every size. A one-off check at larger sizes (random bytes inserted directly, not a script in
+this repository) shows the same: 12MB 116 to 61MB, 24MB 264 to 169MB, 48MB 528 to 339MB, 96MB **1027 to 646MB**. Note what the old
+figure means: reading an image with `get()` needed about **ten times the image's size** in memory; it is now about six and a half.
+A real fix for very large images is to stream them, which `createImageHandler` already does.
+
+**Streaming memory is bounded either way and I am not claiming a saving.** At 12 to 96MB it peaked at 27 to 76MB on 0.10.0 and 44 to
+61MB on 0.10.1, higher for 0.10.1 at 12 and 24MB and lower at 48 and 96MB. That is garbage-collection timing, not a cost that grows
+with the image.
+
+**How to reproduce:** `npm run read-cost` times and measures one build; `npm run compare-builds -- --a <folder> --b <folder>` loads
+two installed builds in one process and alternates their reads, which is the fair way to compare them on a noisy machine (timing one
+and then the other, minutes apart, produced differences of up to 25 percentage points on identical images).
+
+## PostgreSQL 16 (0.10.0 numbers; its Get columns are superseded by the section above)
 
 | Size  | Actual | Stored | Validate | Put     | Get     | Put peak mem | Get peak mem | Put loop stall | Get loop stall |
 | ----- | ------ | ------ | -------- | ------- | ------- | ------------ | ------------ | -------------- | -------------- |
@@ -165,11 +227,11 @@ on SQLite and about 50-80% on MariaDB, so the database write is a real share and
 **Memory.** See the fresh-process table above. After this change an 11.5MB, 45-megapixel JPEG costs about 11MB of transient
 memory to validate instead of about 148MB. Formats that cannot stream (WebP, progressive JPEG, interlaced PNG) still cost
 roughly the decoded image, so cap `maxBytes` and `maxPixels` on public endpoints regardless. Treat the `Get peak mem` columns as
-a lower bound: the allocator keeps memory it already has, so later calls often show 0.0MB. PostgreSQL's 45.9MB get at 11.5MB is a
-real signal about the driver's buffering; its cause is not yet investigated.
+a lower bound: the allocator keeps memory it already has, so later calls often show 0.0MB. The PostgreSQL `Get peak mem` of 45.9MB
+at 11.5MB understates what happened: measured properly in a fresh process it was 110MB, and 0.10.1 reduces it to 66MB (see above).
 
-**Reads are cheap relative to writes**, as in Python: 10MB comes back in 136ms (PostgreSQL), 13ms (MariaDB) or 5ms (SQLite).
-PostgreSQL is the slowest reader at the large sizes, unchanged by this release.
+**Reads are cheap relative to writes**, as in Python: 10MB comes back in 136ms (PostgreSQL, 0.10.0; about 70ms in 0.10.1),
+13ms (MariaDB) or 5ms (SQLite). PostgreSQL is the slowest reader at the large sizes because it sends the bytes as hex text; see above.
 
 **Throughput is still CPU-bound here, so do not read scaling from it.** There is one core, so `put()` barely rises with
 concurrency (192 to 226 per second on PostgreSQL). Whether more cores help (libuv's pool is 4 threads) was not tested.

@@ -12,6 +12,8 @@
     "bench:quick": "tsx --expose-gc src/run.ts --quick --no-write",
     "compression": "tsx src/compression.ts",
     "validation-cost": "tsx src/validation-cost.ts",
+    "read-cost": "tsx src/read-cost.ts",
+    "compare-builds": "tsx src/compare-builds.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
