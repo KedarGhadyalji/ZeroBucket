@@ -48,11 +48,14 @@ than left for someone to wonder about while reading unfamiliar code:
   a dynamically-sized `IN (?, ?, ...)` placeholder list instead.
 - `RETURNING` IS supported (SQLite >= 3.35, released March 2021) and is
   used the same way the Postgres adapter uses it.
-- get_stream() uses `sqlite3.Connection.blobopen()` (Python >= 3.11), a
-  genuine incremental-BLOB-I/O API -- not a workaround built on top of
-  substring()-style range queries the way the Postgres adapter's
-  version is. This is arguably a more natural fit for streaming than
-  the Postgres implementation, not a lesser one.
+- get_stream() uses `sqlite3.Connection.blobopen()` where it exists
+  (Python >= 3.11), a genuine incremental-BLOB-I/O API -- not a
+  workaround built on top of substring()-style range queries the way the
+  Postgres adapter's version is. This package supports Python 3.10 too,
+  which has no blobopen(); there get_stream() reads the same bytes with
+  substr() range queries inside ONE held read transaction, which gives
+  the same snapshot behaviour (see `_stream_with_substr`). Both paths are
+  covered by tests/test_sqlite_stream_fallback.py on every Python.
 """
 
 from __future__ import annotations
@@ -66,6 +69,13 @@ from datetime import datetime, timezone
 from ..exceptions import StorageError
 from ..object_storage import ObjectStorage
 from .base import StorageBackend, StoredRecord, StoredRecordMetadata
+
+# Connection.blobopen() (incremental BLOB I/O) was added in Python 3.11; this package
+# supports 3.10. Where it is missing, get_stream() reads the same bytes with substr()
+# range queries inside one held read transaction. A module-level flag, not an inline
+# hasattr(), so the fallback can be exercised on newer Pythons too (the tests switch
+# it off).
+_HAS_BLOBOPEN = hasattr(sqlite3.Connection, "blobopen")
 
 DEFAULT_STREAM_CHUNK_SIZE = 1024 * 1024
 
@@ -248,6 +258,60 @@ _EXISTS = "SELECT 1 FROM zerobucket_images WHERE id = ?;"
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _stream_with_substr(
+    conn: sqlite3.Connection,
+    table: str,
+    rowid: int,
+    total_size: int,
+    chunk_size: int,
+    image_id: str,
+    owns_connection: bool,
+) -> Iterator[bytes]:
+    """get_stream() for Pythons without Connection.blobopen() (3.10).
+
+    Reads the bytes with `substr()` range queries, one per chunk, but inside ONE read
+    transaction held open for the whole stream. In WAL mode that transaction pins a
+    snapshot, so a stream that has started keeps returning the original bytes even if
+    another connection deletes the row meanwhile: the same behaviour as the blobopen()
+    path (and unlike the Postgres and async SQLite adapters, whose per-chunk queries
+    each see the current state). If the caller passed their own connection that is
+    already inside a transaction, that transaction is used as it is and left open.
+
+    `table` is one of two constants chosen by the caller, never user input.
+    """
+    began = False
+    try:
+        if not conn.in_transaction:
+            try:
+                conn.execute("BEGIN")
+                began = True
+            except Exception as exc:  # noqa: BLE001
+                raise StorageError(f"Failed to stream image: {exc}") from exc
+        delivered = 0
+        while delivered < total_size:
+            want = min(chunk_size, total_size - delivered)
+            try:
+                row = conn.execute(
+                    f"SELECT substr(data, ?, ?) FROM {table} WHERE rowid = ?;",
+                    (delivered + 1, want, rowid),  # substr() is 1-indexed
+                ).fetchone()
+            except Exception as exc:  # noqa: BLE001
+                raise StorageError(f"Failed to stream image: {exc}") from exc
+            chunk = bytes(row[0]) if row is not None and row[0] is not None else b""
+            if not chunk:
+                raise StorageError(
+                    f"Image {image_id!r} was deleted while streaming "
+                    f"(delivered {delivered} of {total_size} bytes)."
+                )
+            yield chunk
+            delivered += len(chunk)
+    finally:
+        if began:
+            conn.rollback()  # ends the read transaction; nothing was written
+        if owns_connection:
+            conn.close()
 
 
 class SQLiteBackend(StorageBackend):
@@ -642,8 +706,10 @@ class SQLiteBackend(StorageBackend):
         chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
         connection: sqlite3.Connection | None = None,
     ) -> Iterator[bytes] | None:
-        """Uses `sqlite3.Connection.blobopen()` -- a real incremental-
-        BLOB-read API, not a range-query workaround. Unlike the Postgres
+        """Uses `sqlite3.Connection.blobopen()` on Python 3.11+ -- a real
+        incremental-BLOB-read API, not a range-query workaround -- and
+        `substr()` range queries in one held read transaction on 3.10,
+        which has no blobopen() (see `_stream_with_substr`). Unlike the Postgres
         adapter (which does one `_run()` call PER CHUNK, each its own
         pooled connection), this holds ONE connection open for the
         WHOLE stream -- necessary because the Blob handle is tied to
@@ -663,7 +729,8 @@ class SQLiteBackend(StorageBackend):
         deleted by another connection mid-stream causes the NEXT chunk
         fetch to see no row and raise StorageError. On SQLite, this
         method holds ONE connection open for the whole stream, and
-        `blobopen()`'s underlying read transaction gives it a
+        the read transaction (blobopen()'s own on Python 3.11+, an explicit
+        one on 3.10, where blobopen() does not exist) gives it a
         consistent snapshot (in WAL mode) of the row as it was when
         streaming began -- a concurrent DELETE from another connection
         does NOT interrupt or truncate an in-progress stream here; the
@@ -732,6 +799,17 @@ class SQLiteBackend(StorageBackend):
             table = "zerobucket_images"
 
         def generator() -> Iterator[bytes]:
+            if not _HAS_BLOBOPEN:
+                yield from _stream_with_substr(
+                    conn,
+                    table,
+                    rowid,
+                    total_size,
+                    chunk_size,
+                    image_id,
+                    owns_connection,
+                )
+                return
             try:
                 blob = conn.blobopen(table, "data", rowid, readonly=True)
             except Exception as exc:  # noqa: BLE001
