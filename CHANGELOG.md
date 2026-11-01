@@ -6,6 +6,54 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## Python `zerobucket` [0.26.1] - 2026-10-27
+
+Fixes SQLite streaming on Python 3.10. No change for Python 3.11 and later.
+
+### Fixed
+
+- **`SQLiteBackend.get_stream()` (and everything built on it: `stream_to()`, the Django serving view, any HTTP serving through
+  the sync client) failed on Python 3.10** with `StorageError: Failed to stream image: 'sqlite3.Connection' object has no
+attribute 'blobopen'`. The method used `Connection.blobopen()`, which only exists from Python 3.11, while the package declares
+  support for 3.10. Affects 0.19.0 through 0.26.0 on 3.10 only; classic and dedup mode alike. It was found by the Python 3.10 job in
+  CI, which had not got as far as running these tests before the 0.21.1 import fix.
+  - On Python 3.11+ the code path is unchanged.
+  - On 3.10 it now reads the same bytes with `substr()` range queries inside **one held read transaction**, so a stream that has
+    started still keeps its snapshot if another connection deletes the row mid-stream, exactly as the `blobopen()` path does. A
+    caller's own open transaction is used as it is and left open; otherwise the transaction is released when the stream finishes or
+    is abandoned.
+  - `AsyncSQLiteBackend` was never affected: it already streams with `substr()`.
+
+### Added
+
+- `tests/test_sqlite_stream_fallback.py` runs every scenario through **both** implementations by switching a module flag, so the
+  fallback is exercised on 3.11 and 3.12 as well as on 3.10: exact bytes at awkward chunk sizes, the snapshot surviving a concurrent
+  delete, a row deleted before the first chunk, the transaction being released after completion and after abandonment, a caller's
+  own transaction left alone, writers in other connections not being blocked by an open stream, and dedup mode. Each of three
+  deliberate breakages of the fallback (no held transaction, never released, off-by-one offset) is caught.
+
+### Verified
+
+- On a real Python 3.10.20 the whole suite passes: 474 passed, 13 skipped (the `blobopen` variants, which cannot run there), 0
+  failed, with PostgreSQL 16 and MariaDB 10.11 live. On Python 3.12: 487 passed. Lint clean (`ruff check src tests`).
+- Not changed: the author e-mail in `pyproject.toml` is still the `your-email@example.com` placeholder.
+
+## Repository and CI changes with no package release (npm)
+
+- **The npm CI conformance step failed with `Checksum mismatch ... in response header "content-md5"`.** Reproduced with the CI's
+  exact Python dependency: the step's `pip install` kept Ubuntu's system `boto3 1.34.46`, which sends `Content-MD5` on plain-HTTP
+  uploads; the moto server echoes it on every GET (ranged ones too), and the Node SDK then compares it with each partial body. With
+  boto3 1.43 the same script passes all six modes. The job now installs the Python side on a `setup-python` interpreter, which sees
+  current PyPI packages instead of the OS ones. Real S3 does not send `Content-MD5` on GETs; a library-level hardening for servers
+  that do is possible but is not part of this change.
+- **The npm publish workflow no longer fails when the version is already on npm** (published by hand and then tagged, or a re-run):
+  it says so in a warning and finishes green. It still fails on any other publish error.
+- **`package.json` `bin` is now `dist/bin.js`** instead of `./dist/bin.js`. npm 11 rewrites the old value when publishing and
+  reported it as "script name was invalid and removed"; the published packages were checked and always kept their `bin` entry
+  (the CLI runs from 0.10.1), so this only removes the warning. It ships with the next npm release.
+- A new CI step runs `npm pkg fix` on a copy of `package.json` and fails if npm would change anything, so a value that npm silently
+  rewrites is caught on the pull request rather than in a publish log.
+
 ## npm `zerobucket` [0.10.1] - 2026-10-26
 
 Reading images back from PostgreSQL uses less memory and, for large images, less time. No API or behaviour change: the bytes

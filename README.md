@@ -394,8 +394,9 @@ UPDATE`-based version has, but `BEGIN IMMEDIATE` is a coarser lock --
   trip, so a row
   deleted by another connection mid-stream causes the next chunk fetch
   to see nothing and raise `StorageError`. On SQLite, this backend
-  holds one connection open for the whole stream, and `blobopen()`'s
-  read transaction gives it a consistent WAL-mode snapshot of the row
+  holds one connection open for the whole stream, and its read
+  transaction (`blobopen()`'s on Python 3.11+, an explicit one on 3.10,
+  which has no `blobopen()`) gives it a consistent WAL-mode snapshot of the row
   as it was when streaming began -- a concurrent delete doesn't
   interrupt an in-progress stream; it completes with the full, correct
   original bytes.
