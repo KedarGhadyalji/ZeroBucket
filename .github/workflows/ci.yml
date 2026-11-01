@@ -144,6 +144,16 @@ jobs:
           ZEROBUCKET_TEST_MYSQL_URL: mysql://zerobucket:zerobucket@127.0.0.1:3306/zerobucket_test
         run: npm test
 
+      # The Python half of the conformance harness needs its own, current Python. Without this step pip used the Ubuntu system
+      # Python, saw "Requirement already satisfied: boto3" for the OS's boto3 1.34 and kept it. That version sends a Content-MD5
+      # header on plain-HTTP uploads, the moto server echoes it back on every GET (ranged ones too), and the Node SDK then compares
+      # it with each partial body: "Checksum mismatch ... in response header content-md5". Real S3 never sends that header on a GET.
+      - name: Set up Python for the conformance harness
+        if: matrix.node-version == 22
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Cross-language conformance (Node <-> Python on one database)
         if: matrix.node-version == 22
         working-directory: packages/typescript
@@ -151,8 +161,24 @@ jobs:
           ZEROBUCKET_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/zerobucket_test
           ZEROBUCKET_TEST_MYSQL_URL: mysql://zerobucket:zerobucket@127.0.0.1:3306/zerobucket_test
         run: |
-          pip install -e "../python[s3,heic,mysql]"
+          python -m pip install -e "../python[s3,heic,mysql]"
+          python -c "import boto3; print('boto3', boto3.__version__)"
           bash conformance/run.sh
+
+      # npm rewrites some package.json values when publishing and says so in a warning that is easy to miss: "./dist/bin.js" became
+      # "dist/bin.js" with a misleading "script name was invalid and removed" in a publish log. `npm pkg fix` is npm's own tool for
+      # exactly this, so run it on a copy and fail if it would change anything. (Not `npm publish --dry-run`: that also asks the
+      # registry, and fails with "cannot publish over the previously published versions" whenever the version is already released.)
+      - name: package.json needs no npm auto-corrections
+        if: matrix.node-version == 24
+        working-directory: packages/typescript
+        run: |
+          cp package.json "$RUNNER_TEMP/package.before.json"
+          npm pkg fix
+          if ! diff -u "$RUNNER_TEMP/package.before.json" package.json; then
+            echo "::error title=npm would rewrite package.json when publishing::run 'npm pkg fix' in packages/typescript and commit the result"
+            exit 1
+          fi
 
       - name: Example app (typecheck + end-to-end verify against the packed build)
         if: matrix.node-version == 22

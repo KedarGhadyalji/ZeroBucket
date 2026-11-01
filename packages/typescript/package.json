@@ -69,7 +69,7 @@
     "./package.json": "./package.json"
   },
   "bin": {
-    "zerobucket": "./dist/bin.js"
+    "zerobucket": "dist/bin.js"
   },
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsup",

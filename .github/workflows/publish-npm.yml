@@ -13,10 +13,10 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    environment: npm            # must match the "Environment" field in the npm trusted-publisher settings
+    environment: npm # must match the "Environment" field in the npm trusted-publisher settings
     permissions:
       contents: read
-      id-token: write           # lets GitHub mint the OIDC token npm checks
+      id-token: write # lets GitHub mint the OIDC token npm checks
     defaults:
       run:
         working-directory: packages/typescript
@@ -52,6 +52,21 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
 
+      # npm refuses to publish a version twice ("You cannot publish over the previously published versions"). That happens when
+      # the version was already published by hand and then its tag was pushed as well, or when this workflow is re-run. It is not
+      # a failure of the code, so say so plainly and finish green instead of showing a red run.
+      - name: Is this version already on npm?
+        id: published
+        run: |
+          V=$(node -p "require('./package.json').version")
+          if npm view "zerobucket@${V}" version > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Already published::zerobucket@${V} is already on npm, so nothing was published. If you meant to release different code, bump the version and use a new tag."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # No NODE_AUTH_TOKEN. Provenance is attached automatically under trusted publishing.
       - name: Publish
+        if: steps.published.outputs.exists != 'true'
         run: npm publish --access public
