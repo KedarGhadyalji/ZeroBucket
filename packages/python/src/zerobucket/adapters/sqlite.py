@@ -61,14 +61,16 @@ than left for someone to wonder about while reading unfamiliar code:
 from __future__ import annotations
 
 import sqlite3
+import time
 import uuid
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 
 from ..exceptions import StorageError
 from ..object_storage import ObjectStorage
 from .base import StorageBackend, StoredRecord, StoredRecordMetadata
+from .postgres import OperationEvent, _backoff_delay
 
 # Connection.blobopen() (incremental BLOB I/O) was added in Python 3.11; this package
 # supports 3.10. Where it is missing, get_stream() reads the same bytes with substr()
@@ -85,6 +87,36 @@ DEFAULT_STREAM_CHUNK_SIZE = 1024 * 1024
 # own dedicated connection below.
 _BUSY_TIMEOUT_SECONDS = 10.0
 _BUSY_TIMEOUT_MS = int(_BUSY_TIMEOUT_SECONDS * 1000)
+
+_SQLITE_BUSY = 5  # primary result codes; extended codes keep these in the low byte
+_SQLITE_LOCKED = 6
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """True only for lock contention (SQLITE_BUSY / SQLITE_LOCKED), the one
+    transient SQLite failure. Everything else, including other
+    `OperationalError`s (no such table, unable to open database file,
+    disk I/O error, read-only database), fails identically every time and
+    is never retried.
+
+    Python 3.11+ exposes `sqlite_errorcode`; on 3.10 the message is
+    matched instead ("database is locked" for BUSY, "database table is
+    locked" for LOCKED).
+
+    This matters beyond the 10 s busy_timeout: SQLite returns BUSY
+    IMMEDIATELY, without consulting the busy handler, when a transaction
+    that began with a read tries to upgrade to a write after another
+    connection has committed. Retrying the whole operation is the correct
+    fix for that case.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return (code & 0xFF) in (_SQLITE_BUSY, _SQLITE_LOCKED)
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
+
 
 _SELECT_STREAM_INFO = """
 SELECT rowid, size_bytes, storage_backend, object_storage_key
@@ -331,6 +363,9 @@ class SQLiteBackend(StorageBackend):
         auto_migrate: bool = True,
         dedup: bool = False,
         object_storage: ObjectStorage | None = None,
+        max_retries: int = 3,
+        retry_base_delay: float = 0.1,
+        on_operation: Callable[[OperationEvent], None] | None = None,
     ) -> None:
         if object_storage is not None and dedup:
             raise ValueError(
@@ -342,16 +377,21 @@ class SQLiteBackend(StorageBackend):
         self._dedup = dedup
         self._object_storage = object_storage
         self._wal_configured = False
+        self._max_retries = max_retries
+        self._retry_base_delay = retry_base_delay
+        self._on_operation = on_operation
         if auto_migrate:
             schema = _DEDUP_SCHEMA if dedup else _SCHEMA
-            conn = self._connect()
-            try:
+
+            def migrate_work(conn):
+                # Idempotent (CREATE ... IF NOT EXISTS), so re-running it
+                # after a retryable failure is safe.
                 conn.executescript(schema)
-                conn.commit()
+
+            try:
+                self._run(None, migrate_work, operation="migrate")
             except Exception as exc:  # noqa: BLE001
                 raise StorageError(f"Migration failed: {exc}") from exc
-            finally:
-                conn.close()
 
     def _connect(self) -> sqlite3.Connection:
         """Explicit busy_timeout at two layers -- see
@@ -385,23 +425,80 @@ class SQLiteBackend(StorageBackend):
         conn.execute("PRAGMA foreign_keys=ON;")
         return conn
 
-    def _run(self, connection, work):
-        """Mirrors the Postgres adapter's `_run()` shape (a `work(conn)`
-        callable, connection=None vs connection=provided) without the
-        retry loop or on_operation metrics -- neither is implemented in
-        this phase (see module docstring)."""
-        if connection is not None:
-            return work(connection)
-        conn = self._connect()
+    def _emit(
+        self,
+        operation: str,
+        start_time: float,
+        success: bool,
+        error: str | None,
+        retry_count: int,
+    ) -> None:
+        if self._on_operation is None:
+            return
+        event = OperationEvent(
+            operation=operation,
+            duration_seconds=time.monotonic() - start_time,
+            success=success,
+            error=error,
+            retry_count=retry_count,
+        )
         try:
-            result = work(conn)
-            conn.commit()
-            return result
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+            self._on_operation(event)
+        except Exception:  # noqa: BLE001
+            pass  # never let a metrics callback break a real operation
+
+    def _run(self, connection, work, *, operation: str):
+        """Mirrors the Postgres adapter's `_run()` shape (a `work(conn)`
+        callable, connection=None vs connection=provided).
+
+        connection provided -> run once on that exact connection, no
+        retry (the caller owns the transaction; replaying part of it
+        could silently half-apply it). Still emits an OperationEvent
+        (retry_count always 0).
+
+        connection is None -> open a fresh connection per attempt; a
+        lock-contention failure (see `_is_retryable`) is retried up to
+        max_retries times with exponential backoff plus jitter, EACH retry
+        re-running `work` in full after a rollback. Note that SQLite
+        already waits up to 10 s per attempt inside the engine
+        (busy_timeout), so a lock that is genuinely stuck can take up to
+        (max_retries + 1) x 10 s to fail; pass max_retries=0 to keep the
+        old single-wait behaviour. Emits exactly one OperationEvent per
+        call, after the final attempt.
+        """
+        start_time = time.monotonic()
+        if connection is not None:
+            try:
+                result = work(connection)
+                self._emit(operation, start_time, True, None, 0)
+                return result
+            except Exception as exc:  # noqa: BLE001
+                self._emit(operation, start_time, False, str(exc), 0)
+                raise
+
+        attempt = 0
+        while True:
+            conn = None
+            try:
+                conn = self._connect()
+                result = work(conn)
+                conn.commit()
+            except Exception as exc:  # noqa: BLE001
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    conn.close()
+                attempt += 1
+                if attempt > self._max_retries or not _is_retryable(exc):
+                    self._emit(operation, start_time, False, str(exc), attempt - 1)
+                    raise
+                time.sleep(_backoff_delay(attempt, self._retry_base_delay))
+            else:
+                conn.close()
+                self._emit(operation, start_time, True, None, attempt)
+                return result
 
     # ---- put ------------------------------------------------------------
 
@@ -452,7 +549,7 @@ class SQLiteBackend(StorageBackend):
             return str(row[0])
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="put")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -486,7 +583,7 @@ class SQLiteBackend(StorageBackend):
             return str(row[0])
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="put")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -534,7 +631,7 @@ class SQLiteBackend(StorageBackend):
             return ids
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="put_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -583,7 +680,7 @@ class SQLiteBackend(StorageBackend):
             return ids
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="put_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -601,7 +698,7 @@ class SQLiteBackend(StorageBackend):
             return cur.fetchone()
 
         try:
-            row = self._run(connection, work)
+            row = self._run(connection, work, operation="get")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image: {exc}") from exc
         if row is None:
@@ -652,7 +749,7 @@ class SQLiteBackend(StorageBackend):
             return cur.fetchall()
 
         try:
-            rows = self._run(connection, work)
+            rows = self._run(connection, work, operation="get_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image batch: {exc}") from exc
         records = []
@@ -684,7 +781,7 @@ class SQLiteBackend(StorageBackend):
             return cur.fetchone()
 
         try:
-            row = self._run(connection, work)
+            row = self._run(connection, work, operation="get_metadata")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
         if row is None:
@@ -722,6 +819,11 @@ class SQLiteBackend(StorageBackend):
         Same not-found contract as the Postgres adapter's version:
         returns None immediately if the id doesn't exist (checked
         eagerly, before any generator is even created).
+
+        Not instrumented: this method opens its own connection outside
+        `_run()`, so it neither emits `on_operation` events nor retries
+        (0.27.0). A WAL-mode read does not block on writers, so there is
+        no lock contention to retry.
 
         MID-STREAM CONCURRENT DELETION BEHAVES DIFFERENTLY FROM
         POSTGRES, verified directly rather than assumed to match: on
@@ -942,7 +1044,7 @@ class SQLiteBackend(StorageBackend):
             return cur.fetchone()
 
         try:
-            row = self._run(connection, work)
+            row = self._run(connection, work, operation="delete")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image: {exc}") from exc
         if row is None:
@@ -979,7 +1081,7 @@ class SQLiteBackend(StorageBackend):
             return True
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="delete")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image: {exc}") from exc
 
@@ -1003,7 +1105,7 @@ class SQLiteBackend(StorageBackend):
             return cur.fetchall()
 
         try:
-            rows = self._run(connection, work)
+            rows = self._run(connection, work, operation="delete_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image batch: {exc}") from exc
         deleted_ids = []
@@ -1058,7 +1160,7 @@ class SQLiteBackend(StorageBackend):
             return deleted_ids
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="delete_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image batch: {exc}") from exc
 
@@ -1074,7 +1176,7 @@ class SQLiteBackend(StorageBackend):
             return cur.fetchone() is not None
 
         try:
-            return self._run(connection, work)
+            return self._run(connection, work, operation="exists")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to check image existence: {exc}") from exc
 

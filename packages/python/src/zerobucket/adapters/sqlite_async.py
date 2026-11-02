@@ -3,8 +3,8 @@
 Scope matches `AsyncPostgresBackend`'s established scope EXACTLY, not
 by accident -- core CRUD + streaming, classic mode only. NOT
 implemented, same as the async Postgres adapter and tracked the same
-way: `dedup=True`, `tier_to_object_storage()`, the `on_operation`/
-retry-backoff machinery. This mirrors the async Postgres adapter's own
+way: `dedup=True`, `tier_to_object_storage()`. (The `on_operation`
+metrics hook and busy-retry were added in 0.27.0.) This mirrors the async Postgres adapter's own
 documented scope decision rather than inventing a different, wider one
 for SQLite -- consistency across the two async adapters was judged more
 valuable than SQLite async matching sync SQLite's fuller feature set.
@@ -38,15 +38,17 @@ stated directly rather than left to be discovered.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from ..exceptions import StorageError
 from .base import StoredRecord, StoredRecordMetadata
 from .base_async import AsyncStorageBackend
-from .sqlite import _SCHEMA, DEFAULT_STREAM_CHUNK_SIZE
+from .postgres import OperationEvent, _backoff_delay
+from .sqlite import _SCHEMA, DEFAULT_STREAM_CHUNK_SIZE, _is_retryable
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -127,7 +129,15 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
     the same failure, slower, not assumed fixed from reasoning alone.
     """
 
-    def __init__(self, database_path: str, *, auto_migrate: bool = True) -> None:
+    def __init__(
+        self,
+        database_path: str,
+        *,
+        auto_migrate: bool = True,
+        max_retries: int = 3,
+        retry_base_delay: float = 0.1,
+        on_operation: Callable[[OperationEvent], None] | None = None,
+    ) -> None:
         try:
             import aiosqlite
         except ImportError as exc:
@@ -141,6 +151,9 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         self._aiosqlite = aiosqlite
         self._database_path = database_path
         self._auto_migrate = auto_migrate
+        self._max_retries = max_retries
+        self._retry_base_delay = retry_base_delay
+        self._on_operation = on_operation
         self._ready = False
         self._ready_lock = asyncio.Lock()
 
@@ -169,15 +182,20 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         async with self._ready_lock:
             if self._ready:
                 return
-            try:
+
+            async def migrate_attempt() -> None:
                 async with self._aiosqlite.connect(
                     self._database_path, timeout=_BUSY_TIMEOUT_SECONDS
                 ) as conn:
                     await conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
                     await conn.execute("PRAGMA journal_mode=WAL;")
                     if self._auto_migrate:
+                        # Idempotent, so safe to re-run after a retry.
                         await conn.executescript(_SCHEMA)
                     await conn.commit()
+
+            try:
+                await self._with_retry(migrate_attempt, operation="migrate")
             except Exception as exc:  # noqa: BLE001
                 raise StorageError(f"Migration failed: {exc}") from exc
             self._ready = True
@@ -204,18 +222,81 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         await conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
         return conn
 
-    async def _run(self, work):
-        await self._ensure_ready()
-        conn = await self._connect()
+    def _emit(
+        self,
+        operation: str,
+        start_time: float,
+        success: bool,
+        error: str | None,
+        retry_count: int,
+    ) -> None:
+        if self._on_operation is None:
+            return
+        event = OperationEvent(
+            operation=operation,
+            duration_seconds=time.monotonic() - start_time,
+            success=success,
+            error=error,
+            retry_count=retry_count,
+        )
         try:
-            result = await work(conn)
-            await conn.commit()
-            return result
-        except Exception:
-            await conn.rollback()
+            self._on_operation(event)
+        except Exception:  # noqa: BLE001
+            pass  # never let a metrics callback break a real operation
+
+    async def _with_retry(
+        self, attempt_fn, *, operation: str, start_time: float | None = None
+    ):
+        """Runs `attempt_fn()` (one complete attempt, including opening
+        its own connection), retrying lock contention (see
+        `sqlite._is_retryable`) up to max_retries times with exponential
+        backoff plus jitter. Emits one OperationEvent after the final
+        attempt. SQLite already waits up to 10 s per attempt inside the
+        engine, so a genuinely stuck lock can take up to
+        (max_retries + 1) x 10 s to fail; max_retries=0 keeps the old
+        single wait."""
+        if start_time is None:
+            start_time = time.monotonic()
+        attempt = 0
+        while True:
+            try:
+                result = await attempt_fn()
+            except Exception as exc:  # noqa: BLE001
+                attempt += 1
+                if attempt > self._max_retries or not _is_retryable(exc):
+                    self._emit(operation, start_time, False, str(exc), attempt - 1)
+                    raise
+                await asyncio.sleep(_backoff_delay(attempt, self._retry_base_delay))
+            else:
+                self._emit(operation, start_time, True, None, attempt)
+                return result
+
+    async def _run(self, work, *, operation: str):
+        start_time = time.monotonic()
+        try:
+            await self._ensure_ready()
+        except Exception as exc:  # noqa: BLE001
+            self._emit(operation, start_time, False, str(exc), 0)
             raise
-        finally:
-            await conn.close()
+
+        async def attempt_fn():
+            conn = await self._connect()
+            try:
+                result = await work(conn)
+                await conn.commit()
+                return result
+            except Exception:
+                try:
+                    await conn.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+            finally:
+                await conn.close()
+
+        return await self._with_retry(
+            attempt_fn, operation=operation, start_time=start_time
+        )
 
     # ---- put ------------------------------------------------------------
 
@@ -253,7 +334,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return str(row[0])
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="put")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -296,7 +377,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return ids
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="put_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -310,7 +391,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return await cur.fetchone()
 
         try:
-            row = await self._run(work)
+            row = await self._run(work, operation="get")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image: {exc}") from exc
         if row is None:
@@ -337,7 +418,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return await cur.fetchall()
 
         try:
-            rows = await self._run(work)
+            rows = await self._run(work, operation="get_many")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image batch: {exc}") from exc
         return [
@@ -360,7 +441,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return await cur.fetchone()
 
         try:
-            row = await self._run(work)
+            row = await self._run(work, operation="get_metadata")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
         if row is None:
@@ -396,7 +477,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return await cur.fetchone()
 
         try:
-            info_row = await self._run(info_work)
+            info_row = await self._run(info_work, operation="get_stream")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
         if info_row is None:
@@ -415,7 +496,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
                     return await cur.fetchone()
 
                 try:
-                    row = await self._run(work)
+                    row = await self._run(work, operation="get_stream")
                 except Exception as exc:  # noqa: BLE001
                     raise StorageError(f"Failed to stream image: {exc}") from exc
 
@@ -441,7 +522,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return cur.rowcount > 0
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="delete")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -460,7 +541,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return [str(row[0]) for row in await cur.fetchall()]
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="delete_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -474,7 +555,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return (await cur.fetchone()) is not None
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="exists")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
