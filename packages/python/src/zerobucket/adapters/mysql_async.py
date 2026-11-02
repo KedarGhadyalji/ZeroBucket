@@ -6,12 +6,18 @@ Scope matches `AsyncPostgresBackend`'s and `AsyncSQLiteBackend`'s
 established scope EXACTLY, not by accident: core CRUD + streaming,
 classic mode only. NOT implemented, same as both other async adapters
 and tracked the same way: `dedup=True`, `tier_to_object_storage()` as
-a caller-facing operation, `connection=` transaction participation,
-the `on_operation`/retry-backoff machinery. This mirrors
-`AsyncSQLiteBackend`'s own documented scope decision rather than
-inventing a wider one for MySQL -- consistency across all three async
-adapters was judged more valuable than matching sync MySQL's fuller
-(Phase 1-3) feature set.
+a caller-facing operation, `connection=` transaction participation.
+This mirrors `AsyncSQLiteBackend`'s own documented scope decision
+rather than inventing a wider one for MySQL -- consistency across all
+three async adapters was judged more valuable than matching sync
+MySQL's fuller (Phase 1-3) feature set.
+
+**0.27.0 added the `on_operation` metrics hook and automatic
+retry/backoff** (`max_retries`, `retry_base_delay`, `on_operation`),
+with the same names, defaults, `OperationEvent` shape and operation
+names as the sync `MySQLBackend`. See `_run()` for exactly what is
+retried and why a retry always runs the WHOLE logical operation again
+on a fresh connection, never one statement.
 
 DRIVER CHOICE, stated directly: **aiomysql, not asyncmy**. asyncmy is
 faster (Cython-accelerated) but ships as a COMPILED extension -- that
@@ -125,8 +131,9 @@ turns `close()` into "return to pool".
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING
 
 from ..exceptions import StorageError
@@ -142,9 +149,11 @@ from .mysql import (
     _SELECT_METADATA,
     _SELECT_STREAM_INFO,
     DEFAULT_STREAM_CHUNK_SIZE,
+    _backoff_delay,
     _now,
     _parse_database_url,
 )
+from .postgres import OperationEvent
 
 if TYPE_CHECKING:
     import aiomysql
@@ -172,6 +181,16 @@ class AsyncMySQLBackend(AsyncStorageBackend):
     but asyncio makes this trivial: pool_timeout is enforced with
     `asyncio.wait_for()` around `pool.acquire()`, no polling loop
     needed here.
+
+    max_retries/retry_base_delay/on_operation: the same three knobs as
+    sync `MySQLBackend` (defaults 3 / 0.1 / None). A transient failure
+    is retried up to `max_retries` times with exponential backoff and
+    jitter, each retry re-running the WHOLE operation on a fresh pooled
+    connection. `on_operation` receives one `OperationEvent` per call
+    after the final attempt; an exception raised by the callback is
+    swallowed, never allowed to break the real operation. There is no
+    `connection=` parameter on this adapter, so unlike the sync
+    adapter there is no no-retry path.
     """
 
     def __init__(
@@ -182,12 +201,18 @@ class AsyncMySQLBackend(AsyncStorageBackend):
         pool_min_size: int = 1,
         pool_max_size: int = 5,
         pool_timeout: float = 10,
+        max_retries: int = 3,
+        retry_base_delay: float = 0.1,
+        on_operation: Callable[[OperationEvent], None] | None = None,
     ) -> None:
         self._connect_kwargs = _parse_database_url(database_url)
         self._auto_migrate = auto_migrate
         self._pool_min_size = pool_min_size
         self._pool_max_size = pool_max_size
         self._pool_timeout = pool_timeout
+        self._max_retries = max_retries
+        self._retry_base_delay = retry_base_delay
+        self._on_operation = on_operation
         self._ready = False
         self._ready_lock = asyncio.Lock()
         self._aiomysql = None  # set in _ensure_ready, once import succeeds
@@ -238,13 +263,16 @@ class AsyncMySQLBackend(AsyncStorageBackend):
 
             if self._auto_migrate:
                 conn = None
+                migrate_start = time.monotonic()
                 try:
                     conn = await self._acquire()
                     async with conn.cursor() as cur:
                         await cur.execute(_SCHEMA)
                         await _migrate_tiering_async(cur)
                     await conn.commit()
+                    self._emit("migrate", migrate_start, True, None, 0)
                 except Exception as exc:  # noqa: BLE001
+                    self._emit("migrate", migrate_start, False, str(exc), 0)
                     # Don't leak the pool if setup fails partway
                     # through -- close it before propagating, same
                     # reasoning as the sync adapter's equivalent.
@@ -280,21 +308,92 @@ class AsyncMySQLBackend(AsyncStorageBackend):
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to connect to MySQL/MariaDB: {exc}") from exc
 
-    async def _run(self, work):
-        await self._ensure_ready()
-        conn = await self._acquire()
+    def _is_retryable(self, exc: BaseException) -> bool:
+        """Same classification as sync `MySQLBackend._is_retryable()`:
+        PyMySQL (which aiomysql re-exports) raises `OperationalError`
+        for connection-level failures AND for lock-wait-timeout (1205)
+        and deadlock (1213) alike, and all of those are transient.
+        Integrity/Programming/Data errors are not and are never
+        retried."""
+        return isinstance(exc, self._aiomysql.OperationalError)
+
+    def _emit(
+        self,
+        operation: str,
+        start_time: float,
+        success: bool,
+        error: str | None,
+        retry_count: int,
+    ) -> None:
+        if self._on_operation is None:
+            return
+        event = OperationEvent(
+            operation=operation,
+            duration_seconds=time.monotonic() - start_time,
+            success=success,
+            error=error,
+            retry_count=retry_count,
+        )
         try:
-            result = await work(conn)
-            await conn.commit()
-            return result
-        except Exception:
-            await conn.rollback()
+            self._on_operation(event)
+        except Exception:  # noqa: BLE001
+            pass  # never let a metrics callback break a real operation
+
+    async def _run(self, work, *, operation: str):
+        """Run `work(conn)` (an async callable) on a pooled connection,
+        commit, and return its result.
+
+        A transient failure (see `_is_retryable`) is retried up to
+        `max_retries` times with exponential backoff plus jitter, EACH
+        retry re-running `work` in full on a freshly acquired
+        connection after a rollback. That is retry at the whole
+        logical-operation boundary, never statement-by-statement
+        replay, which is what makes it safe for multi-statement work
+        such as `put_many()` and `delete_many()`.
+
+        Pool-acquire failures (including `pool_timeout`) are never
+        retried: `_acquire()` is already a bounded wait, and retrying it
+        would only repeat the same wait. Emits exactly one
+        `OperationEvent` per call, after the final attempt;
+        `duration_seconds` covers the whole call including backoff.
+        """
+        start_time = time.monotonic()
+        try:
+            await self._ensure_ready()
+        except Exception as exc:  # noqa: BLE001
+            self._emit(operation, start_time, False, str(exc), 0)
             raise
-        finally:
-            # aiomysql's pool needs an explicit release() -- unlike
-            # DBUtils (sync adapter), conn.close() here would actually
-            # disconnect rather than return the connection to the pool.
-            self._pool.release(conn)
+
+        attempt = 0
+        while True:
+            try:
+                conn = await self._acquire()
+            except Exception as exc:  # noqa: BLE001
+                self._emit(operation, start_time, False, str(exc), attempt)
+                raise
+            try:
+                result = await work(conn)
+                await conn.commit()
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    await conn.rollback()
+                except Exception:  # noqa: BLE001
+                    # The connection is probably already dead; drop it
+                    # rather than hand a broken one back to the pool.
+                    conn.close()
+                # aiomysql's pool needs an explicit release() -- unlike
+                # DBUtils (sync adapter), conn.close() would disconnect
+                # rather than return the connection to the pool.
+                self._pool.release(conn)
+                attempt += 1
+                if attempt > self._max_retries or not self._is_retryable(exc):
+                    self._emit(operation, start_time, False, str(exc), attempt - 1)
+                    raise
+                await asyncio.sleep(_backoff_delay(attempt, self._retry_base_delay))
+            else:
+                self._pool.release(conn)
+                self._emit(operation, start_time, True, None, attempt)
+                return result
 
     # ---- put ------------------------------------------------------------
 
@@ -332,7 +431,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
             return image_id
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="put")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -369,7 +468,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
             return [image_id for image_id, _ in prepared]
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="put_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -389,7 +488,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return await cur.fetchone()
 
         try:
-            row = await self._run(work)
+            row = await self._run(work, operation="get")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -419,7 +518,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return await cur.fetchall()
 
         try:
-            rows = await self._run(work)
+            rows = await self._run(work, operation="get_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -445,7 +544,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return await cur.fetchone()
 
         try:
-            row = await self._run(work)
+            row = await self._run(work, operation="get_metadata")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
         if row is None:
@@ -475,7 +574,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return await cur.fetchone()
 
         try:
-            info_row = await self._run(info_work)
+            info_row = await self._run(info_work, operation="get_stream")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
         if info_row is None:
@@ -502,7 +601,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                         return await cur.fetchone()
 
                 try:
-                    row = await self._run(work)
+                    row = await self._run(work, operation="get_stream")
                 except Exception as exc:  # noqa: BLE001
                     raise StorageError(f"Failed to stream image: {exc}") from exc
 
@@ -534,7 +633,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return cur.rowcount > 0
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="delete")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -568,7 +667,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return existing_ids
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="delete_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -583,7 +682,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return (await cur.fetchone()) is not None
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="exists")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to check image existence: {exc}") from exc
 
