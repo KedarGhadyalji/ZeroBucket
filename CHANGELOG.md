@@ -6,6 +6,55 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## django-zerobucket [0.1.1] - 2026-11-02
+
+Metadata only. No code change.
+
+### Changed
+
+- The package author e-mail in `pyproject.toml` is now `kedarghadyalji@gmail.com` instead of the `your-email@example.com`
+  placeholder. PyPI metadata cannot be edited in place, so this needs a release to take effect.
+- The `zerobucket` dependency floor is raised from `>=0.15.0` to `>=0.26.0` (also for the `[s3]` extra), so installs always get
+  the UUID handling fix from 0.26.0.
+
+## Python `zerobucket` [0.27.0] - 2026-11-02
+
+The async adapters now have the resilience and observability the sync adapters have had since 0.25.0: automatic retry with
+backoff and the `on_operation` metrics hook. SQLite, sync and async, gets both too.
+
+### Added
+
+- **`AsyncMySQLBackend`, `AsyncPostgresBackend` and `AsyncSQLiteBackend` accept `max_retries` (default 3), `retry_base_delay`
+  (default 0.1) and `on_operation`**, with the same names, defaults, `OperationEvent` shape, backoff formula and operation names
+  as the sync adapters. One event is emitted per call, after the final attempt; `duration_seconds` includes backoff; an exception
+  raised by the callback is swallowed. A `migrate` event is emitted for the lazy first-call migration.
+- **`SQLiteBackend` accepts the same three options.** A `migrate` event is emitted at construction (when `auto_migrate=True`).
+- **`AsyncZeroBucket(database_url=...)` accepts `max_retries`, `retry_base_delay` and `on_operation`** and passes them to the
+  PostgreSQL backend it builds. With `backend=...` they are ignored; pass them to that backend instead (same as the sync client).
+- Tests: `tests/test_async_retry_metrics.py` (new, 16 tests, includes a **real PostgreSQL deadlock** that the retry recovers),
+  `tests/test_sqlite_retry_metrics.py` (new, 25 tests, includes **real SQLite lock contention** for both sync and async), and a
+  block of async tests in `tests/test_mysql_async_adapter.py` (includes a **real InnoDB lock-wait timeout**).
+
+### Behaviour to know about
+
+- **What is retried.** Each retry re-runs the WHOLE operation on a fresh connection after a rollback, never one statement, so
+  multi-statement work such as `put_many()` is never half-applied. MySQL: `OperationalError` (connection loss, lock-wait timeout,
+  deadlock). PostgreSQL: the same classification as the sync adapter. SQLite: only `SQLITE_BUSY`/`SQLITE_LOCKED`; other
+  `OperationalError`s (no such table, unable to open file, read-only database) are never retried.
+- **SQLite can now take longer to fail.** SQLite already waits up to 10 s per attempt inside the engine, so a lock that is truly
+  stuck can take up to `(max_retries + 1) x 10 s` instead of 10 s. Pass `max_retries=0` to keep the old behaviour. Retrying also
+  fixes the case where SQLite reports "locked" instantly (a transaction that began with a read and then tries to write).
+- **Async MySQL does not retry pool-acquire timeouts** (`pool_timeout` is already a bounded wait). Async PostgreSQL does, as the
+  sync adapter does.
+- **Not instrumented:** sync `SQLiteBackend.get_stream()` (opens its own connection) and `tier_to_object_storage()` on SQLite emit
+  no events and are not retried. Async SQLite `get_stream()` emits one event for the size lookup plus one per chunk.
+- No `connection=` parameter exists on the async adapters, so there is no "caller owns the transaction, never retry" path there. On
+  sync SQLite a caller-supplied `connection=` runs once, with no retry, and still emits an event with `retry_count` 0.
+
+### Changed
+
+- The package author e-mail in `pyproject.toml` is now `kedarghadyalji@gmail.com` (this package and `django-zerobucket`).
+
 ## Python `zerobucket` [0.26.1] - 2026-10-27
 
 Fixes SQLite streaming on Python 3.10. No change for Python 3.11 and later.

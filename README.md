@@ -173,10 +173,14 @@ today, tracked honestly rather than implied:
 
 - `dedup=True` (content-addressed storage) -- classic mode only for now.
 - `before_get`/`before_put` access-control hooks.
-- `on_operation` observability hook.
 - `optimize=True` (resize/re-encode pipeline) and custom `validator=`.
 - `connection=` transaction participation.
-- Automatic retry/backoff on transient errors.
+
+Since 0.27.0 all three async adapters (PostgreSQL, SQLite, MySQL) support
+the `on_operation` observability hook and automatic retry/backoff
+(`max_retries`, `retry_base_delay`), with the same names and defaults as
+the sync adapters. `AsyncZeroBucket(database_url=...)` accepts them
+directly; with `backend=...`, pass them to that backend's constructor.
 
 Every one of these exists on the sync `ZeroBucket` today and isn't
 architecturally blocked from reaching the async client later -- they
@@ -366,13 +370,19 @@ images = ZeroBucket(backend=SQLiteBackend("images.db", dedup=True))
 What works today, async (`AsyncSQLiteBackend`, `pip install
 zerobucket[sqlite-async]`): core CRUD + `get_stream()`/`stream_to()`,
 classic mode only -- same scope `AsyncPostgresBackend` has (no
-`dedup=True`, no `tier_to_object_storage()`, no `on_operation`/retry
-machinery), deliberately kept consistent between the two async
-adapters rather than letting SQLite's async support drift wider.
+`dedup=True`, no `tier_to_object_storage()`), deliberately kept
+consistent between the async adapters rather than letting SQLite's
+async support drift wider.
 
-**Not yet implemented:** the `on_operation`/retry-backoff machinery
-`PostgresBackend` has, for either sync or async SQLite. `dedup=True`
-combined with `object_storage=` raises `ValueError` at construction --
+**`on_operation` and retry (0.27.0), sync and async SQLite:** the same
+`max_retries` / `retry_base_delay` / `on_operation` knobs as the other
+adapters. Only lock contention (`SQLITE_BUSY`/`SQLITE_LOCKED`) is
+retried, as a whole-operation re-run. SQLite already waits up to 10 s per
+attempt inside the engine, so a lock that is truly stuck can take up to
+`(max_retries + 1) x 10 s` to fail; pass `max_retries=0` for the old
+single wait. Sync `SQLiteBackend.get_stream()` and
+`tier_to_object_storage()` are not instrumented and not retried.
+`dedup=True` combined with `object_storage=` raises `ValueError` at construction --
 same restriction as the Postgres adapter; combining content-addressed
 storage with tiering is out of scope for both.
 
@@ -417,10 +427,9 @@ UPDATE`-based version has, but `BEGIN IMMEDIATE` is a coarser lock --
 `PostgresBackend`**: core CRUD, streaming, tiering, dedup mode,
 connection pooling, `on_operation` metrics, and automatic retry/backoff
 (same knobs and defaults as Postgres throughout). `AsyncMySQLBackend`
-covers core CRUD + streaming + pooling, classic mode only -- matching
-`AsyncPostgresBackend`/`AsyncSQLiteBackend`'s own scope, which
-deliberately does not include retry/metrics either (see
-`AsyncPostgresBackend`'s own docstring).
+covers core CRUD + streaming + pooling + `on_operation` metrics and
+automatic retry/backoff (since 0.27.0), classic mode only -- matching
+`AsyncPostgresBackend`/`AsyncSQLiteBackend`'s own scope.
 
 ```bash
 pip install zerobucket[mysql]          # sync
