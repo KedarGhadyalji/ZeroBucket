@@ -16,11 +16,12 @@ purpose -- see the project's CHANGELOG for the scoping decision):
 
 - dedup=True (content-addressed storage) -- classic mode only for now.
 - before_get/before_put access-control hooks.
-- on_operation observability/metrics hook.
 - optimize=True (resize/re-encode pipeline) and custom validator=
   support -- put() here only does the built-in image validation.
 - connection= transaction participation.
-- Automatic retry/backoff on transient errors.
+
+(0.27.0 added the on_operation metrics hook and automatic retry/backoff
+on transient errors, for all three async adapters.)
 
 Every one of these exists on the sync ZeroBucket today; none is
 architecturally blocked from being added to the async client later, they
@@ -45,11 +46,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import BinaryIO
 
 from .adapters.base_async import AsyncStorageBackend
-from .adapters.postgres import DEFAULT_STREAM_CHUNK_SIZE
+from .adapters.postgres import DEFAULT_STREAM_CHUNK_SIZE, OperationEvent
 from .adapters.postgres_async import AsyncPostgresBackend
 from .client import DEFAULT_MAX_BYTES, ImageInput, _read_image_input
 from .exceptions import ImageNotFoundError
@@ -69,8 +70,13 @@ class AsyncZeroBucket:
 
     Args: same meaning as the sync ZeroBucket's constructor for
         max_bytes/max_pixels/allowed_formats/pool_min_size/
-        pool_max_size/pool_timeout -- see its docstring for the full
-        rationale on each; not repeated here.
+        pool_max_size/pool_timeout/max_retries/retry_base_delay/
+        on_operation -- see its docstring for the full rationale on
+        each; not repeated here. max_retries, retry_base_delay and
+        on_operation only configure the PostgreSQL backend this class
+        builds from `database_url`. With `backend=...` they are ignored:
+        pass them to that backend's own constructor instead (every async
+        adapter accepts the same three).
     """
 
     def __init__(
@@ -84,6 +90,9 @@ class AsyncZeroBucket:
         pool_max_size: int = 5,
         pool_timeout: float = 10,
         auto_migrate: bool = True,
+        max_retries: int = 3,
+        retry_base_delay: float = 0.1,
+        on_operation: Callable[[OperationEvent], None] | None = None,
         backend: AsyncStorageBackend | None = None,
     ) -> None:
         if backend is not None:
@@ -95,6 +104,9 @@ class AsyncZeroBucket:
                 pool_min_size=pool_min_size,
                 pool_max_size=pool_max_size,
                 pool_timeout=pool_timeout,
+                max_retries=max_retries,
+                retry_base_delay=retry_base_delay,
+                on_operation=on_operation,
             )
         else:
             raise ValueError("Either database_url or backend must be provided")

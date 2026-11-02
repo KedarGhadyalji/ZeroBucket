@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 
 from psycopg_pool import AsyncConnectionPool
 
@@ -41,6 +42,9 @@ from .postgres import (
     _SELECT_FULL,
     _SELECT_METADATA,
     DEFAULT_STREAM_CHUNK_SIZE,
+    OperationEvent,
+    _backoff_delay,
+    _is_retryable,
 )
 
 __all__ = ["AsyncPostgresBackend", "DEFAULT_STREAM_CHUNK_SIZE"]
@@ -91,11 +95,16 @@ class AsyncPostgresBackend(AsyncStorageBackend):
     connection error; the first real operation can, same as it always
     could for a bad database_url.
 
-    No automatic retry (max_retries doesn't exist as a parameter here --
-    contrast with sync PostgresBackend) and no on_operation metrics hook
-    in this first pass. Errors from a failed operation are wrapped in
-    StorageError and raised directly, same wrapping behavior as the sync
-    adapter, just without a retry loop around it.
+    max_retries/retry_base_delay/on_operation (added in 0.27.0): the same
+    three knobs, defaults (3 / 0.1 / None), retry classification
+    (`postgres._is_retryable`), backoff formula, `OperationEvent` shape
+    and operation names as the sync PostgresBackend. A transient failure
+    re-runs the WHOLE operation on a freshly acquired pooled connection,
+    inside a new transaction, so a half-applied multi-statement
+    operation is never continued. There is no `connection=` parameter on
+    this adapter, so unlike the sync adapter there is no no-retry path.
+    The callback is called synchronously on the event loop thread: keep
+    it fast and non-blocking. An exception it raises is swallowed.
 
     Windows note: psycopg3's async mode cannot run under Windows'
     default ProactorEventLoop (a documented psycopg3 limitation, not
@@ -117,6 +126,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
         pool_min_size: int = 1,
         pool_max_size: int = 5,
         pool_timeout: float = 10,
+        max_retries: int = 3,
+        retry_base_delay: float = 0.1,
+        on_operation: Callable[[OperationEvent], None] | None = None,
     ) -> None:
         self._pool = AsyncConnectionPool(
             database_url,
@@ -126,6 +138,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             timeout=pool_timeout,
         )
         self._pool_timeout = pool_timeout
+        self._max_retries = max_retries
+        self._retry_base_delay = retry_base_delay
+        self._on_operation = on_operation
         self._auto_migrate = auto_migrate
         self._ready = False
         self._ready_lock = asyncio.Lock()
@@ -149,9 +164,11 @@ class AsyncPostgresBackend(AsyncStorageBackend):
 
             if self._auto_migrate:
                 try:
-                    async with self._pool.connection() as conn:
-                        async with conn.cursor() as cur:
-                            await cur.execute(_SCHEMA)
+
+                    async def migrate_work(cur):
+                        await cur.execute(_SCHEMA)
+
+                    await self._attempt(migrate_work, operation="migrate")
                 except Exception as exc:  # noqa: BLE001
                     # Don't leak the pool's background resources if setup
                     # fails partway through -- mirrors the sync adapter's
@@ -161,14 +178,70 @@ class AsyncPostgresBackend(AsyncStorageBackend):
 
             self._ready = True
 
-    async def _run(self, work):
+    def _emit(
+        self,
+        operation: str,
+        start_time: float,
+        success: bool,
+        error: str | None,
+        retry_count: int,
+    ) -> None:
+        if self._on_operation is None:
+            return
+        event = OperationEvent(
+            operation=operation,
+            duration_seconds=time.monotonic() - start_time,
+            success=success,
+            error=error,
+            retry_count=retry_count,
+        )
+        try:
+            self._on_operation(event)
+        except Exception:  # noqa: BLE001
+            pass  # never let a metrics callback break a real operation
+
+    async def _attempt(self, work, *, operation: str, start_time: float | None = None):
+        """The retry loop, without the lazy-init step (so migration,
+        which runs inside `_ensure_ready()`, can use it too).
+
+        Runs `work(cursor)` on a pooled connection; a transient failure
+        (see `postgres._is_retryable`) is retried up to `max_retries`
+        times with exponential backoff plus jitter, each retry re-running
+        `work` in full on a freshly acquired connection and a new
+        transaction. Non-transient errors propagate on the first attempt.
+        Emits exactly one `OperationEvent` per call, after the final
+        attempt; `duration_seconds` covers the whole call including
+        backoff delays.
+        """
+        if start_time is None:
+            start_time = time.monotonic()
+        attempt = 0
+        while True:
+            try:
+                async with self._pool.connection() as conn:
+                    async with conn.cursor() as cur:
+                        result = await work(cur)
+                self._emit(operation, start_time, True, None, attempt)
+                return result
+            except Exception as exc:  # noqa: BLE001
+                attempt += 1
+                if attempt > self._max_retries or not _is_retryable(exc):
+                    self._emit(operation, start_time, False, str(exc), attempt - 1)
+                    raise
+                await asyncio.sleep(_backoff_delay(attempt, self._retry_base_delay))
+
+    async def _run(self, work, *, operation: str):
         """Run `work(cursor)` (an async callable) on a pooled connection
-        and return its result. No retry loop in this first pass -- see
-        class docstring."""
-        await self._ensure_ready()
-        async with self._pool.connection() as conn:
-            async with conn.cursor() as cur:
-                return await work(cur)
+        and return its result, with retry and metrics -- see `_attempt`.
+        A failure to open the pool or migrate is reported as a failed
+        event for this operation and is never retried."""
+        start_time = time.monotonic()
+        try:
+            await self._ensure_ready()
+        except Exception as exc:  # noqa: BLE001
+            self._emit(operation, start_time, False, str(exc), 0)
+            raise
+        return await self._attempt(work, operation=operation, start_time=start_time)
 
     # ---- put ------------------------------------------------------------
 
@@ -200,7 +273,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return str(row[0])
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="put")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -234,7 +307,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return ids
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="put_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -251,7 +324,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return await cur.fetchone()
 
         try:
-            row = await self._run(work)
+            row = await self._run(work, operation="get")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -285,7 +358,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return await cur.fetchall()
 
         try:
-            rows = await self._run(work)
+            rows = await self._run(work, operation="get_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -313,7 +386,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return await cur.fetchone()
 
         try:
-            row = await self._run(work)
+            row = await self._run(work, operation="get_metadata")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -362,7 +435,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
                     return await cur.fetchone()
 
                 try:
-                    row = await self._run(work)
+                    row = await self._run(work, operation="get_stream")
                 except Exception as exc:  # noqa: BLE001
                     raise StorageError(f"Failed to stream image: {exc}") from exc
 
@@ -391,7 +464,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return cur.rowcount > 0
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="delete")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -410,7 +483,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return [str(row[0]) for row in await cur.fetchall()]
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="delete_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -427,7 +500,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return (await cur.fetchone()) is not None
 
         try:
-            return await self._run(work)
+            return await self._run(work, operation="exists")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
