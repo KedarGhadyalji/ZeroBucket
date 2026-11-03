@@ -1096,9 +1096,11 @@ ruff check src/ tests/
 ```bash
 zerobucket init      # create the zerobucket_images table and indexes if missing
 zerobucket migrate   # currently the same as init -- no versioned migrations yet
+zerobucket migrate --to-dedup   # copy classic images into the dedup tables (PostgreSQL only)
 zerobucket info      # image count, total size, on-disk size, breakdown by format
 zerobucket verify    # re-checksum every stored image to detect corruption
 zerobucket verify --sample 100   # check a random sample instead of everything
+zerobucket verify --bucket my-bucket   # also verify images tiered to object storage
 zerobucket tier IMAGE_ID --bucket my-bucket             # tier a single image
 zerobucket tier --all --bucket my-bucket                # tier every untiered image
 zerobucket tier --min-size 2000000 --bucket my-bucket    # tier images >= 2MB
@@ -1106,13 +1108,37 @@ zerobucket tier --older-than 90 --bucket my-bucket       # tier images older tha
 zerobucket tier --all --bucket my-bucket --dry-run       # preview without doing it
 ```
 
-All commands take `--database-url`, or read `ZEROBUCKET_DATABASE_URL` from
-the environment:
+Since 0.28.0 the CLI works on **PostgreSQL, SQLite and MySQL/MariaDB**, in
+classic **and** dedup mode, the same as the npm package's CLI. Choose the
+database with one of:
 
 ```bash
-export ZEROBUCKET_DATABASE_URL=postgresql://user:pass@localhost/mydb
-zerobucket info
+zerobucket info --database-url postgresql://user:pass@localhost/mydb
+zerobucket info --database-url mysql://user:pass@localhost/mydb     # mariadb:// also works
+zerobucket info --sqlite ./images.db
+zerobucket info --sqlite ./images.db --dedup                        # the dedup-mode tables
 ```
+
+or set `ZEROBUCKET_DATABASE_URL` / `ZEROBUCKET_SQLITE_PATH` in the environment
+(a flag beats the environment; setting both variables is an error until you
+pass a flag to choose). A `mysql://` or `mariadb://` URL selects MySQL/MariaDB
+(`pip install zerobucket[mysql]`); anything else is treated as PostgreSQL.
+Exit codes: 0 success, 1 problems found or an operation failed, 2 usage or
+connection error.
+
+`info` also understands the two modes: in dedup mode it reports the distinct
+blobs and the physical bytes saved, and in classic mode it reports how many
+images are tiered to object storage. `tier` is not available with `--dedup`
+(a deduplicated blob can be shared by many images).
+
+`verify` skips images tiered to object storage and says how many it skipped;
+pass `--bucket` (plus `--endpoint-url`/`--region`/credentials, the same
+options as `tier`) to check those too -- their bytes are read back from the
+bucket and checksummed like any other.
+
+`migrate --to-dedup` refuses when classic images are tiered to object storage
+(their bytes are not in the database to copy); pass `--skip-tiered` to skip
+them and migrate the rest. It never modifies the classic table.
 
 `verify` exits with status 1 if any mismatches are found (and prints
 which image IDs), so it's usable as a cron job or CI check, not just an
@@ -1153,7 +1179,7 @@ Not yet built, tracked honestly rather than implied:
 - [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)
 - [x] Deduplication with reference counting (opt-in, `dedup=True`)
 - [x] SQLite and MySQL adapters -- `SQLiteBackend`/`AsyncSQLiteBackend` at feature parity with `PostgresBackend`/`AsyncPostgresBackend` as of 0.19.0 (see [SQLite support](#sqlite-support)); `MySQLBackend` at full feature parity with `PostgresBackend` (including pooling and retry/metrics) as of 0.25.0, `AsyncMySQLBackend` matching `AsyncPostgresBackend`'s scope (see [MySQL support](#mysql-support)). SQLite has no pool by design (local file).
-- [x] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`, `zerobucket verify`)
+- [x] CLI (`zerobucket init`, `zerobucket migrate`, `zerobucket info`, `zerobucket verify`, `zerobucket tier`) on PostgreSQL, SQLite and MySQL/MariaDB, classic and dedup
 - [x] Optional object-storage backend for files that outgrow the database tier (`tier_to_object_storage()`, S3-compatible via `boto3` -- see [Object-storage tiering](#object-storage-tiering))
 - [x] Async client support (`AsyncZeroBucket`, via psycopg3's native async mode -- see [Async support](#async-support) for why this isn't literally the `asyncpg` package despite the name here historically)
 - [x] Batch operations (`put_many`/`get_many`/`delete_many`)

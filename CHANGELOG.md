@@ -6,6 +6,51 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## Python `zerobucket` [0.28.0] - 2026-11-03
+
+The Python CLI now does what the npm CLI does: it works on all three databases, in both modes, and can check images that were
+tiered to object storage.
+
+### Added
+
+- **`zerobucket init/migrate/info/verify/tier` work on SQLite and MySQL/MariaDB**, not only PostgreSQL. Choose the database with
+  `--database-url` (a `mysql://` or `mariadb://` URL selects MySQL/MariaDB, anything else is PostgreSQL) or the new `--sqlite PATH`,
+  or with the `ZEROBUCKET_DATABASE_URL` / `ZEROBUCKET_SQLITE_PATH` environment variables. Flags beat the environment; passing
+  both `--sqlite` and `--database-url`, or setting both variables, is a usage error (exit 2), as in the npm CLI.
+- **`--dedup` on every command** operates on the dedup-mode tables. `info --dedup` reports the distinct blobs and the physical bytes
+  saved; `init --dedup` creates the dedup tables. `tier --dedup` is refused (a deduplicated blob can be shared by many images).
+- **`verify --bucket ...`** (with `--endpoint-url`, `--region`, `--aws-access-key-id`, `--aws-secret-access-key`, the same options as
+  `tier`) also verifies images tiered to object storage: their bytes are read back from the bucket and checksummed. Without it,
+  tiered images are skipped and the run says how many and how to include them.
+- **`migrate --to-dedup [--skip-tiered]`** exposes the existing `migrate_classic_to_dedup()` on the command line (PostgreSQL only,
+  non-destructive, re-runnable). Unlike calling the function directly, the CLI refuses when classic images are tiered to object
+  storage unless `--skip-tiered` is given, matching npm. The function itself is unchanged.
+- **`info` shows more:** images tiered to object storage (classic mode), and a mode-appropriate on-disk size for each database.
+- **`get_info()` and `list_images()` on `PostgresBackend`, `SQLiteBackend` and `MySQLBackend`** (classic and dedup mode), the
+  methods the CLI is built on. `list_images(min_size=, older_than_days=, only_untiered=, limit=, sample=)` returns
+  `ImageListEntry(id, tiered)` rows, oldest first or a random sample; `get_info()` returns a `StorageInfo`, or `None` if the tables
+  don't exist yet. New types `StorageInfo`, `ImageListEntry`, `FormatStat`, `TieredStats`, `DedupStats` in `zerobucket.adapters.base`.
+  Custom backends are not required to implement them.
+- Tests: `tests/test_cli_backends.py` (59 tests: every command on SQLite, PostgreSQL and MySQL in both modes, tiered verification
+  against mocked S3 including a corrupted object, `migrate --to-dedup`, usage errors, and the two new backend methods).
+
+### Changed
+
+- **`verify` reads images through the backend** instead of raw PostgreSQL SQL, so it works the same on every database. Its note
+  about tiered images now reads "Note: N image(s) tiered to object storage were skipped. Pass --bucket (and credentials) to verify
+  them too." (it used to be appended to the OK line), and it now reports images it could not read as `ERROR` instead of crashing.
+- **The CLI no longer retries.** It opens backends with `max_retries=0` so a failure is reported promptly instead of after backoff
+  delays (this matters now that SQLite and the other adapters retry by default).
+- A connection problem is reported before any work starts, as `Error: could not connect: ...` with exit code 2.
+- `--sample`, `--limit`, `--min-size` and `--older-than` are validated (`--sample` and `--limit` must be >= 1, the others >= 0).
+- `info`, `verify` and `tier` on a SQLite path that does not exist report it and exit 1 instead of silently creating an empty file.
+
+### Known limits
+
+- `migrate --to-dedup` is PostgreSQL only (as in npm). A SQLite/MySQL version is not planned yet.
+- `tier --older-than` on MySQL compares against `UTC_TIMESTAMP()`, as the npm package does; the test suite runs on a UTC server, so a
+  non-UTC session timezone is not exercised by a test.
+
 ## django-zerobucket [0.1.1] - 2026-11-02
 
 Metadata only. No code change.
