@@ -441,7 +441,8 @@ def test_verify_does_not_crash_on_tiered_rows(images, s3_bucket, capsys):
     cmd_verify(_args(TEST_DATABASE_URL))
     out = capsys.readouterr().out
     assert "OK: all 1 image(s) verified" in out
-    assert "1 tiered image(s) skipped" in out
+    assert "1 image(s) tiered to object storage were skipped" in out
+    assert "Pass --bucket" in out
 
     images.delete(tiered_id)
     images.delete(plain_id)
