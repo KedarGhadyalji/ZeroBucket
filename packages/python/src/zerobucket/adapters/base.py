@@ -54,6 +54,68 @@ class StoredRecordMetadata:
     checksum_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class ImageListEntry:
+    """One row of `list_images()`: an image id, and whether its bytes live in
+    object storage (tiered) rather than in the database."""
+
+    id: str
+    tiered: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FormatStat:
+    mime_type: str
+    count: int
+    bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class TieredStats:
+    """Classic mode: images whose bytes currently live in object storage."""
+
+    count: int
+    bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class DedupStats:
+    """Dedup mode: distinct stored blobs and the bytes they physically occupy."""
+
+    blobs: int
+    stored_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class StorageInfo:
+    """Storage statistics for `zerobucket info`, returned by the built-in
+    adapters' `get_info()` (None when the tables don't exist yet)."""
+
+    mode: str  # "classic" or "dedup"
+    count: int  # number of images (references, in dedup mode)
+    total_bytes: int  # sum of every image's size_bytes: the logical size
+    oldest: str | None
+    newest: str | None
+    on_disk: str | None  # human-readable, if the database can tell
+    by_format: tuple[FormatStat, ...]
+    tiered: TieredStats | None = None  # classic mode only
+    dedup: DedupStats | None = None  # dedup mode only
+
+
+def pretty_size(num_bytes: int) -> str:
+    """1024-based, like PostgreSQL's pg_size_pretty and npm's prettySize:
+    "812 bytes", "13.2 kB", "4.0 MB"."""
+    if num_bytes < 1024:
+        return f"{num_bytes} bytes"
+    value = num_bytes / 1024
+    units = ("kB", "MB", "GB", "TB")
+    index = 0
+    while value >= 1024 and index < len(units) - 1:
+        value /= 1024
+        index += 1
+    return f"{value:.1f} {units[index]}"
+
+
 class StorageBackend(ABC):
     """Abstract interface every ZeroBucket storage adapter must implement."""
 

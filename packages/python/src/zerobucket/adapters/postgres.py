@@ -48,7 +48,16 @@ from psycopg_pool import ConnectionPool
 from .._ids import is_valid_id
 from ..exceptions import StorageError
 from ..object_storage import ObjectStorage
-from .base import StorageBackend, StoredRecord, StoredRecordMetadata
+from .base import (
+    DedupStats,
+    FormatStat,
+    ImageListEntry,
+    StorageBackend,
+    StorageInfo,
+    StoredRecord,
+    StoredRecordMetadata,
+    TieredStats,
+)
 
 # 1 MiB. Default chunk size for get_stream() -- small enough to keep
 # Python-side peak memory low, large enough to keep the per-chunk
@@ -1206,6 +1215,150 @@ class PostgresBackend(StorageBackend):
             return self._run(connection, work, operation="exists")
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to check image existence: {exc}") from exc
+
+    # ---- maintenance (used by the CLI) ----------------------------------
+
+    def get_info(self) -> StorageInfo | None:
+        """Storage statistics for `zerobucket info`, or None if the tables
+        don't exist yet. Works in classic and dedup mode."""
+        dedup = self._dedup
+
+        def work(cur):
+            image_table = "zerobucket_image_refs" if dedup else "zerobucket_images"
+            cur.execute(
+                "SELECT to_regclass(%s), to_regclass('zerobucket_blobs');",
+                (image_table,),
+            )
+            present, blobs_present = cur.fetchone()
+            if present is None or (dedup and blobs_present is None):
+                return None
+            frm = (
+                "FROM zerobucket_image_refs r JOIN zerobucket_blobs b "
+                "ON r.checksum_sha256 = b.checksum_sha256"
+                if dedup
+                else "FROM zerobucket_images"
+            )
+            size = "b.size_bytes" if dedup else "size_bytes"
+            created = "r.created_at" if dedup else "created_at"
+            mime = "b.mime_type" if dedup else "mime_type"
+            cur.execute(
+                f"SELECT count(*), coalesce(sum({size}), 0), min({created}), "
+                f"max({created}) {frm};"
+            )
+            count, total_bytes, oldest, newest = cur.fetchone()
+            if dedup:
+                cur.execute(
+                    "SELECT pg_size_pretty(pg_total_relation_size('zerobucket_blobs') "
+                    "+ pg_total_relation_size('zerobucket_image_refs'));"
+                )
+            else:
+                cur.execute(
+                    "SELECT pg_size_pretty(pg_total_relation_size('zerobucket_images'));"
+                )
+            on_disk = cur.fetchone()[0]
+            cur.execute(
+                f"SELECT {mime}, count(*), coalesce(sum({size}), 0) {frm} "
+                f"GROUP BY {mime} ORDER BY count(*) DESC, {mime};"
+            )
+            by_format = tuple(
+                FormatStat(m, int(n), int(b)) for m, n, b in cur.fetchall()
+            )
+            tiered = dedup_stats = None
+            if dedup:
+                cur.execute(
+                    "SELECT count(*), coalesce(sum(size_bytes), 0) FROM zerobucket_blobs;"
+                )
+                n, b = cur.fetchone()
+                dedup_stats = DedupStats(int(n), int(b))
+            else:
+                cur.execute(
+                    "SELECT count(*), coalesce(sum(size_bytes), 0) FROM zerobucket_images "
+                    "WHERE storage_backend = 'object_storage';"
+                )
+                n, b = cur.fetchone()
+                tiered = TieredStats(int(n), int(b))
+            return StorageInfo(
+                mode="dedup" if dedup else "classic",
+                count=int(count),
+                total_bytes=int(total_bytes),
+                oldest=None if oldest is None else str(oldest),
+                newest=None if newest is None else str(newest),
+                on_disk=on_disk,
+                by_format=by_format,
+                tiered=tiered,
+                dedup=dedup_stats,
+            )
+
+        try:
+            return self._run(None, work, operation="info")
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to read storage info: {exc}") from exc
+
+    def list_images(
+        self,
+        *,
+        min_size: int | None = None,
+        older_than_days: int | None = None,
+        only_untiered: bool = False,
+        limit: int | None = None,
+        sample: int | None = None,
+    ) -> list[ImageListEntry]:
+        """Ids matching the filters, oldest first (or a random `sample`).
+        Used by the CLI's verify and tier. `only_untiered` keeps only images
+        whose bytes are still in the database; it has no effect in dedup
+        mode, which has no tiering."""
+        for name, value in (
+            ("min_size", min_size),
+            ("older_than_days", older_than_days),
+            ("limit", limit),
+            ("sample", sample),
+        ):
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        dedup = self._dedup
+        size = "b.size_bytes" if dedup else "size_bytes"
+        created = "r.created_at" if dedup else "created_at"
+        id_col = "r.id" if dedup else "id"
+        where: list[str] = []
+        params: list[object] = []
+        if min_size is not None:
+            where.append(f"{size} >= %s")
+            params.append(min_size)
+        if older_than_days is not None:
+            where.append(f"{created} <= now() - make_interval(days => %s::int)")
+            params.append(older_than_days)
+        if only_untiered and not dedup:
+            where.append("storage_backend = 'postgres'")
+        frm = (
+            "FROM zerobucket_image_refs r JOIN zerobucket_blobs b "
+            "ON r.checksum_sha256 = b.checksum_sha256"
+            if dedup
+            else "FROM zerobucket_images"
+        )
+        tier = "false" if dedup else "(storage_backend = 'object_storage')"
+        order = (
+            "ORDER BY random()"
+            if sample is not None
+            else f"ORDER BY {created}, {id_col}"
+        )
+        cap = sample if sample is not None else limit
+        sql = f"SELECT {id_col}, {tier} {frm}"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" {order}"
+        if cap is not None:
+            sql += " LIMIT %s"
+            params.append(cap)
+
+        def work(cur):
+            cur.execute(sql + ";", params)
+            return cur.fetchall()
+
+        try:
+            rows = self._run(None, work, operation="list_images")
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to list images: {exc}") from exc
+        return [ImageListEntry(str(r[0]), bool(r[1])) for r in rows]
 
     def close(self) -> None:
         self._pool.close()
