@@ -14,6 +14,11 @@ from __future__ import annotations
 import os
 from urllib.parse import unquote, urlparse
 
+from ._dotenv import load_dotenv
+
+# Read ZEROBUCKET_* settings from the repository's .env first (see _dotenv.py).
+DOTENV_LOADED = load_dotenv()
+
 SECRET_KEY = "test-secret-key-not-for-production"
 DEBUG = True
 ALLOWED_HOSTS = ["*"]

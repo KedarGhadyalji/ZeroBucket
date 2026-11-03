@@ -18,7 +18,13 @@ import pytest
 from PIL import Image as PILImage
 
 from django_zerobucket.storage import _client_cache
-from tests.django_settings import ZEROBUCKET_DATABASE_URL
+from tests.django_settings import DOTENV_LOADED, ZEROBUCKET_DATABASE_URL
+
+
+def pytest_report_header(config):
+    if DOTENV_LOADED:
+        return "zerobucket: settings read from .env: " + ", ".join(DOTENV_LOADED)
+    return None
 
 
 @pytest.fixture(autouse=True)

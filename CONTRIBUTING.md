@@ -57,7 +57,9 @@ automatically (and `.env.local`, and the same two files inside `packages/typescr
 - On Windows, create `.env` in an editor and save it as UTF-8. The loader also reads UTF-16, which PowerShell's `echo ... > .env`
   writes, and it warns if the file is really called `.env.txt` (Notepad adds that silently; turn on "File name extensions" in
   Explorer to see it).
-- The Python tests do not read `.env` yet; set the variables in your shell for those.
+- The Python and Django tests read the same `.env` (the `ZEROBUCKET_*` keys only; a value in `.env` wins over one set in your
+  shell, as for npm). Run `pytest` without `-q` and its first lines say which keys were read (never their values). Nothing needs to be `set`
+  per terminal window any more.
 
 ## Before submitting a PR
 

@@ -87,6 +87,16 @@ attribute 'blobopen'`. The method used `Connection.blobopen()`, which only exist
   failed, with PostgreSQL 16 and MariaDB 10.11 live. On Python 3.12: 487 passed. Lint clean (`ruff check src tests`).
 - Not changed: the author e-mail in `pyproject.toml` is still the `your-email@example.com` placeholder.
 
+## Repository changes with no package release (Python and Django tests)
+
+- **The Python and `django-zerobucket` test suites now read the repository's `.env`**, the way the npm tests already did. Before,
+  `pytest` ignored `.env`: with the variables only in `.env`, the PostgreSQL and MySQL tests were silently skipped (Python) or the
+  run crashed with `password authentication failed for user "postgres"` (Django, which fell back to `postgres:postgres`).
+  Same rules as npm: only `ZEROBUCKET_*` keys, a value in `.env` wins over the shell, an empty value is ignored, passwords are never
+  printed. A `pytest` run without `-q` names the keys it read in its header. `tests/_dotenv.py` (no new dependency; a copy lives in each package's
+  `tests/`) plus `tests/test_dotenv.py` (5 tests). `.env.example` and `CONTRIBUTING.md` no longer say the Python tests ignore `.env`.
+- No change to the published `zerobucket` or `django-zerobucket` packages.
+
 ## Repository and CI changes with no package release (npm)
 
 - **The npm CI conformance step failed with `Checksum mismatch ... in response header "content-md5"`.** Reproduced with the CI's

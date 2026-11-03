@@ -37,6 +37,12 @@ if sys.platform == "win32":
 
 from zerobucket import AsyncZeroBucket, ZeroBucket
 
+from ._dotenv import load_dotenv
+
+# Read ZEROBUCKET_* settings from the repository's .env BEFORE anything below (or any
+# test module, which conftest is imported ahead of) reads os.environ.
+_DOTENV_LOADED = load_dotenv()
+
 TEST_DATABASE_URL = os.environ.get(
     "ZEROBUCKET_TEST_DATABASE_URL",
     "postgresql://postgres:postgres@localhost:5432/zerobucket_test",
@@ -85,15 +91,24 @@ def _redacted_url() -> str:
 
 
 def pytest_report_header(config):
+    lines = []
+    if _DOTENV_LOADED:
+        lines.append(
+            "zerobucket: settings read from .env: " + ", ".join(_DOTENV_LOADED)
+        )
     problem = _db_problem()
     if problem is None:
-        return f"zerobucket: PostgreSQL reachable ({_redacted_url()})"
-    return (
-        f"zerobucket: PostgreSQL NOT reachable ({_redacted_url()}): {problem}\n"
-        "zerobucket: every test that needs it will be SKIPPED, not failed. "
-        "Fix ZEROBUCKET_TEST_DATABASE_URL (note `set` only lasts for one "
-        "command window)."
-    )
+        lines.append(f"zerobucket: PostgreSQL reachable ({_redacted_url()})")
+    else:
+        lines.append(
+            f"zerobucket: PostgreSQL NOT reachable ({_redacted_url()}): {problem}"
+        )
+        lines.append(
+            "zerobucket: every test that needs it will be SKIPPED, not failed. "
+            "Fix ZEROBUCKET_TEST_DATABASE_URL in .env (or in your shell; `set` only "
+            "lasts for one command window)."
+        )
+    return lines
 
 
 @pytest.fixture(scope="session")
