@@ -1418,8 +1418,10 @@ class MySQLBackend(StorageBackend):
         (i.e. after the MySQL row is already gone), same deliberate
         ordering as the Postgres adapter: the row being gone is what
         makes the image correctly "not found" from here on regardless
-        of whether the S3 delete below succeeds; a failure here leaves
-        a harmless orphaned object, not a data-integrity problem."""
+        of whether the S3 delete below succeeds. A failure there NEVER
+        fails the delete (0.29.0): it leaves a harmless orphaned object,
+        not a data-integrity problem, and is reported to on_operation as
+        an "object_storage_delete" event."""
         if self._dedup:
             return self._delete_dedup(image_id, connection=connection)
 
@@ -1448,7 +1450,7 @@ class MySQLBackend(StorageBackend):
             and storage_backend == "object_storage"
             and self._object_storage is not None
         ):
-            self._object_storage.delete(object_storage_key)
+            self._delete_tiered_object(object_storage_key)
         return True
 
     def _delete_dedup(
@@ -1552,7 +1554,7 @@ class MySQLBackend(StorageBackend):
                 and storage_backend == "object_storage"
                 and self._object_storage is not None
             ):
-                self._object_storage.delete(object_storage_key)
+                self._delete_tiered_object(object_storage_key)
         return deleted_ids
 
     def _delete_many_dedup(

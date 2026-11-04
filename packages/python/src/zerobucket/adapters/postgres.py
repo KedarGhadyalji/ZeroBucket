@@ -323,7 +323,13 @@ class OperationEvent:
 
     operation: one of "put", "put_many", "get", "get_stream",
         "get_many", "get_metadata", "delete", "delete_many", "exists",
-        "migrate", "tier_to_object_storage". A single get_stream() call reports one event per
+        "migrate", "tier_to_object_storage", "info", "list_images",
+        "object_storage_delete". "object_storage_delete" is reported
+        separately, right after the "delete" / "delete_many" event, once
+        per tiered image whose object was removed; success=False there means
+        an orphaned object was left behind in the bucket (the delete itself
+        still succeeded -- see StorageBackend._delete_tiered_object()).
+        A single get_stream() call reports one event per
         chunk fetched (plus one for the initial metadata lookup used to
         learn the total size), not one event for the whole stream --
         each is a genuinely separate round trip, so this is consistent
@@ -1078,20 +1084,23 @@ class PostgresBackend(StorageBackend):
             # that case the object is left for the caller to remove after
             # committing (ObjectStorage.delete(key)).
             #
-            # Best-effort, AFTER the Postgres row is already gone -- a
-            # deliberate ordering choice, not an oversight. The row being
-            # gone is what makes the image correctly "not found" to every
-            # caller from here on, regardless of whether this S3 delete
-            # below succeeds; if it fails, the result is a harmless
-            # orphaned object costing a few cents, not a data-integrity
-            # problem (contrast: deleting from S3 FIRST and having the
-            # Postgres DELETE fail afterward would leave a row that
-            # claims to exist but points at nothing -- a worse failure
-            # mode). If this backend has no object_storage configured at
-            # all, the orphan is simply left behind with no attempt --
-            # documented as a stated limitation (see class docstring),
-            # not silently swallowed.
-            self._object_storage.delete(object_storage_key)
+            # AFTER the Postgres row is already gone, and a failure here
+            # NEVER fails the delete (0.29.0) -- both deliberate. The row
+            # being gone is what makes the image correctly "not found" to
+            # every caller from here on, whether or not this S3 delete
+            # succeeds; if it fails, the result is a harmless orphaned
+            # object costing a few cents, not a data-integrity problem
+            # (contrast: deleting from S3 FIRST and having the Postgres
+            # DELETE fail afterward would leave a row that claims to exist
+            # but points at nothing -- a worse failure mode). Raising here
+            # would tell the caller the image still exists when it does
+            # not, so the failure is reported instead as an
+            # "object_storage_delete" on_operation event (see
+            # StorageBackend._delete_tiered_object()). If this backend has
+            # no object_storage configured at all, the orphan is simply
+            # left behind with no attempt -- documented as a stated
+            # limitation (see class docstring), not silently swallowed.
+            self._delete_tiered_object(object_storage_key)
         return True
 
     def _delete_dedup(
@@ -1149,11 +1158,11 @@ class PostgresBackend(StorageBackend):
                 and storage_backend == "object_storage"
                 and self._object_storage is not None
             ):
-                # Same best-effort, after-the-fact ordering as delete()
-                # above, one at a time -- not batched into a single S3
-                # DeleteObjects call in this first pass. See delete()'s
-                # docstring for the ordering reasoning.
-                self._object_storage.delete(object_storage_key)
+                # Same after-the-fact, never-fails-the-delete ordering as
+                # delete() above, one at a time -- not batched into a
+                # single S3 DeleteObjects call in this first pass. See the
+                # comment in delete() for the reasoning.
+                self._delete_tiered_object(object_storage_key)
         return deleted_ids
 
     def _delete_many_dedup(

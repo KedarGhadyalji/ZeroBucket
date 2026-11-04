@@ -780,8 +780,11 @@ class ZeroBucket:
         this image_id keep working exactly the same from the caller's
         side -- the whole point of transparent tiering. delete() also
         keeps working, and additionally cleans up the object-storage
-        copy (best-effort, after the Postgres row is already gone -- see
-        PostgresBackend.delete()'s docstring for why that ordering was
+        copy, after the row is already gone. That cleanup can never make
+        the delete fail (0.29.0): if the object delete fails, only an
+        orphaned object is left behind, and the failure is reported to
+        `on_operation` as an event named "object_storage_delete". See the
+        comment in PostgresBackend.delete() for why that ordering was
         chosen).
         """
         # tier_to_object_storage() is deliberately NOT part of the

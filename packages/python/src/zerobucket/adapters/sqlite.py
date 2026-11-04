@@ -1066,11 +1066,12 @@ class SQLiteBackend(StorageBackend):
             and storage_backend == "object_storage"
             and self._object_storage is not None
         ):
-            # Same best-effort, after-the-fact ordering as PostgresBackend's
-            # delete() -- see its docstring for the reasoning (a harmless
-            # orphaned S3 object beats a row that claims to exist but
-            # points at nothing).
-            self._object_storage.delete(object_storage_key)
+            # Same after-the-fact, never-fails-the-delete ordering as
+            # PostgresBackend's delete() -- see the comment there (a
+            # harmless orphaned S3 object beats a row that claims to exist
+            # but points at nothing). A failed object delete is reported as
+            # an "object_storage_delete" on_operation event, not raised.
+            self._delete_tiered_object(object_storage_key)
         return True
 
     def _delete_dedup(
@@ -1128,7 +1129,7 @@ class SQLiteBackend(StorageBackend):
                 and storage_backend == "object_storage"
                 and self._object_storage is not None
             ):
-                self._object_storage.delete(object_storage_key)
+                self._delete_tiered_object(object_storage_key)
         return deleted_ids
 
     def _delete_many_dedup(
