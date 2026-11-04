@@ -6,6 +6,40 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## Python `zerobucket` [0.29.0] - 2026-11-03
+
+A behaviour change: deleting a tiered image no longer fails when the object cleanup fails. This is the same behaviour the npm
+package has had since it gained tiering.
+
+### Changed (behaviour change)
+
+- **`delete()` and `delete_many()` no longer raise when removing a tiered image's object from object storage fails.** The row is
+  deleted first, so by the time the object is removed the image is already "not found" to every caller. Before, a failed object
+  delete raised `StorageError` after the row was gone, which told the caller the image still existed when it did not (and, for
+  `delete_many()`, abandoned the rest of the batch's cleanup). Now the delete returns normally and the only consequence is an
+  orphaned object in the bucket (a few cents, not a data-integrity problem).
+- **The failure is reported instead of raised:** `on_operation` receives an event named `"object_storage_delete"`, once per tiered
+  image whose object was removed, with `success=False` and the error text when it failed (and `success=True` when it worked).
+  Alert on `success=False` to find orphans. Applies to `PostgresBackend`, `SQLiteBackend` and `MySQLBackend`, in `delete()` and
+  `delete_many()`.
+- **Unchanged:** with `connection=` the object is still left for you to remove after you commit, and nothing is attempted or
+  reported. Dedup mode and the async adapters have no tiering and are unaffected.
+
+### Migration note
+
+If you relied on `delete()` raising when the bucket was unreachable, that no longer happens. Watch for `"object_storage_delete"`
+events with `success=False` instead. An orphaned object is removed with `ObjectStorage.delete(key)` (the key is the image id).
+
+### Added
+
+- `StorageBackend._delete_tiered_object()` (internal): the one place the cleanup, the swallowing and the reporting live, shared by
+  the three adapters so they cannot drift apart.
+- `OperationEvent`'s docstring and the README now list every operation name, including `"info"`, `"list_images"` (0.28.0) and
+  `"object_storage_delete"`.
+- Tests: `tests/test_tier_delete_failure.py` (22 tests, every scenario on SQLite, PostgreSQL and MySQL: an injected failure, a REAL
+  failure from removing the bucket, a partial failure in `delete_many()`, successful cleanup reporting, untiered and missing ids, a
+  callback that raises, and `connection=` still skipping the cleanup).
+
 ## Python `zerobucket` [0.28.0] - 2026-11-03
 
 The Python CLI now does what the npm CLI does: it works on all three databases, in both modes, and can check images that were

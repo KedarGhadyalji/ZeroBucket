@@ -287,7 +287,8 @@ asked and decided, not assumed):
   given image's bytes live in Postgres or in object storage -- your
   application code never needs a separate code path. `delete()`
   additionally cleans up the object-storage copy when deleting a tiered
-  image.
+  image. That cleanup can never make the delete fail (see "Tiered images
+  and `delete(connection=...)`" below).
 - **Not available in dedup mode in this first pass.** Combining
   content-addressed storage (one blob shared by many ids) with tiering
   (a specific blob's bytes living in one place or the other) was judged
@@ -780,6 +781,19 @@ to `delete()` or `delete_many()`, the object-storage copy of a tiered image is
 After you commit, remove it yourself with `ObjectStorage.delete(key)`. Without
 `connection=`, the object is removed automatically after the row delete commits.
 
+**A failed cleanup never fails the delete (0.29.0).** The row is deleted first, so
+once `delete()` or `delete_many()` returns the image is gone: `exists()` is
+`False` and `get()` raises `ImageNotFoundError`. If removing the object from the
+bucket then fails (the service is down, the credentials expired, the bucket was
+removed), nothing is raised, because that would tell you the image still exists
+when it does not. The only consequence is an orphaned object left in the bucket,
+which costs a few cents and is not a data-integrity problem. The failure is
+reported to your `on_operation` callback as an event named
+`"object_storage_delete"` with `success=False` and the error text, so you can
+alert on it and clean the orphan up later. A successful cleanup is reported the
+same way with `success=True`. Before 0.29.0 the same failure raised
+`StorageError` after the row was already gone.
+
 Without `connection=`, this is exactly the "orphaned upload, DB row never
 got created" class of bug that a separate object-storage service is also
 prone to -- the _possibility_ of avoiding it is one of the real
@@ -971,7 +985,10 @@ images = ZeroBucket(database_url=DATABASE_URL, on_operation=on_operation)
 
 `operation` is one of `"put"`, `"put_many"`, `"get"`, `"get_stream"`,
 `"get_many"`, `"get_metadata"`, `"delete"`, `"delete_many"`, `"exists"`,
-`"migrate"` -- dedup-mode operations report the same names as their
+`"migrate"`, `"tier_to_object_storage"`, `"info"`, `"list_images"` and
+`"object_storage_delete"` (a tiered image's object being removed after its
+row was deleted; `success=False` there means an orphaned object was left in
+the bucket, and the delete itself still succeeded) -- dedup-mode operations report the same names as their
 classic-mode counterparts, since from a metrics perspective it's still
 logically the same operation regardless of storage mode underneath. Note
 that a single `get_stream()` call emits one `get_metadata` event (the
