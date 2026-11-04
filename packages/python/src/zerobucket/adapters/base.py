@@ -22,6 +22,7 @@ type in their own implementation.
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -118,6 +119,31 @@ def pretty_size(num_bytes: int) -> str:
 
 class StorageBackend(ABC):
     """Abstract interface every ZeroBucket storage adapter must implement."""
+
+    def _delete_tiered_object(self, key: str | None) -> None:
+        """Remove a tiered image's object from object storage AFTER its
+        database row is already gone. Used by the built-in adapters'
+        delete() and delete_many(); they must have `_object_storage` and
+        `_emit`.
+
+        A failure here NEVER fails the delete (0.29.0). Once the row is gone
+        the image is correctly "not found" to every caller, so a failed
+        object delete leaves only a harmless orphaned object; raising would
+        tell the caller the image still exists when it does not. The outcome
+        is reported to `on_operation` as an event named
+        "object_storage_delete" (success=False with the error text on
+        failure), so a failure can be alerted on and the orphan cleaned up.
+        """
+        store = getattr(self, "_object_storage", None)
+        if store is None or key is None:
+            return
+        start = time.monotonic()
+        try:
+            store.delete(key)
+        except Exception as exc:  # noqa: BLE001
+            self._emit("object_storage_delete", start, False, str(exc), 0)  # type: ignore[attr-defined]
+        else:
+            self._emit("object_storage_delete", start, True, None, 0)  # type: ignore[attr-defined]
 
     @abstractmethod
     def put(
