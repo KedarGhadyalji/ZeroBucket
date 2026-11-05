@@ -15,6 +15,8 @@ connection.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 
@@ -23,6 +25,24 @@ from .base import StoredRecord, StoredRecordMetadata
 
 class AsyncStorageBackend(ABC):
     """Abstract interface an async ZeroBucket storage adapter implements."""
+
+    async def _delete_tiered_object(self, key: str | None) -> None:
+        """Async counterpart of StorageBackend._delete_tiered_object() (0.29.0):
+        remove a tiered image's object AFTER its row is already gone, swallow
+        any failure, and report it as an "object_storage_delete" on_operation
+        event. The blocking boto3 call runs in a worker thread so it never
+        stalls the event loop. Adapters using this must have
+        `_object_storage` and `_emit`."""
+        store = getattr(self, "_object_storage", None)
+        if store is None or key is None:
+            return
+        start = time.monotonic()
+        try:
+            await asyncio.to_thread(store.delete, key)
+        except Exception as exc:  # noqa: BLE001
+            self._emit("object_storage_delete", start, False, str(exc), 0)  # type: ignore[attr-defined]
+        else:
+            self._emit("object_storage_delete", start, True, None, 0)  # type: ignore[attr-defined]
 
     @abstractmethod
     async def put(
