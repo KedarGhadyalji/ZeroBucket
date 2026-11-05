@@ -3,14 +3,13 @@
 PHASE 4 of MySQL's multi-phase build (see mysql.py's own module
 docstring for phases 1-3: core CRUD, streaming + tiering, dedup mode).
 Scope matches `AsyncPostgresBackend`'s and `AsyncSQLiteBackend`'s
-established scope EXACTLY, not by accident: core CRUD + streaming,
-classic mode only. NOT implemented, same as both other async adapters
-and tracked the same way: `dedup=True`, `tier_to_object_storage()` as
-a caller-facing operation, `connection=` transaction participation.
-This mirrors `AsyncSQLiteBackend`'s own documented scope decision
-rather than inventing a wider one for MySQL -- consistency across all
-three async adapters was judged more valuable than matching sync
-MySQL's fuller (Phase 1-3) feature set.
+established scope EXACTLY, not by accident: core CRUD + streaming, and --
+since 0.30.0 -- `dedup=True` (content-addressed storage) and
+`object_storage=` tiering with `tier_to_object_storage()`, as in the sync
+adapter and, as there, not both at once. NOT implemented, same as both
+other async adapters: `connection=` transaction participation. The
+blocking object-storage SDK (boto3) runs in worker threads
+(`asyncio.to_thread`), never on the event loop.
 
 **0.27.0 added the `on_operation` metrics hook and automatic
 retry/backoff** (`max_retries`, `retry_base_delay`, `on_operation`),
@@ -74,24 +73,11 @@ table this adapter creates/migrates is schema-compatible with the sync
 callers can't use tiering themselves (no `object_storage=` parameter
 here -- see scope above).
 
-**A REAL, INHERITED LIMITATION, not new to this adapter**, stated
-plainly rather than silently carried forward: `get()`/`get_many()`
-reuse sync `MySQLBackend`'s tiering-aware `_SELECT_FULL` (which selects
-`storage_backend`/`object_storage_key` alongside `data`), the exact
-same thing `AsyncPostgresBackend` does with Postgres's equivalent
-query. If an image was tiered via the SYNC client, fetching it through
-THIS async adapter will fail with an unhelpful `bytes(None)`-shaped
-`TypeError` wrapped in `StorageError`, rather than a clean, specific
-message -- this adapter has no `ObjectStorage` to resolve the tiered
-bytes with. This mirrors `AsyncPostgresBackend`'s own documented
-behavior exactly (consistency across the three async adapters, not a
-new gap introduced here) -- deliberately not special-cased away in
-this pass, since fixing it well means either adding `object_storage=`
-to every async adapter's scope at once (out of scope for this single
-phase) or giving MySQL a nicer error the other two async adapters
-don't have (inconsistent, and would make the three adapters diverge
-for no caller-visible benefit). Tracked here honestly so a future pass
-fixes all three consistently, not one at a time.
+**Tiered images (0.30.0):** `get()`/`get_many()`/`get_stream()` read an
+image whose row says it lives in object storage back from the bucket, which
+needs `object_storage=` on this backend; a clear StorageError says so if it
+is missing. Before 0.30.0 such a read failed with an unhelpful
+`bytes(None)`-shaped TypeError, because this adapter had no ObjectStorage.
 
 `RETURNING` is NOT used, same reason as the sync adapter (real MySQL
 8.0 doesn't support it on any statement -- see mysql.py's module
@@ -100,10 +86,10 @@ docstring): `put()`/`put_many()` generate the id in Python before the
 then `DELETE` inside one transaction to learn exactly which ids
 existed and were removed -- same shape as sync `MySQLBackend
 .delete_many()`, purely to know which ids to report back without
-RETURNING, NOT for any tiering-related reason: this adapter does no
-object-storage cleanup on delete at all (same inherited scope gap as
-`AsyncPostgresBackend`, which also doesn't clean up tiered objects on
-delete -- see the limitation above).
+RETURNING. Since 0.30.0 it also reports each deleted row's
+`storage_backend`/`object_storage_key`, so a deleted TIERED image's object
+is removed after the row is gone; a failed cleanup never fails the delete
+(see `_delete_tiered_object`).
 
 `get_stream()` uses the exact same `SUBSTRING(data FROM ... FOR ...)`
 ranged-read strategy as the sync adapter -- confirmed to work
@@ -133,21 +119,34 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections import Counter
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING
 
 from ..exceptions import StorageError
+from ..object_storage import ObjectStorage
 from .base import StoredRecord, StoredRecordMetadata
 from .base_async import AsyncStorageBackend
 from .mysql import (
+    _DEDUP_EXISTS,
+    _DEDUP_INSERT_REF,
+    _DEDUP_SCHEMA_BLOBS,
+    _DEDUP_SCHEMA_REFS,
+    _DEDUP_SELECT_CHUNK,
+    _DEDUP_SELECT_FULL,
+    _DEDUP_SELECT_METADATA,
+    _DEDUP_STREAM_INFO,
+    _DEDUP_UPSERT_BLOB,
     _DELETE,
     _EXISTS,
     _INSERT,
     _SCHEMA,
     _SELECT_CHUNK,
+    _SELECT_FOR_TIERING,
     _SELECT_FULL,
     _SELECT_METADATA,
     _SELECT_STREAM_INFO,
+    _UPDATE_AFTER_TIERING,
     DEFAULT_STREAM_CHUNK_SIZE,
     _backoff_delay,
     _now,
@@ -204,7 +203,14 @@ class AsyncMySQLBackend(AsyncStorageBackend):
         max_retries: int = 3,
         retry_base_delay: float = 0.1,
         on_operation: Callable[[OperationEvent], None] | None = None,
+        dedup: bool = False,
+        object_storage: ObjectStorage | None = None,
     ) -> None:
+        if object_storage is not None and dedup:
+            raise ValueError(
+                "object_storage= is not supported together with dedup=True "
+                "in this first pass -- see MySQLBackend's docstring."
+            )
         self._connect_kwargs = _parse_database_url(database_url)
         self._auto_migrate = auto_migrate
         self._pool_min_size = pool_min_size
@@ -213,6 +219,8 @@ class AsyncMySQLBackend(AsyncStorageBackend):
         self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
         self._on_operation = on_operation
+        self._dedup = dedup
+        self._object_storage = object_storage
         self._ready = False
         self._ready_lock = asyncio.Lock()
         self._aiomysql = None  # set in _ensure_ready, once import succeeds
@@ -267,8 +275,12 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 try:
                     conn = await self._acquire()
                     async with conn.cursor() as cur:
-                        await cur.execute(_SCHEMA)
-                        await _migrate_tiering_async(cur)
+                        if self._dedup:
+                            await cur.execute(_DEDUP_SCHEMA_BLOBS)
+                            await cur.execute(_DEDUP_SCHEMA_REFS)
+                        else:
+                            await cur.execute(_SCHEMA)
+                            await _migrate_tiering_async(cur)
                     await conn.commit()
                     self._emit("migrate", migrate_start, True, None, 0)
                 except Exception as exc:  # noqa: BLE001
@@ -411,24 +423,48 @@ class AsyncMySQLBackend(AsyncStorageBackend):
         image_id = str(uuid.uuid4())
         now = _now()
 
-        async def work(conn):
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    _INSERT,
-                    (
-                        image_id,
-                        data,
-                        mime_type,
-                        original_filename,
-                        size_bytes,
-                        width,
-                        height,
-                        checksum_sha256,
-                        now,
-                        now,
-                    ),
-                )
-            return image_id
+        if self._dedup:
+
+            async def work(conn):
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        _DEDUP_UPSERT_BLOB,
+                        (
+                            checksum_sha256,
+                            data,
+                            mime_type,
+                            size_bytes,
+                            width,
+                            height,
+                            now,
+                        ),
+                    )
+                    await cur.execute(
+                        _DEDUP_INSERT_REF,
+                        (image_id, checksum_sha256, original_filename, now, now),
+                    )
+                return image_id
+
+        else:
+
+            async def work(conn):
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        _INSERT,
+                        (
+                            image_id,
+                            data,
+                            mime_type,
+                            original_filename,
+                            size_bytes,
+                            width,
+                            height,
+                            checksum_sha256,
+                            now,
+                            now,
+                        ),
+                    )
+                return image_id
 
         try:
             return await self._run(work, operation="put")
@@ -438,10 +474,6 @@ class AsyncMySQLBackend(AsyncStorageBackend):
             raise StorageError(f"Failed to store image: {exc}") from exc
 
     async def put_many(self, rows: list[dict]) -> list[str]:
-        """One transaction for the whole batch, each row its own
-        execute() -- same shape as the sync adapter's put_many(), same
-        reasoning (no RETURNING-based pipelining to chase here, see
-        module docstring)."""
         if not rows:
             return []
         now = _now()
@@ -449,22 +481,51 @@ class AsyncMySQLBackend(AsyncStorageBackend):
 
         async def work(conn):
             async with conn.cursor() as cur:
-                for image_id, row in prepared:
-                    await cur.execute(
-                        _INSERT,
-                        (
-                            image_id,
-                            row["data"],
-                            row["mime_type"],
-                            row["original_filename"],
-                            row["size_bytes"],
-                            row["width"],
-                            row["height"],
-                            row["checksum_sha256"],
-                            now,
-                            now,
-                        ),
-                    )
+                if self._dedup:
+                    # Blobs in sorted checksum order (one global lock order, so
+                    # overlapping batches cannot deadlock), refs in the caller's
+                    # order so the returned ids line up with `rows`.
+                    for row in sorted(rows, key=lambda r: r["checksum_sha256"]):
+                        await cur.execute(
+                            _DEDUP_UPSERT_BLOB,
+                            (
+                                row["checksum_sha256"],
+                                row["data"],
+                                row["mime_type"],
+                                row["size_bytes"],
+                                row["width"],
+                                row["height"],
+                                now,
+                            ),
+                        )
+                    for image_id, row in prepared:
+                        await cur.execute(
+                            _DEDUP_INSERT_REF,
+                            (
+                                image_id,
+                                row["checksum_sha256"],
+                                row["original_filename"],
+                                now,
+                                now,
+                            ),
+                        )
+                else:
+                    for image_id, row in prepared:
+                        await cur.execute(
+                            _INSERT,
+                            (
+                                image_id,
+                                row["data"],
+                                row["mime_type"],
+                                row["original_filename"],
+                                row["size_bytes"],
+                                row["width"],
+                                row["height"],
+                                row["checksum_sha256"],
+                                now,
+                                now,
+                            ),
+                        )
             return [image_id for image_id, _ in prepared]
 
         try:
@@ -476,15 +537,41 @@ class AsyncMySQLBackend(AsyncStorageBackend):
 
     # ---- get --------------------------------------------------------------
 
+    async def _fetch_tiered_bytes(
+        self, object_storage_key: str, *, image_id: str
+    ) -> bytes:
+        """The row says this image lives in object storage: fetch the bytes
+        (the blocking boto3 download runs in a worker thread)."""
+        if self._object_storage is None:
+            raise StorageError(
+                f"Image {image_id!r} is stored in object storage (key="
+                f"{object_storage_key!r}) but this AsyncMySQLBackend was "
+                "constructed without object_storage=... -- configure it "
+                "with the same bucket/credentials used to tier this image."
+            )
+        return await asyncio.to_thread(
+            self._object_storage.download, object_storage_key
+        )
+
+    @staticmethod
+    def _record(row, data) -> StoredRecord:
+        return StoredRecord(
+            id=str(row[0]),
+            data=bytes(data),
+            mime_type=row[2],
+            original_filename=row[3],
+            size_bytes=row[4],
+            width=row[5],
+            height=row[6],
+            checksum_sha256=row[7],
+        )
+
     async def get(self, image_id: str) -> StoredRecord | None:
-        """See module docstring: reuses sync MySQLBackend's
-        tiering-aware _SELECT_FULL. A tiered row will fail here with an
-        unhelpful error -- a real, inherited, documented limitation,
-        not something this method tries to hide."""
+        select_sql = _DEDUP_SELECT_FULL if self._dedup else _SELECT_FULL
 
         async def work(conn):
             async with conn.cursor() as cur:
-                await cur.execute(_SELECT_FULL, (image_id,))
+                await cur.execute(select_sql, (image_id,))
                 return await cur.fetchone()
 
         try:
@@ -495,26 +582,23 @@ class AsyncMySQLBackend(AsyncStorageBackend):
             raise StorageError(f"Failed to retrieve image: {exc}") from exc
         if row is None:
             return None
-        return StoredRecord(
-            id=str(row[0]),
-            data=bytes(row[1]),
-            mime_type=row[2],
-            original_filename=row[3],
-            size_bytes=row[4],
-            width=row[5],
-            height=row[6],
-            checksum_sha256=row[7],
-        )
+        data = row[1]
+        if not self._dedup and row[8] == "object_storage":
+            data = await self._fetch_tiered_bytes(row[9], image_id=image_id)
+        return self._record(row, data)
 
     async def get_many(self, image_ids: list[str]) -> list[StoredRecord]:
         if not image_ids:
             return []
-        placeholders = ",".join(["%s"] * len(image_ids))
-        sql = _SELECT_FULL.replace("WHERE id = %s", f"WHERE id IN ({placeholders})")
+        placeholders = ", ".join(["%s"] * len(image_ids))
+        base_sql = _DEDUP_SELECT_FULL if self._dedup else _SELECT_FULL
+        where = "WHERE r.id = %s" if self._dedup else "WHERE id = %s"
+        column = "r.id" if self._dedup else "id"
+        sql = base_sql.replace(where, f"WHERE {column} IN ({placeholders})")
 
         async def work(conn):
             async with conn.cursor() as cur:
-                await cur.execute(sql, image_ids)
+                await cur.execute(sql, tuple(image_ids))
                 return await cur.fetchall()
 
         try:
@@ -523,28 +607,26 @@ class AsyncMySQLBackend(AsyncStorageBackend):
             raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image batch: {exc}") from exc
-        return [
-            StoredRecord(
-                id=str(row[0]),
-                data=bytes(row[1]),
-                mime_type=row[2],
-                original_filename=row[3],
-                size_bytes=row[4],
-                width=row[5],
-                height=row[6],
-                checksum_sha256=row[7],
-            )
-            for row in rows
-        ]
+        records = []
+        for row in rows:
+            data = row[1]
+            if not self._dedup and row[8] == "object_storage":
+                data = await self._fetch_tiered_bytes(row[9], image_id=str(row[0]))
+            records.append(self._record(row, data))
+        return records
 
     async def get_metadata(self, image_id: str) -> StoredRecordMetadata | None:
+        select_sql = _DEDUP_SELECT_METADATA if self._dedup else _SELECT_METADATA
+
         async def work(conn):
             async with conn.cursor() as cur:
-                await cur.execute(_SELECT_METADATA, (image_id,))
+                await cur.execute(select_sql, (image_id,))
                 return await cur.fetchone()
 
         try:
             row = await self._run(work, operation="get_metadata")
+        except StorageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
         if row is None:
@@ -562,34 +644,50 @@ class AsyncMySQLBackend(AsyncStorageBackend):
     # ---- get_stream -----------------------------------------------------
 
     async def get_stream(
-        self, image_id: str, *, chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE
+        self,
+        image_id: str,
+        *,
+        chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
     ) -> AsyncIterator[bytes] | None:
-        """See module docstring: SUBSTRING()-based ranged reads, each
-        chunk its own round trip. A concurrent delete mid-stream raises
-        StorageError rather than silently truncating."""
+        """One metadata lookup (the size, and the not-found check), then
+        repeated ranged SUBSTRING reads -- same strategy as the sync adapter.
+        A row deleted between chunks raises StorageError instead of silently
+        truncating. A TIERED row is streamed from object storage with real
+        HTTP byte-range requests (ObjectStorage.download_stream()); each
+        blocking chunk read runs in a worker thread."""
+        info_sql = _DEDUP_STREAM_INFO if self._dedup else _SELECT_STREAM_INFO
+        select_chunk_sql = _DEDUP_SELECT_CHUNK if self._dedup else _SELECT_CHUNK
 
         async def info_work(conn):
             async with conn.cursor() as cur:
-                await cur.execute(_SELECT_STREAM_INFO, (image_id,))
+                await cur.execute(info_sql, (image_id,))
                 return await cur.fetchone()
 
         try:
             info_row = await self._run(info_work, operation="get_stream")
+        except StorageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
         if info_row is None:
             return None
-        total_size, storage_backend, object_storage_key = info_row
-        if storage_backend == "object_storage":
-            raise StorageError(
-                f"Image {image_id!r} is stored in object storage (key="
-                f"{object_storage_key!r}) -- AsyncMySQLBackend cannot "
-                "resolve tiered images in this phase. Use the sync "
-                "MySQLBackend (with object_storage=...) to read this one."
-            )
+        if self._dedup:
+            total_size = info_row[0]
+        else:
+            total_size, storage_backend, object_storage_key = info_row
+            if storage_backend == "object_storage":
+                if self._object_storage is None:
+                    raise StorageError(
+                        f"Image {image_id!r} is stored in object storage (key="
+                        f"{object_storage_key!r}) but this backend was "
+                        "constructed without object_storage=... -- configure "
+                        "it with the same bucket/credentials used to tier "
+                        "this image."
+                    )
+                return self._stream_tiered(object_storage_key, chunk_size)
 
         async def generator() -> AsyncIterator[bytes]:
-            offset = 1  # SUBSTRING() is 1-indexed
+            offset = 1  # SUBSTRING is 1-indexed
             remaining = total_size
             delivered = 0
             while remaining > 0:
@@ -597,7 +695,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
 
                 async def work(conn, offset=offset, length=length):
                     async with conn.cursor() as cur:
-                        await cur.execute(_SELECT_CHUNK, (offset, length, image_id))
+                        await cur.execute(select_chunk_sql, (offset, length, image_id))
                         return await cur.fetchone()
 
                 try:
@@ -619,18 +717,148 @@ class AsyncMySQLBackend(AsyncStorageBackend):
 
         return generator()
 
-    # ---- delete -------------------------------------------------------------
+    async def _stream_tiered(
+        self, object_storage_key: str, chunk_size: int
+    ) -> AsyncIterator[bytes]:
+        """Adapt ObjectStorage.download_stream() (a blocking generator) to an
+        async iterator: each next() runs in a worker thread."""
+        iterator = self._object_storage.download_stream(  # type: ignore[union-attr]
+            object_storage_key, chunk_size=chunk_size
+        )
+        done = object()
+        try:
+            while True:
+                chunk = await asyncio.to_thread(next, iterator, done)
+                if chunk is done:
+                    break
+                yield chunk
+        finally:
+            iterator.close()
 
-    async def delete(self, image_id: str) -> bool:
-        """No object-storage cleanup here -- see module docstring's
-        inherited-limitation note (same as AsyncPostgresBackend). Just a
-        plain DELETE + rowcount check; no SELECT-then-act dance needed
-        since nothing but "did a row disappear" is being determined."""
+    # ---- tier_to_object_storage ------------------------------------------
+
+    async def tier_to_object_storage(self, image_id: str) -> bool | None:
+        """Move an image's bytes out of MySQL into object storage. Same
+        contract and safety as MySQLBackend.tier_to_object_storage(): None if
+        the id doesn't exist, False if already tiered (a safe no-op), True if
+        tiered just now. The upload happens INSIDE the transaction that
+        locked the row (SELECT ... FOR UPDATE), so a failed upload rolls
+        everything back and the row is untouched. TRADEOFF, as in the sync
+        adapter: the row stays locked for the whole upload, so a concurrent
+        delete() or tier of THE SAME image waits; plain reads are not
+        blocked. A retry re-uploads the same bytes to the same
+        deterministic key, which is harmless."""
+        if self._dedup:
+            raise StorageError(
+                "tier_to_object_storage() is not supported in dedup mode "
+                "in this first pass -- see MySQLBackend's docstring."
+            )
+        if self._object_storage is None:
+            raise StorageError(
+                "tier_to_object_storage() requires this backend to be "
+                "constructed with object_storage=... -- see ObjectStorage "
+                "in object_storage.py."
+            )
+        store = self._object_storage
 
         async def work(conn):
             async with conn.cursor() as cur:
+                await cur.execute(_SELECT_FOR_TIERING, (image_id,))
+                row = await cur.fetchone()
+                if row is None:
+                    return None
+                data, mime_type, _size_bytes, storage_backend = row
+                if storage_backend != "mysql":
+                    return False
+                key = str(image_id)
+                await asyncio.to_thread(
+                    store.upload, key, bytes(data), mime_type=mime_type
+                )
+                await cur.execute(
+                    _UPDATE_AFTER_TIERING, (store.bucket, key, _now(), image_id)
+                )
+                return True
+
+        try:
+            return await self._run(work, operation="tier_to_object_storage")
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(
+                f"Failed to tier image to object storage: {exc}"
+            ) from exc
+
+    # ---- delete -------------------------------------------------------------
+
+    async def delete(self, image_id: str) -> bool:
+        if self._dedup:
+            return await self._delete_dedup(image_id)
+
+        async def work(conn):
+            async with conn.cursor() as cur:
+                # No RETURNING in MySQL: lock the row, read what the cleanup
+                # needs, then delete -- all in one transaction.
+                await cur.execute(
+                    "SELECT storage_backend, object_storage_key "
+                    "FROM zerobucket_images WHERE id = %s FOR UPDATE;",
+                    (image_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    return None
                 await cur.execute(_DELETE, (image_id,))
-                return cur.rowcount > 0
+                return row
+
+        try:
+            row = await self._run(work, operation="delete")
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to delete image: {exc}") from exc
+        if row is None:
+            return False
+        storage_backend, object_storage_key = row
+        if storage_backend == "object_storage" and self._object_storage is not None:
+            # After the row is gone, and a failure NEVER fails the delete
+            # (see StorageBackend._delete_tiered_object, 0.29.0).
+            await self._delete_tiered_object(object_storage_key)
+        return True
+
+    async def _delete_dedup(self, image_id: str) -> bool:
+        async def work(conn):
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT checksum_sha256 FROM zerobucket_image_refs "
+                    "WHERE id = %s FOR UPDATE;",
+                    (image_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    return False
+                checksum = row[0]
+                # Lock the blob row too, then drop the ref and decrement.
+                await cur.execute(
+                    "SELECT ref_count FROM zerobucket_blobs "
+                    "WHERE checksum_sha256 = %s FOR UPDATE;",
+                    (checksum,),
+                )
+                blob = await cur.fetchone()
+                await cur.execute(
+                    "DELETE FROM zerobucket_image_refs WHERE id = %s;", (image_id,)
+                )
+                if blob is not None:
+                    await cur.execute(
+                        "UPDATE zerobucket_blobs SET ref_count = ref_count - 1 "
+                        "WHERE checksum_sha256 = %s;",
+                        (checksum,),
+                    )
+                    if blob[0] - 1 <= 0:
+                        await cur.execute(
+                            "DELETE FROM zerobucket_blobs "
+                            "WHERE checksum_sha256 = %s AND ref_count <= 0;",
+                            (checksum,),
+                        )
+                return True
 
         try:
             return await self._run(work, operation="delete")
@@ -640,31 +868,85 @@ class AsyncMySQLBackend(AsyncStorageBackend):
             raise StorageError(f"Failed to delete image: {exc}") from exc
 
     async def delete_many(self, image_ids: list[str]) -> list[str]:
-        """No RETURNING (see module docstring), so this locks the
-        candidate rows with SELECT ... FOR UPDATE before DELETE, purely
-        to learn which ids existed and were removed -- same shape as
-        sync MySQLBackend.delete_many(), no tiering-cleanup purpose
-        here (this adapter does none)."""
         if not image_ids:
             return []
-        placeholders = ",".join(["%s"] * len(image_ids))
+        if self._dedup:
+            return await self._delete_many_dedup(image_ids)
+        placeholders = ", ".join(["%s"] * len(image_ids))
 
         async def work(conn):
             async with conn.cursor() as cur:
                 await cur.execute(
-                    f"SELECT id FROM zerobucket_images WHERE id IN ({placeholders}) "
-                    "FOR UPDATE;",
-                    image_ids,
+                    "SELECT id, storage_backend, object_storage_key FROM zerobucket_images "
+                    f"WHERE id IN ({placeholders}) FOR UPDATE;",
+                    tuple(image_ids),
                 )
-                existing_ids = [str(row[0]) for row in await cur.fetchall()]
-                if not existing_ids:
+                rows = await cur.fetchall()
+                if not rows:
                     return []
-                existing_placeholders = ",".join(["%s"] * len(existing_ids))
                 await cur.execute(
-                    f"DELETE FROM zerobucket_images WHERE id IN ({existing_placeholders});",
-                    existing_ids,
+                    f"DELETE FROM zerobucket_images WHERE id IN ({placeholders});",
+                    tuple(image_ids),
                 )
-                return existing_ids
+                return [(str(r[0]), r[1], r[2]) for r in rows]
+
+        try:
+            rows = await self._run(work, operation="delete_many")
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to delete image batch: {exc}") from exc
+        deleted_ids = []
+        for image_id, storage_backend, object_storage_key in rows:
+            deleted_ids.append(image_id)
+            if storage_backend == "object_storage" and self._object_storage is not None:
+                await self._delete_tiered_object(object_storage_key)
+        return deleted_ids
+
+    async def _delete_many_dedup(self, image_ids: list[str]) -> list[str]:
+        placeholders = ", ".join(["%s"] * len(image_ids))
+
+        async def work(conn):
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT id, checksum_sha256 FROM zerobucket_image_refs "
+                    f"WHERE id IN ({placeholders}) FOR UPDATE;",
+                    tuple(image_ids),
+                )
+                rows = await cur.fetchall()
+                if not rows:
+                    return []
+                counts = Counter(row[1] for row in rows)
+                # Lock the affected blobs in sorted checksum order (the same
+                # lock order as put_many), then delete refs and decrement.
+                emptied = []
+                for checksum in sorted(counts):
+                    await cur.execute(
+                        "SELECT ref_count FROM zerobucket_blobs "
+                        "WHERE checksum_sha256 = %s FOR UPDATE;",
+                        (checksum,),
+                    )
+                    blob = await cur.fetchone()
+                    if blob is not None and blob[0] - counts[checksum] <= 0:
+                        emptied.append(checksum)
+                await cur.execute(
+                    f"DELETE FROM zerobucket_image_refs WHERE id IN ({placeholders});",
+                    tuple(image_ids),
+                )
+                for checksum, count in sorted(counts.items()):
+                    await cur.execute(
+                        "UPDATE zerobucket_blobs SET ref_count = ref_count - %s "
+                        "WHERE checksum_sha256 = %s;",
+                        (count, checksum),
+                    )
+                if emptied:
+                    marks = ", ".join(["%s"] * len(emptied))
+                    await cur.execute(
+                        f"DELETE FROM zerobucket_blobs WHERE checksum_sha256 IN ({marks}) "
+                        "AND ref_count <= 0;",
+                        tuple(emptied),
+                    )
+                return [str(row[0]) for row in rows]
 
         try:
             return await self._run(work, operation="delete_many")
@@ -676,13 +958,17 @@ class AsyncMySQLBackend(AsyncStorageBackend):
     # ---- exists -------------------------------------------------------------
 
     async def exists(self, image_id: str) -> bool:
+        exists_sql = _DEDUP_EXISTS if self._dedup else _EXISTS
+
         async def work(conn):
             async with conn.cursor() as cur:
-                await cur.execute(_EXISTS, (image_id,))
+                await cur.execute(exists_sql, (image_id,))
                 return (await cur.fetchone()) is not None
 
         try:
             return await self._run(work, operation="exists")
+        except StorageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to check image existence: {exc}") from exc
 
