@@ -14,14 +14,15 @@ WHAT'S DELIBERATELY NOT HERE YET, tracked honestly rather than implied
 (this is a first pass, scoped to "core operations + streaming reads" on
 purpose -- see the project's CHANGELOG for the scoping decision):
 
-- dedup=True (content-addressed storage) -- classic mode only for now.
 - before_get/before_put access-control hooks.
 - optimize=True (resize/re-encode pipeline) and custom validator=
   support -- put() here only does the built-in image validation.
 - connection= transaction participation.
 
 (0.27.0 added the on_operation metrics hook and automatic retry/backoff
-on transient errors, for all three async adapters.)
+on transient errors, for all three async adapters. 0.30.0 added dedup=True
+(content-addressed storage) and object_storage= tiering, with
+tier_to_object_storage(), for all three.)
 
 Every one of these exists on the sync ZeroBucket today; none is
 architecturally blocked from being added to the async client later, they
@@ -54,6 +55,7 @@ from .adapters.postgres import DEFAULT_STREAM_CHUNK_SIZE, OperationEvent
 from .adapters.postgres_async import AsyncPostgresBackend
 from .client import DEFAULT_MAX_BYTES, ImageInput, _read_image_input
 from .exceptions import ImageNotFoundError
+from .object_storage import ObjectStorage
 from .types import (
     BatchDeleteResult,
     BatchGetResult,
@@ -77,6 +79,14 @@ class AsyncZeroBucket:
         builds from `database_url`. With `backend=...` they are ignored:
         pass them to that backend's own constructor instead (every async
         adapter accepts the same three).
+
+        dedup, object_storage (0.30.0): the same two options as the sync
+        ZeroBucket -- dedup=True stores each distinct image once, and
+        object_storage= enables tier_to_object_storage() and reads tiered
+        images back from the bucket. They cannot be combined (ValueError).
+        Like the retry options they configure only the PostgreSQL backend
+        built from `database_url`; with `backend=...` pass them to that
+        backend instead.
     """
 
     def __init__(
@@ -93,6 +103,8 @@ class AsyncZeroBucket:
         max_retries: int = 3,
         retry_base_delay: float = 0.1,
         on_operation: Callable[[OperationEvent], None] | None = None,
+        dedup: bool = False,
+        object_storage: ObjectStorage | None = None,
         backend: AsyncStorageBackend | None = None,
     ) -> None:
         if backend is not None:
@@ -107,6 +119,8 @@ class AsyncZeroBucket:
                 max_retries=max_retries,
                 retry_base_delay=retry_base_delay,
                 on_operation=on_operation,
+                dedup=dedup,
+                object_storage=object_storage,
             )
         else:
             raise ValueError("Either database_url or backend must be provided")
@@ -342,6 +356,21 @@ class AsyncZeroBucket:
             )
             for image_id in image_ids
         ]
+
+    async def tier_to_object_storage(self, image_id: str) -> bool:
+        """Move an image's bytes out of the database and into object storage
+        (see the constructor's object_storage= parameter). Returns True if it
+        was tiered by this call, False if it was already tiered (a safe
+        no-op), and raises ImageNotFoundError if the id doesn't exist. Same
+        contract and safety as the sync ZeroBucket.tier_to_object_storage():
+        the upload happens inside the transaction that locked the row, so a
+        failed upload leaves the row untouched."""
+        # Not part of the generic AsyncStorageBackend interface, like the
+        # sync client: a backend without tiering raises AttributeError.
+        result = await self._backend.tier_to_object_storage(image_id)  # type: ignore[attr-defined]
+        if result is None:
+            raise ImageNotFoundError(image_id)
+        return result
 
     async def close(self) -> None:
         """Release underlying database connections."""
