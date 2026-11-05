@@ -171,10 +171,19 @@ This first pass is scoped to core operations + streaming reads, not full
 parity with the sync client yet. Deliberately NOT in `AsyncZeroBucket`
 today, tracked honestly rather than implied:
 
-- `dedup=True` (content-addressed storage) -- classic mode only for now.
 - `before_get`/`before_put` access-control hooks.
 - `optimize=True` (resize/re-encode pipeline) and custom `validator=`.
 - `connection=` transaction participation.
+
+Since 0.30.0 all three async adapters (PostgreSQL, SQLite, MySQL) also
+support `dedup=True` (content-addressed storage) and `object_storage=` tiering
+with `await tier_to_object_storage(image_id)`, the same as the sync adapters
+and, as there, not both at once (`ValueError`). The tiering SDK (boto3) is
+blocking, so every call to it runs in a worker thread and never stalls the event
+loop. The async and sync adapters share their tables, so an image stored or
+tiered by one is readable by the other. As in the sync adapters,
+`tier_to_object_storage()` keeps the row (PostgreSQL, MySQL) or the whole
+database file's write lock (SQLite) held for the duration of the upload.
 
 Since 0.27.0 all three async adapters (PostgreSQL, SQLite, MySQL) support
 the `on_operation` observability hook and automatic retry/backoff
@@ -370,10 +379,10 @@ images = ZeroBucket(backend=SQLiteBackend("images.db", dedup=True))
 
 What works today, async (`AsyncSQLiteBackend`, `pip install
 zerobucket[sqlite-async]`): core CRUD + `get_stream()`/`stream_to()`,
-classic mode only -- same scope `AsyncPostgresBackend` has (no
-`dedup=True`, no `tier_to_object_storage()`), deliberately kept
-consistent between the async adapters rather than letting SQLite's
-async support drift wider.
+and, since 0.30.0, `dedup=True` and `object_storage=` tiering
+(`tier_to_object_storage()`) -- the same scope `AsyncPostgresBackend` and
+`AsyncMySQLBackend` have, deliberately kept consistent between the async
+adapters.
 
 **`on_operation` and retry (0.27.0), sync and async SQLite:** the same
 `max_retries` / `retry_base_delay` / `on_operation` knobs as the other
@@ -429,7 +438,8 @@ UPDATE`-based version has, but `BEGIN IMMEDIATE` is a coarser lock --
 connection pooling, `on_operation` metrics, and automatic retry/backoff
 (same knobs and defaults as Postgres throughout). `AsyncMySQLBackend`
 covers core CRUD + streaming + pooling + `on_operation` metrics and
-automatic retry/backoff (since 0.27.0), classic mode only -- matching
+automatic retry/backoff (since 0.27.0), and `dedup=True` and
+`object_storage=` tiering (since 0.30.0) -- matching
 `AsyncPostgresBackend`/`AsyncSQLiteBackend`'s own scope.
 
 ```bash

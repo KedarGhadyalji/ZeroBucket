@@ -6,6 +6,46 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## Python `zerobucket` [0.30.0] - 2026-11-04
+
+The async adapters are no longer classic-only: they now support dedup mode and object-storage tiering, like the sync adapters.
+
+### Added
+
+- **`dedup=True` on `AsyncPostgresBackend`, `AsyncSQLiteBackend` and `AsyncMySQLBackend`** (and on `AsyncZeroBucket(database_url=...)`).
+  Content-addressed storage with reference counts: identical images are stored once, a shared blob survives until its last
+  reference is deleted, and `put_many()`/`delete_many()` lock blobs in one global order so overlapping batches cannot deadlock.
+  Same SQL as the sync adapters (imported, not copied), so the async and sync adapters share their tables: an image written by one is
+  readable by the other.
+- **`object_storage=` and `tier_to_object_storage()` on the same three adapters** (and `AsyncZeroBucket.tier_to_object_storage()`,
+  which raises `ImageNotFoundError` for a missing id like the sync client). `get()`, `get_many()` and `get_stream()` read a tiered
+  image back from the bucket (`get_stream()` with real HTTP byte-range requests), `delete()`/`delete_many()` remove the object after
+  the row (a failed cleanup never fails the delete, reported as an `"object_storage_delete"` event, as in 0.29.0), and tiering uploads
+  inside the transaction that locked the row, so a failed upload leaves the row untouched.
+- **The blocking boto3 calls run in worker threads** (`asyncio.to_thread`), so a slow upload or download never stalls the event
+  loop. A test proves it: a ticker task keeps running during a 0.6 s blocking upload.
+- `AsyncStorageBackend._delete_tiered_object()` (internal): the async counterpart of the 0.29.0 helper.
+- Tests: `tests/test_async_dedup_tiering.py` (52 tests, every scenario on all three async adapters, including sync/async
+  interoperability on shared tables and tiered images, a failed upload rolling back, and a failed cleanup).
+
+### Changed
+
+- **Reading a tiered image through an async adapter without `object_storage=`** now raises a clear `StorageError` naming the missing
+  option. It used to fail with an unhelpful `bytes(None)`-shaped `TypeError` (a limitation that was documented in the async MySQL
+  adapter's docstring and is now gone).
+- **Async `get_stream()` on PostgreSQL** now looks the image's size up with the same query the sync adapter uses (it still reports
+  one `"get_metadata"` event, as before). No behaviour change for classic, untiered images.
+
+### Known limits (same as the sync adapters)
+
+- `dedup=True` and `object_storage=` cannot be combined (`ValueError`), and `tier_to_object_storage()` is refused in dedup mode.
+- `tier_to_object_storage()` holds the row lock (PostgreSQL, MySQL) or SQLite's whole-database write lock for the duration of the
+  upload; other writers to that row, or to that SQLite file, wait. Plain reads are not blocked.
+- `AsyncSQLiteBackend.tier_to_object_storage()` opens its own connection like the sync adapter, so it is not covered by retry or by an
+  `OperationEvent`.
+- `connection=` transaction participation, `before_get`/`before_put` hooks, `optimize=True` and a custom `validator=` are still not
+  available on the async client.
+
 ## Python `zerobucket` [0.29.0] - 2026-11-03
 
 A behaviour change: deleting a tiered image no longer fails when the object cleanup fails. This is the same behaviour the npm
