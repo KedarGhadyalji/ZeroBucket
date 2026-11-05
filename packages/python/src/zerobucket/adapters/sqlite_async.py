@@ -1,13 +1,11 @@
 """Async SQLite storage adapter, using `aiosqlite`.
 
-Scope matches `AsyncPostgresBackend`'s established scope EXACTLY, not
-by accident -- core CRUD + streaming, classic mode only. NOT
-implemented, same as the async Postgres adapter and tracked the same
-way: `dedup=True`, `tier_to_object_storage()`. (The `on_operation`
-metrics hook and busy-retry were added in 0.27.0.) This mirrors the async Postgres adapter's own
-documented scope decision rather than inventing a different, wider one
-for SQLite -- consistency across the two async adapters was judged more
-valuable than SQLite async matching sync SQLite's fuller feature set.
+Scope matches `AsyncPostgresBackend`'s: core CRUD + streaming, and --
+since 0.30.0 -- `dedup=True` (content-addressed storage) and
+`object_storage=` tiering with `tier_to_object_storage()`, same as the
+sync adapter and, as there, not both at once. (The `on_operation` metrics
+hook and busy-retry were added in 0.27.0.) The blocking object-storage SDK
+runs in worker threads (`asyncio.to_thread`), never on the event loop.
 
 ONE REAL, VERIFIED DRIVER CONSTRAINT THAT SHAPES THIS FILE'S DESIGN:
 `aiosqlite.Connection` does NOT expose `blobopen()` -- confirmed
@@ -40,15 +38,33 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from collections import Counter
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from ..exceptions import StorageError
+from ..object_storage import ObjectStorage
 from .base import StoredRecord, StoredRecordMetadata
 from .base_async import AsyncStorageBackend
 from .postgres import OperationEvent, _backoff_delay
-from .sqlite import _SCHEMA, DEFAULT_STREAM_CHUNK_SIZE, _is_retryable
+from .sqlite import (
+    _DEDUP_DECREMENT_BLOB,
+    _DEDUP_DELETE_REF,
+    _DEDUP_EXISTS,
+    _DEDUP_INSERT_REF,
+    _DEDUP_SCHEMA,
+    _DEDUP_SELECT_FULL,
+    _DEDUP_SELECT_METADATA,
+    _DEDUP_UPSERT_BLOB,
+    _DELETE_RETURNING,
+    _SCHEMA,
+    _SELECT_FOR_TIERING,
+    _SELECT_FULL,
+    _UPDATE_AFTER_TIERING,
+    DEFAULT_STREAM_CHUNK_SIZE,
+    _is_retryable,
+)
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -63,23 +79,25 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 RETURNING id;
 """
 
-_SELECT_FULL = """
-SELECT id, data, mime_type, original_filename, size_bytes, width, height, checksum_sha256
-FROM zerobucket_images
-WHERE id = ?;
-"""
-
 _SELECT_METADATA = """
 SELECT id, mime_type, original_filename, size_bytes, width, height, checksum_sha256
 FROM zerobucket_images
 WHERE id = ?;
 """
 
-_SELECT_STREAM_INFO = "SELECT size_bytes FROM zerobucket_images WHERE id = ?;"
+_SELECT_STREAM_INFO = (
+    "SELECT size_bytes, storage_backend, object_storage_key "
+    "FROM zerobucket_images WHERE id = ?;"
+)
 
 _SELECT_CHUNK = "SELECT substr(data, ?, ?) FROM zerobucket_images WHERE id = ?;"
 
-_DELETE = "DELETE FROM zerobucket_images WHERE id = ?;"
+_DEDUP_SELECT_CHUNK = """
+SELECT substr(b.data, ?, ?)
+FROM zerobucket_image_refs r
+JOIN zerobucket_blobs b ON r.checksum_sha256 = b.checksum_sha256
+WHERE r.id = ?;
+"""
 
 _EXISTS = "SELECT 1 FROM zerobucket_images WHERE id = ?;"
 
@@ -99,10 +117,16 @@ def _now_iso() -> str:
 
 
 class AsyncSQLiteBackend(AsyncStorageBackend):
-    """Async storage backend for SQLite, classic mode only. See module
-    docstring for exact scope and the two real driver-shaped design
-    differences from both the sync SQLite adapter and the async
-    Postgres adapter.
+    """Async storage backend for SQLite. See module docstring for exact
+    scope and the two real driver-shaped design differences from both the
+    sync SQLite adapter and the async Postgres adapter.
+
+    dedup / object_storage (added in 0.30.0): the same two options as the
+    sync SQLiteBackend, with the same meaning and restriction -- they
+    cannot be combined (ValueError). tier_to_object_storage() takes
+    SQLite's single write lock (BEGIN IMMEDIATE) for the whole upload, so
+    other WRITERS to this database file wait until it finishes, exactly as
+    in the sync adapter; readers are not blocked (WAL mode).
 
     Lazy-initialized the same way `AsyncPostgresBackend` is, and for the
     same underlying reason (`__init__` cannot be a coroutine): schema
@@ -137,7 +161,14 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         max_retries: int = 3,
         retry_base_delay: float = 0.1,
         on_operation: Callable[[OperationEvent], None] | None = None,
+        dedup: bool = False,
+        object_storage: ObjectStorage | None = None,
     ) -> None:
+        if object_storage is not None and dedup:
+            raise ValueError(
+                "object_storage= is not supported together with dedup=True "
+                "in this first pass -- see SQLiteBackend's docstring."
+            )
         try:
             import aiosqlite
         except ImportError as exc:
@@ -154,6 +185,8 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
         self._on_operation = on_operation
+        self._dedup = dedup
+        self._object_storage = object_storage
         self._ready = False
         self._ready_lock = asyncio.Lock()
 
@@ -191,7 +224,9 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
                     await conn.execute("PRAGMA journal_mode=WAL;")
                     if self._auto_migrate:
                         # Idempotent, so safe to re-run after a retry.
-                        await conn.executescript(_SCHEMA)
+                        await conn.executescript(
+                            _DEDUP_SCHEMA if self._dedup else _SCHEMA
+                        )
                     await conn.commit()
 
             try:
@@ -314,24 +349,40 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         image_id = str(uuid.uuid4())
         now = _now_iso()
 
-        async def work(conn):
-            cur = await conn.execute(
-                _INSERT,
-                (
-                    image_id,
-                    data,
-                    mime_type,
-                    original_filename,
-                    size_bytes,
-                    width,
-                    height,
-                    checksum_sha256,
-                    now,
-                    now,
-                ),
-            )
-            row = await cur.fetchone()
-            return str(row[0])
+        if self._dedup:
+
+            async def work(conn):
+                await conn.execute(
+                    _DEDUP_UPSERT_BLOB,
+                    (checksum_sha256, data, mime_type, size_bytes, width, height, now),
+                )
+                cur = await conn.execute(
+                    _DEDUP_INSERT_REF,
+                    (image_id, checksum_sha256, original_filename, now, now),
+                )
+                row = await cur.fetchone()  # drain: aiosqlite won't commit otherwise
+                return str(row[0])
+
+        else:
+
+            async def work(conn):
+                cur = await conn.execute(
+                    _INSERT,
+                    (
+                        image_id,
+                        data,
+                        mime_type,
+                        original_filename,
+                        size_bytes,
+                        width,
+                        height,
+                        checksum_sha256,
+                        now,
+                        now,
+                    ),
+                )
+                row = await cur.fetchone()
+                return str(row[0])
 
         try:
             return await self._run(work, operation="put")
@@ -349,29 +400,52 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         async def work(conn):
             ids = []
             for image_id, row in prepared:
-                cur = await conn.execute(
-                    _INSERT,
-                    (
-                        image_id,
-                        row["data"],
-                        row["mime_type"],
-                        row["original_filename"],
-                        row["size_bytes"],
-                        row["width"],
-                        row["height"],
-                        row["checksum_sha256"],
-                        now,
-                        now,
-                    ),
-                )
-                # aiosqlite (unlike the sync sqlite3 driver -- verified,
-                # not assumed to match) refuses to commit() while a
-                # RETURNING cursor's result set hasn't been drained,
-                # raising "cannot commit transaction - SQL statements in
-                # progress". Draining it here also conveniently confirms
-                # the insert actually happened, though we already have
-                # image_id from Python and don't strictly need the value
-                # back.
+                if self._dedup:
+                    # Repeated identical checksums within one batch correctly
+                    # accumulate ref_count: each upsert is a separate
+                    # sequential statement in the same transaction.
+                    await conn.execute(
+                        _DEDUP_UPSERT_BLOB,
+                        (
+                            row["checksum_sha256"],
+                            row["data"],
+                            row["mime_type"],
+                            row["size_bytes"],
+                            row["width"],
+                            row["height"],
+                            now,
+                        ),
+                    )
+                    cur = await conn.execute(
+                        _DEDUP_INSERT_REF,
+                        (
+                            image_id,
+                            row["checksum_sha256"],
+                            row["original_filename"],
+                            now,
+                            now,
+                        ),
+                    )
+                else:
+                    cur = await conn.execute(
+                        _INSERT,
+                        (
+                            image_id,
+                            row["data"],
+                            row["mime_type"],
+                            row["original_filename"],
+                            row["size_bytes"],
+                            row["width"],
+                            row["height"],
+                            row["checksum_sha256"],
+                            now,
+                            now,
+                        ),
+                    )
+                # aiosqlite (unlike the sync sqlite3 driver -- verified, not
+                # assumed to match) refuses to commit() while a RETURNING
+                # cursor's result set hasn't been drained, raising "cannot
+                # commit transaction - SQL statements in progress".
                 await cur.fetchone()
                 ids.append(image_id)
             return ids
@@ -385,20 +459,43 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
 
     # ---- get --------------------------------------------------------------
 
+    async def _fetch_tiered_bytes(
+        self, object_storage_key: str, *, image_id: str
+    ) -> bytes:
+        """The row says this image lives in object storage: fetch the bytes
+        (the blocking boto3 download runs in a worker thread)."""
+        if self._object_storage is None:
+            raise StorageError(
+                f"Image {image_id!r} is stored in object storage (key="
+                f"{object_storage_key!r}) but this backend was constructed "
+                "without object_storage=... -- configure it with the same "
+                "bucket/credentials used to tier this image."
+            )
+        return await asyncio.to_thread(
+            self._object_storage.download, object_storage_key
+        )
+
     async def get(self, image_id: str) -> StoredRecord | None:
+        select_sql = _DEDUP_SELECT_FULL if self._dedup else _SELECT_FULL
+
         async def work(conn):
-            cur = await conn.execute(_SELECT_FULL, (image_id,))
+            cur = await conn.execute(select_sql, (image_id,))
             return await cur.fetchone()
 
         try:
             row = await self._run(work, operation="get")
+        except StorageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image: {exc}") from exc
         if row is None:
             return None
+        data = row[1]
+        if not self._dedup and row[8] == "object_storage":
+            data = await self._fetch_tiered_bytes(row[9], image_id=image_id)
         return StoredRecord(
             id=str(row[0]),
-            data=bytes(row[1]),
+            data=bytes(data),
             mime_type=row[2],
             original_filename=row[3],
             size_bytes=row[4],
@@ -411,7 +508,10 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         if not image_ids:
             return []
         placeholders = ",".join("?" * len(image_ids))
-        sql = _SELECT_FULL.replace("WHERE id = ?", f"WHERE id IN ({placeholders})")
+        base_sql = _DEDUP_SELECT_FULL if self._dedup else _SELECT_FULL
+        where = "WHERE r.id = ?" if self._dedup else "WHERE id = ?"
+        column = "r.id" if self._dedup else "id"
+        sql = base_sql.replace(where, f"WHERE {column} IN ({placeholders})")
 
         async def work(conn):
             cur = await conn.execute(sql, image_ids)
@@ -419,29 +519,40 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
 
         try:
             rows = await self._run(work, operation="get_many")
+        except StorageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image batch: {exc}") from exc
-        return [
-            StoredRecord(
-                id=str(row[0]),
-                data=bytes(row[1]),
-                mime_type=row[2],
-                original_filename=row[3],
-                size_bytes=row[4],
-                width=row[5],
-                height=row[6],
-                checksum_sha256=row[7],
+        records = []
+        for row in rows:
+            data = row[1]
+            if not self._dedup and row[8] == "object_storage":
+                data = await self._fetch_tiered_bytes(row[9], image_id=str(row[0]))
+            records.append(
+                StoredRecord(
+                    id=str(row[0]),
+                    data=bytes(data),
+                    mime_type=row[2],
+                    original_filename=row[3],
+                    size_bytes=row[4],
+                    width=row[5],
+                    height=row[6],
+                    checksum_sha256=row[7],
+                )
             )
-            for row in rows
-        ]
+        return records
 
     async def get_metadata(self, image_id: str) -> StoredRecordMetadata | None:
+        select_sql = _DEDUP_SELECT_METADATA if self._dedup else _SELECT_METADATA
+
         async def work(conn):
-            cur = await conn.execute(_SELECT_METADATA, (image_id,))
+            cur = await conn.execute(select_sql, (image_id,))
             return await cur.fetchone()
 
         try:
             row = await self._run(work, operation="get_metadata")
+        except StorageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
         if row is None:
@@ -470,19 +581,44 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         does NOT share sync SQLiteBackend's "survives a concurrent
         delete mid-stream" guarantee. A row deleted between chunks here
         raises StorageError, matching AsyncPostgresBackend's behavior
-        instead."""
+        instead.
+
+        A TIERED row is streamed from object storage with real HTTP byte-
+        range requests (ObjectStorage.download_stream()); each blocking
+        chunk read runs in a worker thread."""
+        if self._dedup:
+            info_sql = _DEDUP_SELECT_METADATA
+            select_chunk_sql = _DEDUP_SELECT_CHUNK
+        else:
+            info_sql = _SELECT_STREAM_INFO
+            select_chunk_sql = _SELECT_CHUNK
 
         async def info_work(conn):
-            cur = await conn.execute(_SELECT_STREAM_INFO, (image_id,))
+            cur = await conn.execute(info_sql, (image_id,))
             return await cur.fetchone()
 
         try:
             info_row = await self._run(info_work, operation="get_stream")
+        except StorageError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
         if info_row is None:
             return None
-        total_size = info_row[0]
+        if self._dedup:
+            total_size = info_row[3]  # _DEDUP_SELECT_METADATA: size_bytes is column 3
+        else:
+            total_size, storage_backend, object_storage_key = info_row
+            if storage_backend == "object_storage":
+                if self._object_storage is None:
+                    raise StorageError(
+                        f"Image {image_id!r} is stored in object storage (key="
+                        f"{object_storage_key!r}) but this backend was "
+                        "constructed without object_storage=... -- configure "
+                        "it with the same bucket/credentials used to tier "
+                        "this image."
+                    )
+                return self._stream_tiered(object_storage_key, chunk_size)
 
         async def generator() -> AsyncIterator[bytes]:
             offset = 1  # substr() is 1-indexed, same as Postgres's substring()
@@ -492,7 +628,9 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
                 length = min(chunk_size, remaining)
 
                 async def work(conn, offset=offset, length=length):
-                    cur = await conn.execute(_SELECT_CHUNK, (offset, length, image_id))
+                    cur = await conn.execute(
+                        select_chunk_sql, (offset, length, image_id)
+                    )
                     return await cur.fetchone()
 
                 try:
@@ -514,44 +652,197 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
 
         return generator()
 
+    async def _stream_tiered(
+        self, object_storage_key: str, chunk_size: int
+    ) -> AsyncIterator[bytes]:
+        """Adapt ObjectStorage.download_stream() (a blocking generator) to an
+        async iterator: each next() runs in a worker thread."""
+        iterator = self._object_storage.download_stream(  # type: ignore[union-attr]
+            object_storage_key, chunk_size=chunk_size
+        )
+        done = object()
+        try:
+            while True:
+                chunk = await asyncio.to_thread(next, iterator, done)
+                if chunk is done:
+                    break
+                yield chunk
+        finally:
+            iterator.close()
+
+    # ---- tier_to_object_storage ------------------------------------------
+
+    async def tier_to_object_storage(self, image_id: str) -> bool | None:
+        """Move an image's bytes out of SQLite into object storage. Same
+        contract and safety as SQLiteBackend.tier_to_object_storage(): None
+        if the id doesn't exist, False if already tiered (a safe no-op),
+        True if tiered just now. The upload happens INSIDE a BEGIN
+        IMMEDIATE transaction, so a failed upload rolls back and the row is
+        untouched. TRADEOFF, as in the sync adapter: BEGIN IMMEDIATE takes
+        SQLite's single write lock for the whole upload, so every other
+        WRITER to this database file waits; readers are not blocked. Like
+        the sync adapter this opens its own connection, so it is not
+        covered by retry or by an OperationEvent."""
+        if self._dedup:
+            raise StorageError(
+                "tier_to_object_storage() is not supported in dedup mode "
+                "in this first pass -- see SQLiteBackend's docstring."
+            )
+        if self._object_storage is None:
+            raise StorageError(
+                "tier_to_object_storage() requires this backend to be "
+                "constructed with object_storage=... -- see ObjectStorage "
+                "in object_storage.py."
+            )
+        await self._ensure_ready()
+        store = self._object_storage
+
+        try:
+            # isolation_level=None: we issue BEGIN/COMMIT/ROLLBACK ourselves.
+            conn = await self._aiosqlite.connect(
+                self._database_path,
+                timeout=_BUSY_TIMEOUT_SECONDS,
+                isolation_level=None,
+            )
+            try:
+                await conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
+                await conn.execute("BEGIN IMMEDIATE;")
+                try:
+                    cur = await conn.execute(_SELECT_FOR_TIERING, (image_id,))
+                    row = await cur.fetchone()
+                    if row is None:
+                        await conn.execute("ROLLBACK;")
+                        return None
+                    data, mime_type, _size_bytes, storage_backend = row
+                    if storage_backend != "sqlite":
+                        await conn.execute("ROLLBACK;")
+                        return False
+                    key = str(image_id)
+                    await asyncio.to_thread(
+                        store.upload, key, bytes(data), mime_type=mime_type
+                    )
+                    await conn.execute(
+                        _UPDATE_AFTER_TIERING, (store.bucket, key, _now_iso(), image_id)
+                    )
+                    await conn.execute("COMMIT;")
+                    return True
+                except Exception:
+                    await conn.execute("ROLLBACK;")
+                    raise
+            finally:
+                await conn.close()
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(
+                f"Failed to tier image to object storage: {exc}"
+            ) from exc
+
     # ---- delete -------------------------------------------------------------
 
     async def delete(self, image_id: str) -> bool:
-        async def work(conn):
-            cur = await conn.execute(_DELETE, (image_id,))
-            return cur.rowcount > 0
+        if self._dedup:
+
+            async def work(conn):
+                cur = await conn.execute(_DEDUP_DELETE_REF, (image_id,))
+                row = await cur.fetchone()
+                if row is None:
+                    return None  # id didn't exist -- nothing to decrement either
+                checksum = row[0]
+                cur = await conn.execute(_DEDUP_DECREMENT_BLOB, (1, checksum))
+                new_ref_count = (await cur.fetchone())[0]
+                if new_ref_count <= 0:
+                    await conn.execute(
+                        "DELETE FROM zerobucket_blobs "
+                        "WHERE checksum_sha256 = ? AND ref_count <= 0;",
+                        (checksum,),
+                    )
+                return ("sqlite", None)
+
+        else:
+
+            async def work(conn):
+                cur = await conn.execute(_DELETE_RETURNING, (image_id,))
+                return await cur.fetchone()
 
         try:
-            return await self._run(work, operation="delete")
+            row = await self._run(work, operation="delete")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image: {exc}") from exc
+        if row is None:
+            return False
+        storage_backend, object_storage_key = row
+        if storage_backend == "object_storage" and self._object_storage is not None:
+            # After the row is gone, and a failure NEVER fails the delete
+            # (see StorageBackend._delete_tiered_object, 0.29.0).
+            await self._delete_tiered_object(object_storage_key)
+        return True
 
     async def delete_many(self, image_ids: list[str]) -> list[str]:
         if not image_ids:
             return []
         placeholders = ",".join("?" * len(image_ids))
-        sql = (
-            f"DELETE FROM zerobucket_images WHERE id IN ({placeholders}) RETURNING id;"
-        )
 
-        async def work(conn):
-            cur = await conn.execute(sql, image_ids)
-            return [str(row[0]) for row in await cur.fetchall()]
+        if self._dedup:
+
+            async def work(conn):
+                cur = await conn.execute(
+                    f"DELETE FROM zerobucket_image_refs WHERE id IN ({placeholders}) "
+                    "RETURNING id, checksum_sha256;",
+                    image_ids,
+                )
+                deleted_rows = await cur.fetchall()
+                if not deleted_rows:
+                    return []
+                # Several deleted refs can share one blob: decrement each blob
+                # by how many of its refs were deleted.
+                checksum_counts = Counter(row[1] for row in deleted_rows)
+                emptied = []
+                for checksum, count in checksum_counts.items():
+                    cur = await conn.execute(_DEDUP_DECREMENT_BLOB, (count, checksum))
+                    if (await cur.fetchone())[0] <= 0:
+                        emptied.append(checksum)
+                if emptied:
+                    marks = ",".join("?" * len(emptied))
+                    await conn.execute(
+                        f"DELETE FROM zerobucket_blobs WHERE checksum_sha256 IN ({marks}) "
+                        "AND ref_count <= 0;",
+                        emptied,
+                    )
+                return [(str(row[0]), "sqlite", None) for row in deleted_rows]
+
+        else:
+
+            async def work(conn):
+                cur = await conn.execute(
+                    f"DELETE FROM zerobucket_images WHERE id IN ({placeholders}) "
+                    "RETURNING id, storage_backend, object_storage_key;",
+                    image_ids,
+                )
+                return [(str(r[0]), r[1], r[2]) for r in await cur.fetchall()]
 
         try:
-            return await self._run(work, operation="delete_many")
+            rows = await self._run(work, operation="delete_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image batch: {exc}") from exc
+        deleted_ids = []
+        for image_id, storage_backend, object_storage_key in rows:
+            deleted_ids.append(image_id)
+            if storage_backend == "object_storage" and self._object_storage is not None:
+                await self._delete_tiered_object(object_storage_key)
+        return deleted_ids
 
     # ---- exists -------------------------------------------------------------
 
     async def exists(self, image_id: str) -> bool:
+        exists_sql = _DEDUP_EXISTS if self._dedup else _EXISTS
+
         async def work(conn):
-            cur = await conn.execute(_EXISTS, (image_id,))
+            cur = await conn.execute(exists_sql, (image_id,))
             return (await cur.fetchone()) is not None
 
         try:
@@ -562,5 +853,5 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             raise StorageError(f"Failed to check image existence: {exc}") from exc
 
     async def close(self) -> None:
-        """No-op: same reasoning as sync SQLiteBackend.close() -- no
-        persistent connection/pool is held between operations."""
+        # No pool to release: a fresh connection is opened per operation.
+        return None
