@@ -43,6 +43,8 @@ import type {
   CallOptions,
   ImageListEntry,
   ImageListOptions,
+  MigrateToDedupOptions,
+  MigrateToDedupResult,
   StorageBackend,
   StorageInfo,
   StoredRecord,
@@ -758,6 +760,165 @@ export class SQLiteBackend implements StorageBackend {
       );
     } catch (exc) {
       throw wrap("Failed to check image existence", exc);
+    }
+  }
+
+  // ---- migration: classic -> dedup --------------------------------------
+
+  /**
+   * One-time, NON-DESTRUCTIVE copy of every row in the classic `zerobucket_images` table into this
+   * dedup instance's tables, preserving every id (external references keep working) and
+   * deduplicating identical content on the way. The classic table is never modified. Same contract
+   * as `PostgresBackend.migrateClassicToDedup()`.
+   *
+   * Rows are copied in small batches (bounded memory instead of loading the whole table);
+   * re-running is safe (already-migrated ids are skipped and reported, not an error). Classic rows
+   * already tiered to object storage are refused up front with a clear message (their bytes are
+   * not in the database to copy) unless `skipTiered: true`, which skips and counts them instead.
+   * All-or-nothing: ONE `BEGIN IMMEDIATE` transaction, so a failure part-way leaves the dedup
+   * tables exactly as they were. That transaction holds SQLite's single write lock for the whole
+   * copy, so other writers to this database file wait until it finishes (readers are not blocked).
+   */
+  async migrateClassicToDedup(
+    opts: MigrateToDedupOptions = {},
+  ): Promise<MigrateToDedupResult> {
+    if (!this.dedup) {
+      throw new StorageError(
+        "migrateClassicToDedup() must be called on an instance created with dedup: true.",
+      );
+    }
+    try {
+      return await this.execute(
+        "migrate_to_dedup",
+        undefined,
+        "write",
+        (db) => {
+          if (
+            !db
+              .prepare(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'zerobucket_images'",
+              )
+              .get()
+          ) {
+            throw new StorageError(
+              "No classic zerobucket_images table found in this database -- nothing to migrate.",
+            );
+          }
+          let tieredSkipped = 0;
+          const hasTierCol = (
+            db.prepare("PRAGMA table_info(zerobucket_images)").all() as {
+              name: string;
+            }[]
+          ).some((c) => c.name === "storage_backend");
+          if (hasTierCol) {
+            const tiered = (
+              db
+                .prepare(
+                  "SELECT count(*) AS n FROM zerobucket_images WHERE storage_backend <> 'sqlite'",
+                )
+                .get() as { n: number }
+            ).n;
+            if (tiered > 0 && !opts.skipTiered) {
+              throw new StorageError(
+                `${tiered} classic image(s) are tiered to object storage, so their bytes are not in the database to migrate. ` +
+                  "Dedup mode does not support tiering. Migrate only an un-tiered table, bring those images back first, " +
+                  "or pass skipTiered: true (CLI: --skip-tiered) to skip them and migrate the rest.",
+              );
+            }
+            tieredSkipped = tiered;
+          }
+          // Only reached with tiered rows present when skipTiered is set: leave them out of the copy.
+          const onlyInDb = hasTierCol && tieredSkipped > 0;
+
+          const seen = new Set<string>();
+          let migrated = 0;
+          let already = 0;
+          // Keyset paging on (created_at, id): created_at is TEXT here (a fixed-width ISO string), so it
+          // round-trips exactly. Rows sharing one created_at (a putMany batch) are ordered by id.
+          let cursor: { createdAt: string; id: string } | null = null;
+          const BATCH = 20;
+          const columns =
+            "id, data, mime_type, original_filename, size_bytes, width, height, checksum_sha256, created_at, updated_at";
+          for (;;) {
+            const page: any[] = cursor
+              ? db
+                  .prepare(
+                    `SELECT ${columns} FROM zerobucket_images WHERE (created_at, id) > (?, ?)${onlyInDb ? " AND storage_backend = 'sqlite'" : ""} ORDER BY created_at, id LIMIT ${BATCH}`,
+                  )
+                  .all(cursor.createdAt, cursor.id)
+              : db
+                  .prepare(
+                    `SELECT ${columns} FROM zerobucket_images${onlyInDb ? " WHERE storage_backend = 'sqlite'" : ""} ORDER BY created_at, id LIMIT ${BATCH}`,
+                  )
+                  .all();
+            if (page.length === 0) break;
+            const last = page[page.length - 1];
+            if (
+              cursor &&
+              cursor.createdAt === last.created_at &&
+              cursor.id === last.id
+            ) {
+              throw new StorageError(
+                "Migration made no progress (keyset cursor did not advance); aborting instead of looping.",
+              );
+            }
+            cursor = { createdAt: last.created_at, id: last.id };
+
+            const have = new Set(
+              (
+                db
+                  .prepare(
+                    `SELECT id FROM zerobucket_image_refs WHERE id IN (${placeholders(page.length)})`,
+                  )
+                  .all(...page.map((r) => r.id)) as { id: string }[]
+              ).map((r) => r.id),
+            );
+            const fresh = page.filter((r) => !have.has(r.id));
+            already += page.length - fresh.length;
+
+            // Identical content within this page shares one blob, counted once per reference.
+            const groups = new Map<string, { row: any; n: number }>();
+            for (const r of fresh) {
+              const g = groups.get(r.checksum_sha256);
+              if (g) g.n += 1;
+              else groups.set(r.checksum_sha256, { row: r, n: 1 });
+            }
+            for (const checksum of [...groups.keys()].sort()) {
+              const { row, n } = groups.get(checksum)!;
+              db.prepare(D_UPSERT).run(
+                checksum,
+                row.data,
+                row.mime_type,
+                row.size_bytes,
+                row.width,
+                row.height,
+                n,
+                row.created_at,
+              );
+            }
+            for (const r of fresh) {
+              db.prepare(D_INSERT_REF).run(
+                r.id,
+                r.checksum_sha256,
+                r.original_filename,
+                r.created_at,
+                r.updated_at,
+              );
+              seen.add(r.checksum_sha256);
+              migrated += 1;
+            }
+          }
+          return {
+            imagesMigrated: migrated,
+            distinctBlobsCreated: seen.size,
+            duplicateReferencesFound: migrated - seen.size,
+            alreadyMigrated: already,
+            tieredSkipped,
+          };
+        },
+      );
+    } catch (exc) {
+      throw wrap("Migration to dedup failed", exc);
     }
   }
 
