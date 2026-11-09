@@ -61,6 +61,8 @@ import type {
   CallOptions,
   ImageListEntry,
   ImageListOptions,
+  MigrateToDedupOptions,
+  MigrateToDedupResult,
   StorageBackend,
   StorageInfo,
   StoredRecord,
@@ -99,6 +101,7 @@ CREATE TABLE IF NOT EXISTS zerobucket_images (
 
 const TIERING_CHECK = "chk_zerobucket_storage";
 const MIGRATE_LOCK = "zerobucket_migrate";
+const MIGRATE_DEDUP_LOCK = "zerobucket_migrate_dedup";
 
 // ---- SQL ---------------------------------------------------------------------------------------
 
@@ -598,19 +601,40 @@ export class MySQLBackend implements StorageBackend {
   /**
    * Run `work` on a pooled connection. `tx` wraps it in a transaction. Transient failures retry the
    * WHOLE closure on a fresh connection after a full rollback.
+   *
+   * `lock` serializes this work against other callers holding the same named lock (`GET_LOCK`). The
+   * ORDER matters and is the whole point: the lock is taken BEFORE the transaction begins (so the
+   * transaction's snapshot is taken after any earlier holder has finished) and released AFTER the
+   * transaction commits or rolls back (so a later holder can never start while this one's rows are
+   * still uncommitted and invisible to it). Releasing inside `work`, before the commit, lets a second
+   * holder read a stale snapshot and collide on primary keys.
    */
   private async runPooled<T>(
     operation: string,
     work: Work<T>,
     tx: boolean,
+    lock?: { name: string; timeoutSec: number; timeoutMessage: string },
   ): Promise<T> {
     const start = performance.now();
     let attempt = 0;
     for (;;) {
       let conn: MysqlPoolConnectionLike | undefined;
       let destroy = false;
+      let held = false;
       try {
         conn = await this.acquire();
+        if (lock) {
+          const got = (
+            (
+              await conn.query("SELECT GET_LOCK(?, ?) AS got", [
+                lock.name,
+                lock.timeoutSec,
+              ])
+            )[0] as { got: number | null }[]
+          )[0]?.got;
+          if (got !== 1) throw new StorageError(lock.timeoutMessage);
+          held = true;
+        }
         if (tx) await conn.beginTransaction();
         const result = await work(conn);
         if (tx) await conn.commit();
@@ -632,6 +656,14 @@ export class MySQLBackend implements StorageBackend {
         }
       } finally {
         if (conn) {
+          // After the commit/rollback above. A destroyed connection takes its lock with it.
+          if (held && lock && !destroy) {
+            try {
+              await conn.query("SELECT RELEASE_LOCK(?)", [lock.name]);
+            } catch {
+              destroy = true; // cannot confirm the lock is gone: drop the session, which frees it
+            }
+          }
           if (destroy) conn.destroy();
           else conn.release();
         }
@@ -650,7 +682,13 @@ export class MySQLBackend implements StorageBackend {
     operation: string,
     connection: Connection | undefined,
     work: Work<T>,
-    { tx = false }: { tx?: boolean } = {},
+    {
+      tx = false,
+      lock,
+    }: {
+      tx?: boolean;
+      lock?: { name: string; timeoutSec: number; timeoutMessage: string };
+    } = {},
   ): Promise<T> {
     if (connection) {
       if (!isMysqlConnection(connection)) {
@@ -671,7 +709,7 @@ export class MySQLBackend implements StorageBackend {
       }
     }
     await this.ready();
-    return this.runPooled(operation, work, tx);
+    return this.runPooled(operation, work, tx, lock);
   }
 
   /**
@@ -992,6 +1030,179 @@ export class MySQLBackend implements StorageBackend {
     } catch (exc) {
       throw wrap("Failed to check image existence", exc);
     }
+  }
+
+  // ---- migration: classic -> dedup --------------------------------------
+
+  /**
+   * One-time, NON-DESTRUCTIVE copy of every row in the classic `zerobucket_images` table into this
+   * dedup instance's tables, preserving every id (external references keep working) and
+   * deduplicating identical content on the way. The classic table is never modified. Same contract
+   * as `PostgresBackend.migrateClassicToDedup()`.
+   *
+   * Rows are copied in small batches (bounded memory instead of loading the whole table);
+   * re-running is safe (already-migrated ids are skipped and reported, not an error). Classic rows
+   * already tiered to object storage are refused up front with a clear message (their bytes are
+   * not in the database to copy) unless `skipTiered: true`, which skips and counts them instead.
+   * All-or-nothing: ONE transaction, so a failure part-way leaves the dedup tables exactly as they
+   * were. A named lock (`GET_LOCK`) serializes two migrations started at once; it is taken before the
+   * transaction and released only after it commits (see `runPooled`), so a second migration always sees
+   * the first one's rows.
+   */
+  async migrateClassicToDedup(
+    opts: MigrateToDedupOptions = {},
+  ): Promise<MigrateToDedupResult> {
+    if (!this.dedup) {
+      throw new StorageError(
+        "migrateClassicToDedup() must be called on an instance created with dedup: true.",
+      );
+    }
+    try {
+      return await this.run(
+        "migrate_to_dedup",
+        undefined,
+        (q) => this.copyClassicToDedup(q, opts),
+        {
+          tx: true,
+          lock: {
+            name: MIGRATE_DEDUP_LOCK,
+            timeoutSec: 30,
+            timeoutMessage:
+              "Timed out waiting for another migration to dedup to finish.",
+          },
+        },
+      );
+    } catch (exc) {
+      throw wrap("Migration to dedup failed", exc);
+    }
+  }
+
+  private async copyClassicToDedup(
+    q: MysqlQueryable,
+    opts: MigrateToDedupOptions,
+  ): Promise<MigrateToDedupResult> {
+    const rowsOf = async (sql: string, params?: unknown[]): Promise<any[]> =>
+      (await q.query(sql, params))[0] as any[];
+
+    if (
+      (
+        await rowsOf(
+          "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'zerobucket_images'",
+        )
+      ).length === 0
+    ) {
+      throw new StorageError(
+        "No classic zerobucket_images table found in this database -- nothing to migrate.",
+      );
+    }
+    let tieredSkipped = 0;
+    const hasTierCol =
+      (
+        await rowsOf(
+          "SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'zerobucket_images' AND COLUMN_NAME = 'storage_backend'",
+        )
+      ).length > 0;
+    if (hasTierCol) {
+      const tiered = Number(
+        (
+          await rowsOf(
+            `SELECT COUNT(*) AS n FROM zerobucket_images WHERE storage_backend <> '${LOCAL}'`,
+          )
+        )[0].n,
+      );
+      if (tiered > 0 && !opts.skipTiered) {
+        throw new StorageError(
+          `${tiered} classic image(s) are tiered to object storage, so their bytes are not in the database to migrate. ` +
+            "Dedup mode does not support tiering. Migrate only an un-tiered table, bring those images back first, " +
+            "or pass skipTiered: true (CLI: --skip-tiered) to skip them and migrate the rest.",
+        );
+      }
+      tieredSkipped = tiered;
+    }
+    // Only reached with tiered rows present when skipTiered is set: leave them out of the copy.
+    const onlyInDb = hasTierCol && tieredSkipped > 0;
+
+    const seen = new Set<string>();
+    let migrated = 0;
+    let already = 0;
+    // created_at/updated_at travel as TEXT, never a JS Date: DATETIME(6) keeps microseconds, a Date
+    // keeps only milliseconds, and a truncated keyset cursor sorts before its own row (infinite loop).
+    let cursor: { createdAt: string; id: string } | null = null;
+    const BATCH = 20;
+    const columns =
+      "id, data, mime_type, original_filename, size_bytes, width, height, checksum_sha256, " +
+      "CAST(created_at AS CHAR) AS created_at_txt, CAST(updated_at AS CHAR) AS updated_at_txt";
+    for (;;) {
+      const page: any[] = cursor
+        ? await rowsOf(
+            `SELECT ${columns} FROM zerobucket_images WHERE (created_at, id) > (?, ?)${onlyInDb ? ` AND storage_backend = '${LOCAL}'` : ""} ORDER BY created_at, id LIMIT ${BATCH}`,
+            [cursor.createdAt, cursor.id],
+          )
+        : await rowsOf(
+            `SELECT ${columns} FROM zerobucket_images${onlyInDb ? ` WHERE storage_backend = '${LOCAL}'` : ""} ORDER BY created_at, id LIMIT ${BATCH}`,
+          );
+      if (page.length === 0) break;
+      const last = page[page.length - 1];
+      if (
+        cursor &&
+        cursor.createdAt === last.created_at_txt &&
+        cursor.id === last.id
+      ) {
+        throw new StorageError(
+          "Migration made no progress (keyset cursor did not advance); aborting instead of looping.",
+        );
+      }
+      cursor = { createdAt: last.created_at_txt, id: last.id };
+
+      const have = new Set(
+        (
+          await rowsOf("SELECT id FROM zerobucket_image_refs WHERE id IN (?)", [
+            page.map((r) => r.id),
+          ])
+        ).map((r) => String(r.id)),
+      );
+      const fresh = page.filter((r) => !have.has(String(r.id)));
+      already += page.length - fresh.length;
+
+      // Identical content within this page shares one blob, counted once per reference. Blobs are
+      // upserted in sorted checksum order (one global lock order, as everywhere else in this adapter).
+      const groups = new Map<string, { row: any; n: number }>();
+      for (const r of fresh) {
+        const g = groups.get(r.checksum_sha256);
+        if (g) g.n += 1;
+        else groups.set(r.checksum_sha256, { row: r, n: 1 });
+      }
+      for (const checksum of [...groups.keys()].sort()) {
+        const { row, n } = groups.get(checksum)!;
+        await q.query(upsertBlobSql(n), [
+          checksum,
+          row.data,
+          row.mime_type,
+          row.size_bytes,
+          row.width,
+          row.height,
+          row.created_at_txt,
+        ]);
+      }
+      for (const r of fresh) {
+        await q.query(D_INSERT_REF, [
+          r.id,
+          r.checksum_sha256,
+          r.original_filename,
+          r.created_at_txt,
+          r.updated_at_txt,
+        ]);
+        seen.add(r.checksum_sha256);
+        migrated += 1;
+      }
+    }
+    return {
+      imagesMigrated: migrated,
+      distinctBlobsCreated: seen.size,
+      duplicateReferencesFound: migrated - seen.size,
+      alreadyMigrated: already,
+      tieredSkipped,
+    };
   }
 
   // ---- maintenance (CLI) -----------------------------------------------
