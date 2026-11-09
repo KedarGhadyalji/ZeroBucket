@@ -243,7 +243,7 @@ zerobucket verify --sample 200  # ...or just a random sample (good for a nightly
 zerobucket tier IMAGE_ID --bucket my-images                         # move one image to S3
 zerobucket tier --older-than 90 --min-size 500000 --bucket my-images --dry-run   # preview a bulk move
 zerobucket tier --all --limit 1000 --bucket my-images --endpoint-url https://<acct>.r2.cloudflarestorage.com
-zerobucket migrate --to-dedup   # PostgreSQL: copy classic images into the dedup tables (non-destructive, re-runnable)
+zerobucket migrate --to-dedup   # copy classic images into the dedup tables (PostgreSQL, SQLite and MySQL; non-destructive, re-runnable)
 zerobucket migrate --to-dedup --skip-tiered   # ...skipping images tiered to object storage instead of refusing
 ```
 
@@ -306,7 +306,8 @@ How it behaves in Node, and why:
 - **Node 22+ for SQLite.** `better-sqlite3` 13 requires Node 22 or newer and crashes on older versions. It ships its Windows,
   macOS and Linux binaries inside the npm package, so no compiler or Visual Studio is needed. Postgres users can stay on Node 20.
   (`better-sqlite3` 12 declares Node 20 support, but it is untested here.)
-- Not available on SQLite: `migrateClassicToDedup()` (Python has it for Postgres only, too).
+- `migrateClassicToDedup()` works on SQLite (since 0.11.0): one `BEGIN IMMEDIATE` transaction, so it is all-or-nothing, and it
+  holds SQLite's single write lock for the whole copy, so other writers to the file wait until it finishes (readers do not).
 
 ## MySQL / MariaDB
 
@@ -328,7 +329,9 @@ dedup tables), so a Node app and a Python app can share one MySQL/MariaDB databa
 directions in both modes, including tiered rows and shared dedup blobs.
 
 As everywhere, dedup and tiering cannot be combined (`dedup: true` with `objectStorage` throws). Copying an existing
-classic table into the dedup tables (`migrate --to-dedup`) is PostgreSQL-only, as in the Python package.
+classic table into the dedup tables (`migrate --to-dedup`) works on MySQL/MariaDB since 0.11.0: one transaction (all-or-nothing)
+and a named lock (`GET_LOCK`) so two migrations started at once cannot race. Timestamps are copied as text, never as JS dates,
+because `DATETIME(6)` keeps microseconds and a JS date does not.
 
 What is different from Postgres, and why (each verified against a real MariaDB 10.11):
 
@@ -400,7 +403,8 @@ await images.delete(b); // last reference gone: blob removed
 **Moving existing data in:** `await images.migrateClassicToDedup()` copies every classic image into the dedup tables,
 keeping each id, and never modifies the classic table. It runs in small batches (bounded memory), is safe to re-run
 (already-migrated ids are skipped and counted), and refuses up front if any classic image is tiered to object storage
-(their bytes are not in the database to copy, and dedup mode has no tiering), changing nothing. If you would rather
+(their bytes are not in the database to copy, and dedup mode has no tiering), changing nothing. Works on PostgreSQL, SQLite
+and MySQL/MariaDB (SQLite and MySQL since 0.11.0). If you would rather
 migrate everything else, pass `{ skipTiered: true }` (CLI: `--skip-tiered`): tiered images are left untouched in the
 classic table, counted in `tieredSkipped`, and **will not exist in the dedup tables**, so only use it if you can live
 without them there.
@@ -453,29 +457,31 @@ same corpus of valid and corrupt files identically.
 
 ## Differences from the Python package
 
-Python column = zerobucket on PyPI **0.26.0 or later** (several of its behaviours below were fixed in 0.25.1 and 0.26.0; older
-versions differ).
+Python column = zerobucket on PyPI **0.30.0 or later** (several of its behaviours below were fixed or added in 0.25.1, 0.26.0 and
+0.27.0 to 0.30.0; older versions differ).
 
-|                                                                | Python                                                                | npm                                                                                                                                 |
-| -------------------------------------------------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| API                                                            | sync + async clients                                                  | one async client                                                                                                                    |
-| `optimize`                                                     | Pillow; EXIF stripped, not applied                                    | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                                                            |
-| JPEG encoder in `optimize`                                     | Pillow, progressive + optimized                                       | sharp with `mozjpeg`, progressive: on smooth photos roughly **half the size** at about the same SSIM (measured); WebP and PNG match |
-| JPEG missing only its last 1-2 bytes (the end-of-image marker) | accepted (Pillow reads every pixel)                                   | **rejected** (libvips treats a premature end as an error); truncated interlaced PNGs are rejected by both since npm 0.10.0          |
-| `putMany` inserts                                              | pipelined                                                             | one transaction, statements run sequentially                                                                                        |
-| Formats                                                        | JPEG, PNG, WebP, HEIC (`[heic]` extra)                                | JPEG, PNG, WebP, HEIC (optional `libheif-js`)                                                                                       |
-| Convert TO HEIC with `optimize`                                | yes (pillow-heif)                                                     | no (no HEVC encoder for Node); converting FROM HEIC works; `optimize: true` on a HEIC needs an explicit `format`                    |
-| Event duration                                                 | `duration_seconds`                                                    | `durationMs`                                                                                                                        |
-| `migrateClassicToDedup`, tiered classic rows                   | always **skips** them and reports `tiered_rows_skipped`               | **refuses** by default (changes nothing); `skipTiered: true` / `--skip-tiered` skips and reports like Python                        |
-| `migrateClassicToDedup`, other behaviour                       | batched, safe to re-run (server-side cursor)                          | batched, safe to re-run (keyset paging, advisory lock so concurrent runs cannot race)                                               |
-| SQLite API                                                     | synchronous `SQLiteBackend` + separate async backend                  | one async client; the sync driver runs on the event loop, lock waits are async (never block it)                                     |
-| SQLite `onOperation` / busy retry                              | none                                                                  | `onOperation` events and async `SQLITE_BUSY` retry (`busyTimeoutMs`)                                                                |
-| SQLite stream deleted mid-read                                 | sync adapter keeps reading a WAL snapshot (async adapter raises)      | raises `StorageError`, like Postgres; use `connection` in a transaction for a snapshot                                              |
-| MySQL `onOperation` / retry                                    | sync `MySQLBackend` yes; `AsyncMySQLBackend` none                     | yes (same client for everything)                                                                                                    |
-| CLI                                                            | PostgreSQL, classic mode only; `verify` skips tiered rows with a note | PostgreSQL, SQLite **and** MySQL/MariaDB, classic **and** dedup; `verify --bucket` also checks tiered images; `migrate --to-dedup`  |
-| `connection=` without an open transaction                      | multi-statement ops rely on the driver's implicit transaction         | always atomic (own transaction or savepoint)                                                                                        |
-| S3 delete failure after `delete()`                             | raises after the row is gone                                          | never fails the delete; reported via `onOperation`                                                                                  |
-| Options                                                        | snake_case kwargs                                                     | camelCase options object                                                                                                            |
+|                                                                | Python                                                                                                                                                          | npm                                                                                                                                             |
+| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| API                                                            | sync + async clients                                                                                                                                            | one async client                                                                                                                                |
+| Async clients: dedup and tiering                               | every async adapter (since 0.30.0)                                                                                                                              | one async client, always                                                                                                                        |
+| `optimize`                                                     | Pillow; EXIF stripped, not applied                                                                                                                              | sharp; EXIF **applied then stripped**; transparency → **white** for JPEG                                                                        |
+| JPEG encoder in `optimize`                                     | Pillow, progressive + optimized                                                                                                                                 | sharp with `mozjpeg`, progressive: on smooth photos roughly **half the size** at about the same SSIM (measured); WebP and PNG match             |
+| JPEG missing only its last 1-2 bytes (the end-of-image marker) | accepted (Pillow reads every pixel)                                                                                                                             | **rejected** (libvips treats a premature end as an error); truncated interlaced PNGs are rejected by both since npm 0.10.0                      |
+| `putMany` inserts                                              | pipelined                                                                                                                                                       | one transaction, statements run sequentially                                                                                                    |
+| Formats                                                        | JPEG, PNG, WebP, HEIC (`[heic]` extra)                                                                                                                          | JPEG, PNG, WebP, HEIC (optional `libheif-js`)                                                                                                   |
+| Convert TO HEIC with `optimize`                                | yes (pillow-heif)                                                                                                                                               | no (no HEVC encoder for Node); converting FROM HEIC works; `optimize: true` on a HEIC needs an explicit `format`                                |
+| Event duration                                                 | `duration_seconds`                                                                                                                                              | `durationMs`                                                                                                                                    |
+| `migrateClassicToDedup`, tiered classic rows                   | always **skips** them and reports `tiered_rows_skipped`                                                                                                         | **refuses** by default (changes nothing); `skipTiered: true` / `--skip-tiered` skips and reports like Python                                    |
+| `migrateClassicToDedup`, other behaviour                       | batched, safe to re-run (server-side cursor)                                                                                                                    | batched, safe to re-run (keyset paging); concurrent runs cannot race (PostgreSQL advisory lock, MySQL named lock, SQLite write lock)            |
+| `migrateClassicToDedup`, databases                             | PostgreSQL only                                                                                                                                                 | PostgreSQL, SQLite **and** MySQL/MariaDB (SQLite and MySQL since 0.11.0)                                                                        |
+| SQLite API                                                     | synchronous `SQLiteBackend` + separate async backend                                                                                                            | one async client; the sync driver runs on the event loop, lock waits are async (never block it)                                                 |
+| SQLite `onOperation` / busy retry                              | `on_operation` events and busy retry, sync and async (since 0.27.0)                                                                                             | `onOperation` events and async `SQLITE_BUSY` retry (`busyTimeoutMs`)                                                                            |
+| SQLite stream deleted mid-read                                 | sync adapter keeps reading a WAL snapshot (async adapter raises)                                                                                                | raises `StorageError`, like Postgres; use `connection` in a transaction for a snapshot                                                          |
+| MySQL `onOperation` / retry                                    | yes, sync and async (since 0.27.0)                                                                                                                              | yes (same client for everything)                                                                                                                |
+| CLI                                                            | PostgreSQL, SQLite **and** MySQL/MariaDB, classic **and** dedup; `verify --bucket` checks tiered images (since 0.28.0); `migrate --to-dedup` on PostgreSQL only | PostgreSQL, SQLite **and** MySQL/MariaDB, classic **and** dedup; `verify --bucket` also checks tiered images; `migrate --to-dedup` on all three |
+| `connection=` without an open transaction                      | multi-statement ops rely on the driver's implicit transaction                                                                                                   | always atomic (own transaction or savepoint)                                                                                                    |
+| S3 delete failure after `delete()`                             | never fails the delete; reported as an `object_storage_delete` event (since 0.29.0)                                                                             | never fails the delete; reported via `onOperation`                                                                                              |
+| Options                                                        | snake_case kwargs                                                                                                                                               | camelCase options object                                                                                                                        |
 
 Both packages treat a malformed id as "not found" on every backend (Python 0.26.0+, npm 0.9.0+) and never pass one to a
 `before_get`/`beforeGet` hook. Both packages now leave a tiered image's object in place on `delete(id, connection=...)` (a rolled-back transaction can
@@ -521,8 +527,8 @@ memory, event-loop impact, throughput, and the before and after of each release)
   files must be backed up with `.backup`, not copied. See the
   [Operations Guide](https://github.com/KedarGhadyalji/ZeroBucket/blob/main/docs/OPERATIONS.md).
 - **Dedup and tiering cannot be combined** (a shared blob has many owners): `dedup: true` with `objectStorage` throws.
-- **`migrate --to-dedup` is PostgreSQL-only**, as in the Python package. Tiered classic images cannot be migrated (see
-  Deduplication for `skipTiered`).
+- **Tiered classic images cannot be migrated** by `migrate --to-dedup` (see Deduplication for `skipTiered`). The migration itself
+  works on PostgreSQL, SQLite and MySQL/MariaDB since 0.11.0; the Python package still has it for PostgreSQL only.
 - **HEIC can be read and converted from, but not written.** There is no HEVC encoder for Node, so `optimize` cannot
   produce HEIC.
 - **SQLite allows one writer at a time**; lock waits are async and never block the event loop, but write-heavy

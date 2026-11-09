@@ -6,6 +6,54 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.11.0] - 2026-11-05
+
+`migrateClassicToDedup()` and `zerobucket migrate --to-dedup` now work on SQLite and MySQL/MariaDB, not only PostgreSQL.
+
+### Added
+
+- **`migrateClassicToDedup()` on `SQLiteBackend` and `MySQLBackend`** (and through `new ZeroBucket({ sqlite | mysql, dedup: true })`),
+  with the same contract as PostgreSQL: a one-time, non-destructive copy of every classic row into the dedup tables that keeps each
+  id (external references keep working), deduplicates identical content, never touches the classic table, runs in small batches
+  (bounded memory), and is safe to re-run (already-migrated ids are skipped and counted, not an error). Tiered classic rows are
+  refused up front with a message naming `skipTiered: true`, or skipped and counted with it. It returns the same
+  `MigrateToDedupResult`. The SQLite and MySQL versions also report a `migrate_to_dedup` event to `onOperation` (success or
+  failure); the existing PostgreSQL migration has never reported one, and still does not.
+- **All-or-nothing on every database.** SQLite runs the whole copy in one `BEGIN IMMEDIATE` transaction (and so holds SQLite's single
+  write lock for the duration: other writers to that file wait, readers do not). MySQL runs it in one transaction. A failure part-way
+  leaves the dedup tables exactly as they were, and a later run then completes.
+- **Two migrations started at once cannot race:** MySQL takes a named lock (`GET_LOCK`), PostgreSQL its advisory lock, SQLite its write
+  lock. Together the two runs copy each image exactly once and no blob's `ref_count` is double-counted. The MySQL lock is taken
+  BEFORE the transaction begins and released only AFTER it commits, so a second migration can never start while the first one's rows
+  are still uncommitted and invisible to it (releasing it earlier, inside the transaction, lets the second collide on primary keys
+  with `Duplicate entry ... for key 'PRIMARY'`). A regression test with a deliberately slow `COMMIT` pins that ordering.
+- **`zerobucket migrate --to-dedup [--skip-tiered]` on SQLite and MySQL** (`--sqlite PATH`, or a `mysql://` / `mariadb://` URL). It refuses a
+  SQLite path that does not exist instead of silently creating an empty database file.
+- Tests: `tests/migrate_dedup.test.ts` (33 tests: eleven scenarios on each of PostgreSQL, SQLite and MySQL, including more rows than one
+  batch with every row sharing one `created_at`, tiered rows, a failure injected mid-copy, two concurrent migrations, and, on MySQL, a
+  deliberately slow `COMMIT`), and the CLI
+  tests for `migrate --to-dedup` now run on every database instead of asserting that SQLite and MySQL are refused.
+
+### Changed
+
+- **The SQLite and MySQL migrations preserve `updated_at`** as well as `created_at`. The PostgreSQL migration (npm and Python) has
+  always preserved `created_at` only and lets `updated_at` reset to the migration time; that is unchanged here, so the databases now
+  differ in that one detail. Timestamps travel as text, never as JS dates, because MySQL's `DATETIME(6)` keeps microseconds and a JS date
+  keeps only milliseconds (a truncated keyset cursor sorts before its own row and would loop forever).
+- **Two timing-sensitive tests no longer depend on how fast a connection opens.** The PostgreSQL "pool timeout is explicit" test (and its
+  MySQL counterpart) opened their first connection under the very 150 ms / 300 ms timeout they were checking, so on a slow or busy
+  machine `ready()` failed with `Connection terminated due to connection timeout` before the test reached the pool behaviour. Setup now
+  runs under a generous timeout and only the wait for a free slot runs under the short one; the PostgreSQL test also asserts that
+  `poolTimeoutMs` really reaches pg-pool. Reproduced deterministically by adding 250 ms to every new connection (the old test failed
+  with exactly that error, the new one passes), and the whole suite passes under that delay.
+- The README's Python-versus-npm table is brought up to date with Python 0.30.0: SQLite and MySQL retry and `on_operation`, the Python
+  CLI, and S3 delete failures are no longer listed as gaps, and a row for which databases `migrateClassicToDedup` supports was added.
+
+### Known limits
+
+- Migrating a classic table that has tiered rows needs `skipTiered`, and those images then do not exist in the dedup tables.
+- The Python package still has `migrate_classic_to_dedup()` for PostgreSQL only.
+
 ## Python `zerobucket` [0.30.0] - 2026-11-04
 
 The async adapters are no longer classic-only: they now support dedup mode and object-storage tiering, like the sync adapters.
