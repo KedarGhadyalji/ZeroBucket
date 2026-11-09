@@ -868,6 +868,9 @@ describe.skipIf(!URL)("MySQL/MariaDB (real server)", () => {
 
     it("waiting for a pool slot times out with a clear, non-retried error, and the slot is not leaked", async () => {
       const real = mysql.createPool({ uri: URL!, connectionLimit: 1 });
+      // Open the pool's only connection BEFORE the 300 ms timer applies, so connection speed (slow on a
+      // busy machine) cannot fail the set-up put() below; only the wait for a slot is under test.
+      await real.query("SELECT 1");
       const evs: OperationEvent[] = [];
       const be = new MySQLBackend({
         pool: real as unknown as MysqlPoolLike,

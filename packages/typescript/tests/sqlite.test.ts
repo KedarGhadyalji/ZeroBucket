@@ -734,7 +734,7 @@ describe("SQLite: dedup mode", () => {
     await done();
   });
 
-  it("refuses tiering, objectStorage, and classic->dedup migration (not supported on SQLite)", async () => {
+  it("refuses tiering and objectStorage in dedup mode; the migration reports a missing classic table (migrating is covered in migrate_dedup.test.ts)", async () => {
     const id = await zb.put(await makeImage("png", 20, 20, { seed: 40 }));
     await expect(zb.tierToObjectStorage(id)).rejects.toThrow(/dedup/);
     expect(
@@ -745,8 +745,9 @@ describe("SQLite: dedup mode", () => {
           objectStorage: new ObjectStorage({ bucket: "b" }),
         }),
     ).toThrow(TypeError);
+    // Migration is supported on SQLite since 0.11.0; this fresh dedup database has no classic table.
     await expect(zb.migrateClassicToDedup()).rejects.toThrow(
-      /does not support/,
+      /No classic zerobucket_images table/,
     );
     await done();
   });

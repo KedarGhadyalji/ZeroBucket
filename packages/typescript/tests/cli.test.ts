@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -290,16 +291,36 @@ for (const kind of kinds) {
         expect(m.out).toMatch(/does not have versioned migrations yet/);
         expect(m.out).toMatch(/table and indexes are ready/);
       });
-      it("migrate --to-dedup copies classic images (PostgreSQL) or is refused (SQLite, MySQL)", async () => {
-        await reset();
-        if (kind !== "postgres") {
-          const r = await run(["migrate", "--to-dedup", ...target()]);
-          expect(r).toMatchObject({ code: 2 });
-          expect(r.err).toMatch(/only supported for PostgreSQL/);
-          return;
+      /** A classic row whose bytes live in object storage, so the database holds none. */
+      const insertTiered = async (key: string, checksum: string) => {
+        if (kind === "postgres")
+          await raw!.query(
+            `INSERT INTO zerobucket_images (data, mime_type, size_bytes, checksum_sha256, storage_backend, object_storage_bucket, object_storage_key)
+             VALUES (NULL, 'image/png', 10, $1, 'object_storage', 'b', $2)`,
+            [checksum, key],
+          );
+        else if (kind === "mysql")
+          await my!.query(
+            `INSERT INTO zerobucket_images (id, data, mime_type, size_bytes, checksum_sha256, created_at, updated_at, storage_backend, object_storage_bucket, object_storage_key)
+             VALUES (?, NULL, 'image/png', 10, ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), 'object_storage', 'b', ?)`,
+            [randomUUID(), checksum, key],
+          );
+        else {
+          const Database = (await import("better-sqlite3")).default;
+          const db = new Database(path);
+          try {
+            const ts = "2026-01-02T03:04:05.123456+00:00";
+            db.prepare(
+              `INSERT INTO zerobucket_images (id, data, mime_type, size_bytes, checksum_sha256, created_at, updated_at, storage_backend, object_storage_bucket, object_storage_key)
+               VALUES (?, NULL, 'image/png', 10, ?, ?, ?, 'object_storage', 'b', ?)`,
+            ).run(randomUUID(), checksum, ts, ts, key);
+          } finally {
+            db.close();
+          }
         }
-        await raw!.query("DELETE FROM zerobucket_image_refs").catch(() => {});
-        await raw!.query("DELETE FROM zerobucket_blobs").catch(() => {});
+      };
+      it("migrate --to-dedup copies classic images, on every database, and is re-runnable", async () => {
+        await reset();
         const zb = client();
         const a = await makeImage("png", 30, 30, { seed: 1 });
         await zb.put(a);
@@ -310,8 +331,12 @@ for (const kind of kinds) {
         expect(r.code).toBe(0);
         expect(r.out).toContain("Migrated 3 image(s) into 2 distinct blob(s).");
         expect(r.out).toContain("Duplicate references found: 1");
+        expect(r.out).toContain("The classic table was not modified.");
         expect((await run(["info", "--dedup", ...target()])).out).toMatch(
           /3 image\(s\) sharing 2 distinct blob\(s\)/,
+        );
+        expect((await run(["info", ...target()])).out).toMatch(
+          /zerobucket_images: 3 image\(s\)/, // the classic table is untouched
         );
         expect(
           (await run(["migrate", "--to-dedup", ...target()])).out,
@@ -319,21 +344,10 @@ for (const kind of kinds) {
       });
       it("migrate --to-dedup refuses tiered images unless --skip-tiered; --skip-tiered alone is a usage error", async () => {
         await reset();
-        if (kind !== "postgres") {
-          const r = await run(["migrate", "--skip-tiered", ...target()]);
-          expect(r).toMatchObject({ code: 2 });
-          return;
-        }
-        await raw!.query("DELETE FROM zerobucket_image_refs").catch(() => {});
-        await raw!.query("DELETE FROM zerobucket_blobs").catch(() => {});
         const zb = client();
         await zb.put(await makeImage("png", 32, 32, { seed: 3 }));
         await zb.close();
-        await raw!.query(
-          `INSERT INTO zerobucket_images (data, mime_type, size_bytes, checksum_sha256, storage_backend, object_storage_bucket, object_storage_key)
-           VALUES (NULL, 'image/png', 10, $1, 'object_storage', 'b', 'k')`,
-          ["a".repeat(64)],
-        );
+        await insertTiered("k", "a".repeat(64));
         const refused = await run(["migrate", "--to-dedup", ...target()]);
         expect(refused.code).toBe(1);
         expect(refused.err).toMatch(/--skip-tiered/);
@@ -353,9 +367,17 @@ for (const kind of kinds) {
         const alone = await run(["migrate", "--skip-tiered", ...target()]);
         expect(alone.code).toBe(2);
         expect(alone.err).toMatch(/only applies with --to-dedup/);
-        await raw!.query(
-          "DELETE FROM zerobucket_images WHERE storage_backend = 'object_storage'",
-        );
+      });
+      it("migrate --to-dedup with no classic table says so and exits 1", async () => {
+        await dropAll();
+        if (kind === "sqlite") {
+          // An existing but empty database file: nothing to migrate.
+          const Database = (await import("better-sqlite3")).default;
+          new Database(path).close();
+        }
+        const r = await run(["migrate", "--to-dedup", ...target()]);
+        expect(r.code).toBe(1);
+        expect(r.err).toMatch(/No classic zerobucket_images table found/);
       });
     });
 
