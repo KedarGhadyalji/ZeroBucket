@@ -64,7 +64,7 @@ Usage: zerobucket <command> [options]
 Commands:
   init       Create the schema (tables and indexes) if missing.
   migrate    Apply schema migrations (currently: same as init).
-             --to-dedup  copy every classic image into the dedup tables (PostgreSQL only; non-destructive)
+             --to-dedup  copy every classic image into the dedup tables (PostgreSQL, SQLite and MySQL; non-destructive)
              --skip-tiered  with --to-dedup: skip images tiered to object storage instead of refusing
   info       Show storage stats: count, size, breakdown by format.
   verify     Re-checksum stored images to detect corruption.
@@ -287,8 +287,8 @@ async function cmdMigrate(
     throw usageError("Error: --skip-tiered only applies with --to-dedup.");
   if (v["to-dedup"]) {
     const target = resolveTarget(v, env);
-    if (target.kind !== "postgres")
-      throw usageError("Error: --to-dedup is only supported for PostgreSQL.");
+    // Opening a SQLite path that does not exist would silently create an empty database file.
+    requireSqliteFile(target, "Nothing to migrate.");
     const backend = openBackend(target, { dedup: true, autoMigrate: true });
     await connect(backend, "connect");
     try {
