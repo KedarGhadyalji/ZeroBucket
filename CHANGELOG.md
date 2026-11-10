@@ -18,6 +18,9 @@ No code in either package changed, so no version is bumped.
 - **CI runs the SQLite-and-filesystem tests on Windows.** Two new jobs (Python 3.12 and Node 22 on `windows-latest`) set
   `core.autocrlf false` before checkout. GitHub's Windows runners cannot run service containers, so the PostgreSQL, MySQL and S3 tests
   skip themselves there, as they do whenever their `ZEROBUCKET_TEST_*` setting is missing.
+  The Windows npm job installs with `npm ci --ignore-scripts`: from a lockfile npm otherwise tries to compile `better-sqlite3` with
+  node-gyp, which needs Visual Studio, although the package ships a Windows binary. No other package in the lockfile needs its install
+  scripts (`esbuild` finds its binary through its platform package).
 - **GitHub Actions moved to their Node 24 versions** in `ci.yml`, `publish.yml` and `publish-npm.yml`: `actions/checkout` v6,
   `actions/setup-python` v6, `actions/setup-node` v6, `actions/upload-artifact` v7 and `actions/download-artifact` v8.
 - **CI job names changed** (for example `Python 3.12 / mysql:8.0`, `Node 22 / windows`). Update any branch-protection rule that

@@ -256,9 +256,12 @@ jobs:
           cache: npm
           cache-dependency-path: packages/typescript/package-lock.json
 
+      # --ignore-scripts: from a lockfile, npm runs better-sqlite3's install script, which compiles it with node-gyp and needs
+      # Visual Studio, even though the package ships a Windows binary. Nothing else in the lockfile needs its install scripts
+      # (esbuild finds its binary through its platform package).
       - name: Install
         working-directory: packages/typescript
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Typecheck
         working-directory: packages/typescript
