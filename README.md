@@ -342,9 +342,11 @@ bucket/credentials used to tier them.
 
 ### SQLite support
 
-**Experimental, in progress -- not yet at feature parity with the
-Postgres adapter.** `SQLiteBackend`/`AsyncSQLiteBackend` store images
-in a local SQLite file instead of Postgres. Use them via the existing
+`SQLiteBackend`/`AsyncSQLiteBackend` store images in a local SQLite
+file instead of Postgres, with the same features as the Postgres
+adapters apart from the differences listed below and
+`migrate_classic_to_dedup()`, which is PostgreSQL-only in the Python
+package. Use them via the existing
 `backend=` override (there's no dedicated `sqlite://` connection-string
 auto-detection in either constructor yet):
 
@@ -363,7 +365,7 @@ images = AsyncZeroBucket(backend=AsyncSQLiteBackend("images.db"))
 image_id = await images.put("photo.jpg")
 ```
 
-What works today (as of 0.19.0), sync: `put`/`put_many`/`get`/
+What works, sync: `put`/`put_many`/`get`/
 `get_many`/`metadata`/`delete`/`delete_many`/`exists`, `get_stream()`/
 `stream_to()`, `tier_to_object_storage()` (pass `object_storage=` to
 `SQLiteBackend` the same way you would to `PostgresBackend`),
@@ -390,13 +392,13 @@ adapters. Only lock contention (`SQLITE_BUSY`/`SQLITE_LOCKED`) is
 retried, as a whole-operation re-run. SQLite already waits up to 10 s per
 attempt inside the engine, so a lock that is truly stuck can take up to
 `(max_retries + 1) x 10 s` to fail; pass `max_retries=0` for the old
-single wait. Sync `SQLiteBackend.get_stream()` and
-`tier_to_object_storage()` are not instrumented and not retried.
+single wait. `get_stream()` and `tier_to_object_storage()` are partly exempt; see the
+fourth difference below.
 `dedup=True` combined with `object_storage=` raises `ValueError` at construction --
 same restriction as the Postgres adapter; combining content-addressed
 storage with tiering is out of scope for both.
 
-Three real, verified differences worth knowing before you rely on
+Four real, verified differences worth knowing before you rely on
 identical behavior across backends -- not theoretical ones:
 
 - **`tier_to_object_storage()` locks the whole database file, not just
@@ -430,6 +432,15 @@ UPDATE`-based version has, but `BEGIN IMMEDIATE` is a coarser lock --
   differently from each other for this exact scenario, not just
   differently from Postgres. Confirmed directly with a dedicated test
   for each, not assumed consistent just because both are "SQLite."
+- **Which operations report to `on_operation` and retry differs between
+  the sync and async backends.** On both, the core operations (`put`,
+  `get`, `delete` and the rest) report events and retry lock
+  contention. Two operations are exempt, and not the same two. Sync
+  `get_stream()` and sync `tier_to_object_storage()` do neither, because
+  each opens its own connection outside the retry path. Async
+  `get_stream()` does both: each of its queries (the size lookup and
+  every chunk) goes through the retry and reporting path. Async
+  `tier_to_object_storage()` still does neither.
 
 ### MySQL support
 
@@ -524,8 +535,8 @@ UPDATE` immediately before the statement that follows, inside one
   re-runs a multi-statement `work()` closure from scratch on a fresh
   connection), which is what makes it safe for dedup `put()`/
   `tier_to_object_storage()` and is NOT the same thing as the DBUtils
-  statement-replay hazard disabled above -- deliberately not added to
-  `AsyncMySQLBackend`, matching `AsyncPostgresBackend`'s own scope.
+  statement-replay hazard disabled above. `AsyncMySQLBackend` has the
+  same whole-operation retry since 0.27.0.
 - **`tier_to_object_storage()`'s row lock is a REAL improvement over
   SQLite's equivalent, not just a different implementation of the same
   guarantee.** MySQL/MariaDB's InnoDB storage engine has genuine
@@ -551,10 +562,9 @@ DUPLICATE KEY UPDATE ref_count = ref_count + 1` (not Postgres's/
   `zerobucket[mysql-async]` extra pins `PyMySQL<1.2.0` explicitly to
   work around this -- confirmed necessary by hitting two different
   failure modes while narrowing the correct version boundary, not
-  guessed at from a changelog. A tiered image fetched via the async
-  client also fails with an unhelpful error (no `ObjectStorage` to
-  resolve it with) -- the same inherited limitation
-  `AsyncPostgresBackend` has for Postgres, not new to MySQL.
+  guessed at from a changelog. Since 0.30.0 `AsyncMySQLBackend` accepts
+  `object_storage=`, so it can read tiered images; without it, reading
+  one raises a clear `StorageError` that says what is missing.
 
 ### Serving from a web API
 
@@ -960,6 +970,10 @@ mode has no tiering; they stay untouched in the classic table. Rows stream
 from the server in batches (`batch_size=200`), so memory use does not grow
 with table size. The migration is still one transaction: all rows, or none.
 
+`migrate_classic_to_dedup()` is PostgreSQL-only in the Python package.
+The npm package's `migrateClassicToDedup()` also supports SQLite and
+MySQL/MariaDB since 0.11.0.
+
 ## Tuning and observability
 
 Two things worth knowing before you try to optimize anything: how to
@@ -1057,12 +1071,17 @@ Be honest with yourself about whether ZeroBucket fits your workload:
   (`dedup=False`), uploading the same image twice still stores it twice
   -- pass `dedup=True` for content-addressed, reference-counted storage.
   See the [Deduplication](#deduplication) section above.
-- **No image resizing/optimization pipeline yet.** ZeroBucket stores
-  what you give it. It validates and rejects bad input; it doesn't
-  transform good input (yet).
-- **PostgreSQL only, for now.** The storage layer is abstracted
-  specifically so SQLite/MySQL adapters can be added without touching
-  application code, but only the Postgres adapter exists today.
+- **Image optimization is opt-in.** By default ZeroBucket stores what
+  you give it: it validates and rejects bad input and doesn't transform
+  good input. Pass `optimize=True` to strip metadata, resize and
+  re-encode on `put()` (see
+  [Optimizing images (compression)](#optimizing-images-compression)).
+  `AsyncZeroBucket` doesn't support it yet.
+- **Three databases, nothing else.** ZeroBucket works with PostgreSQL,
+  SQLite and MySQL/MariaDB (see [SQLite support](#sqlite-support) and
+  [MySQL support](#mysql-support)). The storage layer is abstracted so
+  other databases could be added without touching application code, but
+  no other adapter exists.
 - **Storing bytes in BYTEA does not compress them further than they
   already are.** JPEG/WebP files are already near-maximum entropy;
   Postgres's TOAST compression does essentially nothing to them (see
@@ -1086,12 +1105,14 @@ zerobucket/
 │   │   │   └── adapters/
 │   │   │       ├── base.py           # StorageBackend interface (sync)
 │   │   │       ├── postgres.py       # sync Postgres implementation
-│   │   │       ├── sqlite.py         # sync SQLite implementation (in progress)
-│   │   │       ├── mysql.py          # sync MySQL/MariaDB implementation (in progress)
+│   │   │       ├── sqlite.py         # sync SQLite implementation
+│   │   │       ├── mysql.py          # sync MySQL/MariaDB implementation
 │   │   │       ├── base_async.py     # AsyncStorageBackend interface
 │   │   │       ├── postgres_async.py # async Postgres implementation
-│   │   │       └── sqlite_async.py   # async SQLite implementation (in progress)
+│   │   │       ├── sqlite_async.py   # async SQLite implementation
+│   │   │       └── mysql_async.py    # async MySQL/MariaDB implementation
 │   │   └── tests/
+│   ├── typescript/      # the npm zerobucket package (same API, same databases)
 │   └── django-zerobucket/  # separate package: Django Storage backend adapter
 │       ├── src/django_zerobucket/
 │       │   ├── storage.py      # ZeroBucketStorage(Storage)
@@ -1136,7 +1157,8 @@ zerobucket tier --all --bucket my-bucket --dry-run       # preview without doing
 ```
 
 Since 0.28.0 the CLI works on **PostgreSQL, SQLite and MySQL/MariaDB**, in
-classic **and** dedup mode, the same as the npm package's CLI. Choose the
+classic **and** dedup mode, the same as the npm package's CLI except for
+`migrate --to-dedup` (below). Choose the
 database with one of:
 
 ```bash
@@ -1163,7 +1185,9 @@ pass `--bucket` (plus `--endpoint-url`/`--region`/credentials, the same
 options as `tier`) to check those too -- their bytes are read back from the
 bucket and checksummed like any other.
 
-`migrate --to-dedup` refuses when classic images are tiered to object storage
+In the Python CLI, `migrate --to-dedup` is still PostgreSQL-only and refuses a
+SQLite or MySQL/MariaDB target; the npm CLI has supported all three since 0.11.0.
+It also refuses when classic images are tiered to object storage
 (their bytes are not in the database to copy); pass `--skip-tiered` to skip
 them and migrate the rest. It never modifies the classic table.
 
@@ -1200,7 +1224,9 @@ and autovacuum tuning notes specific to a BYTEA-heavy table.
 
 Not yet built, tracked honestly rather than implied:
 
-- [ ] TypeScript/npm package with an equivalent API -- **in progress**: `zerobucket@0.10.0` ships PostgreSQL, SQLite and MySQL/MariaDB (each in classic + dedup mode), streaming/ranges, hooks, HTTP helpers, S3 tiering, HEIC and a CLI (see `packages/typescript/`)
+- [ ] `migrate_classic_to_dedup()` and `zerobucket migrate --to-dedup` on SQLite and MySQL/MariaDB in the Python package (the npm package has them since 0.11.0)
+- [ ] `AsyncZeroBucket` parity: `before_get`/`before_put` hooks, `optimize=True`, custom `validator=` and `connection=`
+- [x] TypeScript/npm package with an equivalent API: `zerobucket@0.11.0` ships PostgreSQL, SQLite and MySQL/MariaDB (each in classic + dedup mode), streaming/ranges, hooks, HTTP helpers, S3 tiering, HEIC, a CLI and `migrateClassicToDedup()` on all three databases (see `packages/typescript/`)
 - [x] Optional resize/format-conversion pipeline (`optimize=True, max_width=...`)
 - [x] Optional HEIC/HEIF support (`pip install zerobucket[heic]`)
 - [x] Transaction participation via `connection=` (put/get/delete/exists/metadata)

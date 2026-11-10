@@ -6,6 +6,41 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## Unreleased - 2026-11-10 (CI and documentation only; no package changes)
+
+No code in either package changed, so no version is bumped.
+
+### Changed
+
+- **CI runs against MySQL 8.0 as well as MariaDB 10.11.** One extra Python run (3.12) and one extra npm run (Node 22, including the
+  cross-language conformance step) use the `mysql:8.0` image. The MySQL service now takes its image from the job matrix and uses the
+  `MYSQL_*` environment names, which both images understand; its health check allows 10 retries instead of 5.
+- **CI runs the SQLite-and-filesystem tests on Windows.** Two new jobs (Python 3.12 and Node 22 on `windows-latest`) set
+  `core.autocrlf false` before checkout. GitHub's Windows runners cannot run service containers, so the PostgreSQL, MySQL and S3 tests
+  skip themselves there, as they do whenever their `ZEROBUCKET_TEST_*` setting is missing.
+- **GitHub Actions moved to their Node 24 versions** in `ci.yml`, `publish.yml` and `publish-npm.yml`: `actions/checkout` v6,
+  `actions/setup-python` v6, `actions/setup-node` v6, `actions/upload-artifact` v7 and `actions/download-artifact` v8.
+- **CI job names changed** (for example `Python 3.12 / mysql:8.0`, `Node 22 / windows`). Update any branch-protection rule that
+  requires the old names.
+
+### Fixed (documentation)
+
+- **README, SQLite section:** removed "Experimental, in progress -- not yet at feature parity", and the "as of 0.19.0" marker on the
+  list of what works. Added a fourth difference to the "real, verified differences" list: which operations report to `on_operation`
+  and retry differs between the sync and async SQLite backends (sync `get_stream()` and `tier_to_object_storage()` do neither; async
+  `get_stream()` does both; async `tier_to_object_storage()` does neither).
+- **README, MySQL section:** the retry bullet said retry was deliberately not in `AsyncMySQLBackend` (it has been since 0.27.0), and the
+  `aiomysql` bullet said a tiered image read through the async client fails with an unhelpful error (since 0.30.0 it raises a clear
+  `StorageError`, or reads the image when `object_storage=` is given).
+- **README, Limitations:** "No image resizing/optimization pipeline yet" now says `optimize=True` exists and is opt-in (not on
+  `AsyncZeroBucket`); "PostgreSQL only, for now" now names the three supported databases.
+- **README, project structure:** dropped the "(in progress)" labels, added `mysql_async.py` and the `packages/typescript/` package.
+- **README, migration and CLI:** stated that `migrate_classic_to_dedup()` and `zerobucket migrate --to-dedup` are PostgreSQL-only in
+  the Python package, while the npm package has supported all three databases since 0.11.0. The CLI paragraph no longer says the Python
+  CLI is the same as the npm CLI without this exception.
+- **README, Roadmap:** the npm package item is checked off at `zerobucket@0.11.0` (it said "in progress, 0.10.0"), and the two open
+  Python items (migration on SQLite and MySQL, `AsyncZeroBucket` parity) are listed as unchecked.
+
 ## npm `zerobucket` [0.11.0] - 2026-11-05
 
 `migrateClassicToDedup()` and `zerobucket migrate --to-dedup` now work on SQLite and MySQL/MariaDB, not only PostgreSQL.
