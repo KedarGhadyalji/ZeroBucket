@@ -8,6 +8,7 @@ on:
 
 jobs:
   test:
+    name: Python ${{ matrix.python-version }} / ${{ matrix.mysql-image }}
     runs-on: ubuntu-latest
 
     services:
@@ -26,29 +27,35 @@ jobs:
           --health-retries 5
 
       mysql:
-        image: mariadb:10.11
+        image: ${{ matrix.mysql-image }}
         env:
-          MARIADB_ROOT_PASSWORD: root
-          MARIADB_DATABASE: zerobucket_test
-          MARIADB_USER: zerobucket
-          MARIADB_PASSWORD: zerobucket
+          # The MYSQL_* names are understood by both the mysql and the mariadb images.
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: zerobucket_test
+          MYSQL_USER: zerobucket
+          MYSQL_PASSWORD: zerobucket
         ports:
           - 3306:3306
         options: >-
           --health-cmd "mysqladmin ping -h localhost -u root -proot"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
 
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
+        mysql-image: ["mariadb:10.11"]
+        include:
+          # MySQL 8 differs from MariaDB (auth plugin, JSON/TIMESTAMP behaviour, UTC_TIMESTAMP), so run it once.
+          - python-version: "3.12"
+            mysql-image: "mysql:8.0"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -68,6 +75,7 @@ jobs:
         run: pytest -v
 
   test-npm:
+    name: Node ${{ matrix.node-version }} / ${{ matrix.mysql-image }}
     runs-on: ubuntu-latest
 
     services:
@@ -86,19 +94,20 @@ jobs:
           --health-retries 5
 
       mysql:
-        image: mariadb:10.11
+        image: ${{ matrix.mysql-image }}
         env:
-          MARIADB_ROOT_PASSWORD: root
-          MARIADB_DATABASE: zerobucket_test
-          MARIADB_USER: zerobucket
-          MARIADB_PASSWORD: zerobucket
+          # The MYSQL_* names are understood by both the mysql and the mariadb images.
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: zerobucket_test
+          MYSQL_USER: zerobucket
+          MYSQL_PASSWORD: zerobucket
         ports:
           - 3306:3306
         options: >-
           --health-cmd "mysqladmin ping -h localhost -u root -proot"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
 
       moto:
         image: motoserver/moto:latest # S3-compatible server for the tiering tests
@@ -114,12 +123,16 @@ jobs:
     strategy:
       matrix:
         node-version: [20, 22, 24]
+        mysql-image: ["mariadb:10.11"]
+        include:
+          - node-version: 22
+            mysql-image: "mysql:8.0"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Node ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
@@ -150,7 +163,7 @@ jobs:
       # it with each partial body: "Checksum mismatch ... in response header content-md5". Real S3 never sends that header on a GET.
       - name: Set up Python for the conformance harness
         if: matrix.node-version == 22
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -181,7 +194,7 @@ jobs:
           fi
 
       - name: Example app (typecheck + end-to-end verify against the packed build)
-        if: matrix.node-version == 22
+        if: matrix.node-version == 22 && matrix.mysql-image == 'mariadb:10.11'
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/zerobucket_test
         run: |
@@ -192,7 +205,7 @@ jobs:
           npm run verify
 
       - name: Benchmarks (typecheck + quick smoke run against the packed build)
-        if: matrix.node-version == 22
+        if: matrix.node-version == 22 && matrix.mysql-image == 'mariadb:10.11'
         env:
           ZEROBUCKET_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/zerobucket_test
           ZEROBUCKET_TEST_MYSQL_URL: mysql://zerobucket:zerobucket@127.0.0.1:3306/zerobucket_test
@@ -203,3 +216,58 @@ jobs:
           npm run typecheck
           npm run bench:quick
           npm run compression
+
+  # GitHub's Windows runners cannot run service containers, so these jobs have no PostgreSQL, MySQL or S3 server. The tests for
+  # those backends skip themselves when their ZEROBUCKET_TEST_* setting is missing; what runs is everything that needs only
+  # SQLite and the filesystem, which is where the Windows-only bugs (locked files, path separators, CRLF) have been.
+  test-windows:
+    name: Python 3.12 / Windows (SQLite only)
+    runs-on: windows-latest
+    steps:
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install package + dev dependencies
+        working-directory: packages/python
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        working-directory: packages/python
+        run: pytest -v
+
+  test-npm-windows:
+    name: Node 22 / Windows (SQLite only)
+    runs-on: windows-latest
+    steps:
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/typescript/package-lock.json
+
+      - name: Install
+        working-directory: packages/typescript
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: packages/typescript
+        run: npm run typecheck
+
+      - name: Build
+        working-directory: packages/typescript
+        run: npm run build
+
+      - name: Run tests
+        working-directory: packages/typescript
+        run: npm test
