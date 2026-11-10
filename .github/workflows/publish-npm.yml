@@ -21,11 +21,11 @@ jobs:
       run:
         working-directory: packages/typescript
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Node 24 bundles npm 11.x. Trusted publishing needs npm >= 11.5.1, and
       # Node 22's bundled npm 10.x silently fails with ENEEDAUTH.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
