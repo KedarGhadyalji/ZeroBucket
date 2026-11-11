@@ -88,8 +88,9 @@ class ZeroBucket:
             / zerobucket_image_refs, not zerobucket_images) -- flipping
             this on does NOT retroactively deduplicate or migrate
             existing classic-mode data; see
-            zerobucket.adapters.postgres.migrate_classic_to_dedup for
-            that (a separate, explicit, non-destructive operation).
+            zerobucket.migrate_classic_to_dedup for that (a separate,
+            explicit, non-destructive operation; PostgreSQL, SQLite and
+            MySQL/MariaDB).
         pool_min_size: Minimum connections kept open in the internal
             pool. Defaults to 1, unchanged from every prior version --
             this makes a previously-hardcoded value configurable, not a

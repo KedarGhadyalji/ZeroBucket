@@ -6,12 +6,12 @@ image_id = images.put("avatar.jpg")
 image = images.get(image_id)
 """
 
+from .adapters.migrate import migrate_classic_to_dedup
 from .adapters.mysql import MySQLBackend
 from .adapters.mysql_async import AsyncMySQLBackend
 from .adapters.postgres import (
     DEFAULT_STREAM_CHUNK_SIZE,
     OperationEvent,
-    migrate_classic_to_dedup,
 )
 from .adapters.postgres_async import AsyncPostgresBackend
 from .adapters.sqlite import SQLiteBackend
@@ -40,7 +40,7 @@ from .types import (
     ImageMetadata,
 )
 
-__version__ = "0.30.0"
+__version__ = "0.31.0"
 
 __all__ = [
     "ZeroBucket",

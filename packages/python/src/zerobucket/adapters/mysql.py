@@ -359,6 +359,22 @@ INSERT INTO zerobucket_image_refs (id, checksum_sha256, original_filename, creat
 VALUES (%s, %s, %s, %s, %s);
 """
 
+# migrate_classic_to_dedup(): the bytes are copied INSIDE the database
+# (INSERT ... SELECT from the classic row), so they never pass through
+# Python (nor through max_allowed_packet) and memory use stays flat.
+_MIGRATE_UPSERT_BLOB = """
+INSERT INTO zerobucket_blobs
+    (checksum_sha256, data, mime_type, size_bytes, width, height, ref_count, created_at)
+SELECT checksum_sha256, data, mime_type, size_bytes, width, height, 1, created_at
+FROM zerobucket_images WHERE id = %s
+ON DUPLICATE KEY UPDATE ref_count = ref_count + 1;
+"""
+
+# The same name the npm package uses, so a Python and a Node migration of one
+# database also exclude each other.
+_MIGRATE_LOCK_NAME = "zerobucket_migrate_dedup"
+_MIGRATE_LOCK_TIMEOUT_SECONDS = 30
+
 _DEDUP_SELECT_FULL = """
 SELECT r.id, b.data, b.mime_type, r.original_filename, b.size_bytes,
        b.width, b.height, r.checksum_sha256
@@ -735,7 +751,30 @@ class MySQLBackend(StorageBackend):
         except Exception:  # noqa: BLE001
             pass  # never let a metrics callback break a real operation
 
-    def _run(self, connection, work, *, operation: str):
+    @staticmethod
+    def _acquire_named_lock(conn, name: str, timeout_seconds: int) -> None:
+        with conn.cursor() as cur:
+            cur.execute("SELECT GET_LOCK(%s, %s);", (name, timeout_seconds))
+            got = cur.fetchone()[0]
+        if got != 1:
+            raise StorageError(
+                "Timed out waiting for another migration to dedup to finish."
+            )
+        # Locks are not transactional; this only ends the implicit transaction
+        # that SELECT started, so the first read of `work` takes its snapshot
+        # AFTER the lock is held.
+        conn.commit()
+
+    @staticmethod
+    def _release_named_lock(conn, name: str) -> None:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT RELEASE_LOCK(%s);", (name,))
+                cur.fetchone()
+        except Exception:  # noqa: BLE001, S110
+            pass  # connection already dead: the server released the lock itself
+
+    def _run(self, connection, work, *, operation: str, lock: tuple | None = None):
         """Mirrors every other adapter's `_run()` shape (a `work(conn)`
         callable, connection=None vs connection=provided) -- kept as-is
         rather than switched to Postgres's `work(cur)` shape, since
@@ -780,7 +819,15 @@ class MySQLBackend(StorageBackend):
                 # wait for no benefit.
                 self._emit(operation, start_time, False, str(exc), attempt)
                 raise
+            locked = False
             try:
+                if lock is not None:
+                    # Taken BEFORE the transaction starts and released only
+                    # AFTER it has committed (or rolled back): releasing it
+                    # earlier would let a second migration start while this
+                    # one's rows are still uncommitted, and so invisible to it.
+                    self._acquire_named_lock(conn, *lock)
+                    locked = True
                 result = work(conn)
                 conn.commit()
             except Exception as exc:  # noqa: BLE001
@@ -788,6 +835,8 @@ class MySQLBackend(StorageBackend):
                     conn.rollback()
                 except Exception:  # noqa: BLE001, S110
                     pass  # connection is likely already dead -- nothing to roll back
+                if locked:
+                    self._release_named_lock(conn, lock[0])
                 conn.close()
                 attempt += 1
                 if attempt > self._max_retries or not self._is_retryable(exc):
@@ -795,6 +844,8 @@ class MySQLBackend(StorageBackend):
                     raise
                 time.sleep(_backoff_delay(attempt, self._retry_base_delay))
             else:
+                if locked:
+                    self._release_named_lock(conn, lock[0])
                 conn.close()  # returns the connection to the pool, does
                 # not actually disconnect -- see class docstring.
                 self._emit(operation, start_time, True, None, attempt)
@@ -1639,7 +1690,11 @@ class MySQLBackend(StorageBackend):
         don't exist yet. Works in classic and dedup mode. The on-disk size is
         an estimate: MySQL keeps table statistics that can lag behind."""
         dedup = self._dedup
-        need = ("zerobucket_image_refs", "zerobucket_blobs") if dedup else ("zerobucket_images",)
+        need = (
+            ("zerobucket_image_refs", "zerobucket_blobs")
+            if dedup
+            else ("zerobucket_images",)
+        )
         marks = ", ".join(["%s"] * len(need))
 
         def work(conn):
@@ -1757,7 +1812,9 @@ class MySQLBackend(StorageBackend):
             else "FROM zerobucket_images"
         )
         tier = "0" if dedup else "(storage_backend = 'object_storage')"
-        order = "ORDER BY RAND()" if sample is not None else f"ORDER BY {created}, {id_col}"
+        order = (
+            "ORDER BY RAND()" if sample is not None else f"ORDER BY {created}, {id_col}"
+        )
         cap = sample if sample is not None else limit
         sql = f"SELECT {id_col}, {tier} {frm}"
         if where:
@@ -1777,6 +1834,119 @@ class MySQLBackend(StorageBackend):
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to list images: {exc}") from exc
         return [ImageListEntry(str(r[0]), bool(r[1])) for r in rows]
+
+    def _migrate_classic_to_dedup(self, batch_size: int = 200) -> dict:
+        """See `zerobucket.migrate_classic_to_dedup()`, which is the public
+        entry point (it accepts every backend). MySQL/MariaDB specifics:
+
+        The whole copy is ONE transaction (all-or-nothing). A named lock
+        (`GET_LOCK`) is taken before it begins and released after it commits,
+        so two migrations started at once cannot race: the second waits, then
+        finds every id already migrated. Classic rows are read in keyset pages
+        of `batch_size` over (created_at, id), which stays correct when many
+        rows share one created_at, and only their metadata is held in Python:
+        the image bytes are copied inside the database. Timestamps travel as
+        Python datetimes, so DATETIME(6) microseconds survive exactly.
+        """
+        if not self._dedup:
+            raise StorageError(
+                "migrate_classic_to_dedup() needs a MySQLBackend created with dedup=True."
+            )
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1.")
+
+        def work(conn):
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'zerobucket_images';"
+                )
+                if cur.fetchone() is None:
+                    raise StorageError(
+                        "No classic zerobucket_images table found in this database -- "
+                        "nothing to migrate."
+                    )
+                cur.execute(
+                    "SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
+                    "AND TABLE_NAME = 'zerobucket_images' AND COLUMN_NAME = 'storage_backend';"
+                )
+                tiered = 0
+                only_local = ""
+                if cur.fetchone() is not None:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM zerobucket_images WHERE storage_backend <> 'mysql';"
+                    )
+                    tiered = int(cur.fetchone()[0])
+                    only_local = " AND storage_backend = 'mysql'"
+
+                select = (
+                    "SELECT id, checksum_sha256, original_filename, created_at, updated_at "
+                    "FROM zerobucket_images WHERE "
+                )
+                migrated = 0
+                already = 0
+                seen_checksums: set[str] = set()
+                last = None
+                while True:
+                    if last is None:
+                        cur.execute(
+                            f"{select}1 = 1{only_local} ORDER BY created_at, id LIMIT %s;",
+                            (batch_size,),
+                        )
+                    else:
+                        cur.execute(
+                            f"{select}(created_at, id) > (%s, %s){only_local} "
+                            "ORDER BY created_at, id LIMIT %s;",
+                            (last[0], last[1], batch_size),
+                        )
+                    rows = cur.fetchall()
+                    if not rows:
+                        break
+                    last = (rows[-1][3], rows[-1][0])
+
+                    fresh = []
+                    for row in rows:
+                        cur.execute(
+                            "SELECT 1 FROM zerobucket_image_refs WHERE id = %s;",
+                            (row[0],),
+                        )
+                        if cur.fetchone() is not None:
+                            already += 1
+                        else:
+                            fresh.append(row)
+
+                    # Blobs in checksum order, the one global lock order, so a
+                    # concurrent put() of the same content cannot deadlock with
+                    # this in opposite orders. (sorted() is stable: within one
+                    # checksum the oldest classic row still comes first.)
+                    for row in sorted(fresh, key=lambda r: r[1]):
+                        cur.execute(_MIGRATE_UPSERT_BLOB, (row[0],))
+                    for image_id, checksum, filename, created_at, updated_at in fresh:
+                        cur.execute(
+                            _DEDUP_INSERT_REF,
+                            (image_id, checksum, filename, created_at, updated_at),
+                        )
+                        seen_checksums.add(checksum)
+                        migrated += 1
+                return {
+                    "images_migrated": migrated,
+                    "distinct_blobs_created": len(seen_checksums),
+                    "duplicate_references_found": migrated - len(seen_checksums),
+                    "already_migrated_skipped": already,
+                    "tiered_rows_skipped": tiered,
+                }
+
+        try:
+            return self._run(
+                None,
+                work,
+                operation="migrate_to_dedup",
+                lock=(_MIGRATE_LOCK_NAME, _MIGRATE_LOCK_TIMEOUT_SECONDS),
+            )
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Migration to dedup failed: {exc}") from exc
 
     def close(self) -> None:
         """Closes the connection pool and marks this backend closed.

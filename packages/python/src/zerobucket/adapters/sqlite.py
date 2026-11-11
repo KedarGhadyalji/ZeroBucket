@@ -236,6 +236,19 @@ VALUES (?, ?, ?, ?, ?)
 RETURNING id;
 """
 
+# migrate_classic_to_dedup(): the bytes are copied INSIDE the database
+# (INSERT ... SELECT from the classic row), so they never pass through
+# Python and memory use stays flat whatever the image sizes. The WHERE
+# clause is also what keeps SQLite's parser from reading the following
+# ON CONFLICT as part of the SELECT.
+_MIGRATE_UPSERT_BLOB = """
+INSERT INTO zerobucket_blobs
+    (checksum_sha256, data, mime_type, size_bytes, width, height, ref_count, created_at)
+SELECT checksum_sha256, data, mime_type, size_bytes, width, height, 1, created_at
+FROM zerobucket_images WHERE id = ?
+ON CONFLICT (checksum_sha256) DO UPDATE SET ref_count = ref_count + 1;
+"""
+
 _DEDUP_SELECT_FULL = """
 SELECT r.id, b.data, b.mime_type, r.original_filename, b.size_bytes,
        b.width, b.height, r.checksum_sha256
@@ -1338,6 +1351,111 @@ class SQLiteBackend(StorageBackend):
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to list images: {exc}") from exc
         return [ImageListEntry(str(r[0]), bool(r[1])) for r in rows]
+
+    def _migrate_classic_to_dedup(self, batch_size: int = 200) -> dict:
+        """See `zerobucket.migrate_classic_to_dedup()`, which is the public
+        entry point (it accepts every backend). SQLite specifics:
+
+        The whole copy is ONE `BEGIN IMMEDIATE` transaction, so it is
+        all-or-nothing, and it holds SQLite's single write lock for its whole
+        duration: other writers to this database file wait (up to the busy
+        timeout) until it finishes; readers are not blocked. Two migrations
+        started at once therefore cannot race -- the second waits, then finds
+        every id already migrated. Classic rows are read in keyset pages of
+        `batch_size` over (created_at, id), which stays correct when many rows
+        share one created_at, and only their metadata is held in Python: the
+        image bytes are copied inside the database.
+        """
+        if not self._dedup:
+            raise StorageError(
+                "migrate_classic_to_dedup() needs a SQLiteBackend created with dedup=True."
+            )
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1.")
+
+        def work(conn):
+            # Take the write lock before reading anything, so what is read is
+            # exactly what gets copied.
+            conn.execute("BEGIN IMMEDIATE;")
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'zerobucket_images';"
+            ).fetchone()
+            if exists is None:
+                raise StorageError(
+                    "No classic zerobucket_images table found in this database -- "
+                    "nothing to migrate."
+                )
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(zerobucket_images);")
+            }
+            tiered = 0
+            only_local = ""
+            if "storage_backend" in columns:
+                tiered = conn.execute(
+                    "SELECT count(*) FROM zerobucket_images "
+                    "WHERE storage_backend <> 'sqlite';"
+                ).fetchone()[0]
+                only_local = " AND storage_backend = 'sqlite'"
+
+            select = (
+                "SELECT id, checksum_sha256, original_filename, created_at, updated_at "
+                "FROM zerobucket_images WHERE "
+            )
+            migrated = 0
+            already = 0
+            seen_checksums: set[str] = set()
+            last: tuple[str, str] | None = None
+            while True:
+                if last is None:
+                    rows = conn.execute(
+                        f"{select}1 = 1{only_local} ORDER BY created_at, id LIMIT ?;",
+                        (batch_size,),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        f"{select}(created_at, id) > (?, ?){only_local} "
+                        "ORDER BY created_at, id LIMIT ?;",
+                        (last[0], last[1], batch_size),
+                    ).fetchall()
+                if not rows:
+                    break
+                last = (rows[-1][3], rows[-1][0])
+                for image_id, checksum, filename, created_at, updated_at in rows:
+                    if (
+                        conn.execute(
+                            "SELECT 1 FROM zerobucket_image_refs WHERE id = ?;",
+                            (image_id,),
+                        ).fetchone()
+                        is not None
+                    ):
+                        already += 1
+                        continue
+                    conn.execute(_MIGRATE_UPSERT_BLOB, (image_id,))
+                    # Keep the ORIGINAL id and both timestamps exactly, so
+                    # anything that already references these ids keeps working.
+                    conn.execute(
+                        "INSERT INTO zerobucket_image_refs "
+                        "(id, checksum_sha256, original_filename, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?);",
+                        (image_id, checksum, filename, created_at, updated_at),
+                    )
+                    seen_checksums.add(checksum)
+                    migrated += 1
+            return {
+                "images_migrated": migrated,
+                "distinct_blobs_created": len(seen_checksums),
+                "duplicate_references_found": migrated - len(seen_checksums),
+                "already_migrated_skipped": already,
+                "tiered_rows_skipped": tiered,
+            }
+
+        try:
+            return self._run(None, work, operation="migrate_to_dedup")
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Migration to dedup failed: {exc}") from exc
 
     def close(self) -> None:
         """No-op: this backend holds no persistent connection/pool to
