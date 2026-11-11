@@ -6,7 +6,57 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
-## Unreleased - 2026-11-10 (CI and documentation only; no package changes)
+## Python `zerobucket` [0.31.0] - 2026-11-11
+
+`migrate_classic_to_dedup()` and `zerobucket migrate --to-dedup` now work on SQLite and MySQL/MariaDB, not only PostgreSQL, with the same
+behaviour as the npm package since 0.11.0.
+
+### Added
+
+- **`migrate_classic_to_dedup()` on `SQLiteBackend` and `MySQLBackend`.** Same contract and same result dict as the PostgreSQL version: a
+  one-time, non-destructive copy of every classic row into the dedup tables that keeps each id (external references keep working),
+  deduplicates identical content, never touches the classic table, reads the classic table in keyset pages of `batch_size` (bounded
+  memory), and is safe to re-run (already-migrated ids are skipped and counted, never double-counted in a blob's `ref_count`). Tiered
+  classic rows are skipped and counted as `tiered_rows_skipped`. The image bytes are copied inside the database (`INSERT ... SELECT`),
+  so they never pass through Python or `max_allowed_packet`.
+- **One public function for every backend.** `zerobucket.migrate_classic_to_dedup(backend, batch_size=200)` (new module
+  `zerobucket/adapters/migrate.py`) picks the right implementation for a `PostgresBackend`, `SQLiteBackend` or `MySQLBackend`, and raises a
+  clear `StorageError` for anything else. `zerobucket.adapters.postgres.migrate_classic_to_dedup` is unchanged and still importable.
+- **All-or-nothing on every database.** SQLite runs the whole copy in one `BEGIN IMMEDIATE` transaction (and so holds SQLite's single write
+  lock for the duration: other writers to that file wait, readers do not); MySQL/MariaDB runs it in one transaction. A failure part-way leaves
+  the dedup tables exactly as they were, and a later run then completes.
+- **Two migrations started at once cannot race.** SQLite: the write lock. MySQL/MariaDB: a named lock (`GET_LOCK("zerobucket_migrate_dedup")`,
+  the same name the npm package uses, so a Python and a Node migration of one database also exclude each other), taken BEFORE the
+  transaction begins and released only AFTER it commits or rolls back. Releasing it earlier would let a second migration start while the
+  first one's rows are still uncommitted and invisible to it. Blobs are upserted in checksum order, so a concurrent `put()` of the same
+  content cannot deadlock with the migration.
+- **Both timestamps are kept.** On SQLite and MySQL/MariaDB each migrated row keeps its `created_at` and `updated_at` exactly (MySQL's
+  `DATETIME(6)` microseconds included).
+- **A `migrate_to_dedup` event** is reported to `on_operation` (success or failure) by the SQLite and MySQL migrations.
+- **`zerobucket migrate --to-dedup [--skip-tiered]` on SQLite and MySQL/MariaDB** (`--sqlite PATH`, or a `mysql://` / `mariadb://` URL). It
+  refuses a SQLite path that does not exist instead of silently creating an empty database file.
+- Tests: `tests/test_migrate_dedup.py` (26 tests: ten scenarios on each of SQLite and MySQL, including more rows than one batch with every
+  row sharing one `created_at`, tiered rows, content already in the dedup tables, a failure injected mid-copy, two concurrent migrations,
+  and, on MySQL, the lock being released only after the commit and being free again after a failed migration). The mid-copy failure is
+  injected with a temporary unique index on the file name rather than a trigger, because creating a trigger on MySQL with binary logging on
+  (MySQL 8's default) needs the SUPER privilege, which the test user does not have. The MySQL tests were run against MySQL 8.0 and MariaDB 10.11. The CLI tests for
+  `migrate --to-dedup` now run on every database instead of only PostgreSQL, and the test that asserted SQLite and MySQL were refused is
+  replaced by one that checks a missing SQLite file is not created.
+
+### Changed
+
+- `MySQLBackend._run()` takes an optional `lock=(name, timeout)`; only the migration uses it.
+- `zerobucket.migrate_classic_to_dedup` is now the dispatching function above rather than the PostgreSQL one. Calling it with a
+  `PostgresBackend` behaves exactly as before.
+- README: the migration section, the CLI section, the SQLite intro and the roadmap now say migration works on all three databases.
+
+### Not changed
+
+- The PostgreSQL migration: it still reports no `on_operation` event, and the migrated rows' `updated_at` is the time of the migration
+  (only `created_at` is kept). Changing either alters released behaviour, so it is left for a decision.
+- The async clients have no migration (it is a one-time, synchronous maintenance operation).
+
+## CI and documentation only - 2026-11-10 (no package changes)
 
 No code in either package changed, so no version is bumped.
 

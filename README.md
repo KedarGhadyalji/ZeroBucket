@@ -344,9 +344,7 @@ bucket/credentials used to tier them.
 
 `SQLiteBackend`/`AsyncSQLiteBackend` store images in a local SQLite
 file instead of Postgres, with the same features as the Postgres
-adapters apart from the differences listed below and
-`migrate_classic_to_dedup()`, which is PostgreSQL-only in the Python
-package. Use them via the existing
+adapters apart from the differences listed below. Use them via the existing
 `backend=` override (there's no dedicated `sqlite://` connection-string
 auto-detection in either constructor yet):
 
@@ -952,6 +950,8 @@ from zerobucket import ZeroBucket, migrate_classic_to_dedup
 
 dedup_images = ZeroBucket(database_url=DATABASE_URL, dedup=True)
 summary = migrate_classic_to_dedup(dedup_images._backend)
+# SQLite: ZeroBucket(backend=SQLiteBackend("app.db", dedup=True))
+# MySQL/MariaDB: ZeroBucket(backend=MySQLBackend(MYSQL_URL, dedup=True))
 print(summary)
 # {'images_migrated': N, 'distinct_blobs_created': M, 'duplicate_references_found': N-M,
 #  'already_migrated_skipped': K, 'tiered_rows_skipped': T}
@@ -970,9 +970,27 @@ mode has no tiering; they stay untouched in the classic table. Rows stream
 from the server in batches (`batch_size=200`), so memory use does not grow
 with table size. The migration is still one transaction: all rows, or none.
 
-`migrate_classic_to_dedup()` is PostgreSQL-only in the Python package.
-The npm package's `migrateClassicToDedup()` also supports SQLite and
-MySQL/MariaDB since 0.11.0.
+Since 0.31.0 `migrate_classic_to_dedup()` works on PostgreSQL, SQLite and
+MySQL/MariaDB (before that, only on PostgreSQL), with the same arguments and
+the same result on each. What differs:
+
+- **SQLite** runs the copy in one `BEGIN IMMEDIATE` transaction, so it holds
+  SQLite's single write lock until it finishes: other writers to that file wait
+  (up to the busy timeout), readers do not. Two migrations started at once
+  cannot race; the second waits and then finds every id already migrated.
+- **MySQL/MariaDB** takes a named lock (`GET_LOCK`) before the transaction
+  begins and releases it only after the commit, so two migrations started at
+  once cannot race there either. It is the same lock name the npm package
+  uses, so a Python and a Node migration of one database also exclude each
+  other.
+- On SQLite and MySQL/MariaDB the image bytes are copied inside the database
+  and never pass through Python, and **both `created_at` and `updated_at` are
+  kept**. The PostgreSQL migration keeps `created_at`; `updated_at` of the
+  migrated rows is the time of the migration.
+- On SQLite and MySQL/MariaDB the migration reports one `migrate_to_dedup`
+  event to `on_operation` (success or failure). The PostgreSQL migration does
+  not.
+- `batch_size` must be at least 1 (a `ValueError` otherwise).
 
 ## Tuning and observability
 
@@ -1144,7 +1162,7 @@ ruff check src/ tests/
 ```bash
 zerobucket init      # create the zerobucket_images table and indexes if missing
 zerobucket migrate   # currently the same as init -- no versioned migrations yet
-zerobucket migrate --to-dedup   # copy classic images into the dedup tables (PostgreSQL only)
+zerobucket migrate --to-dedup   # copy classic images into the dedup tables
 zerobucket info      # image count, total size, on-disk size, breakdown by format
 zerobucket verify    # re-checksum every stored image to detect corruption
 zerobucket verify --sample 100   # check a random sample instead of everything
@@ -1157,8 +1175,7 @@ zerobucket tier --all --bucket my-bucket --dry-run       # preview without doing
 ```
 
 Since 0.28.0 the CLI works on **PostgreSQL, SQLite and MySQL/MariaDB**, in
-classic **and** dedup mode, the same as the npm package's CLI except for
-`migrate --to-dedup` (below). Choose the
+classic **and** dedup mode, the same as the npm package's CLI. Choose the
 database with one of:
 
 ```bash
@@ -1185,9 +1202,10 @@ pass `--bucket` (plus `--endpoint-url`/`--region`/credentials, the same
 options as `tier`) to check those too -- their bytes are read back from the
 bucket and checksummed like any other.
 
-In the Python CLI, `migrate --to-dedup` is still PostgreSQL-only and refuses a
-SQLite or MySQL/MariaDB target; the npm CLI has supported all three since 0.11.0.
-It also refuses when classic images are tiered to object storage
+`migrate --to-dedup` works on all three databases since 0.31.0 (before that the
+Python CLI accepted only PostgreSQL). On SQLite it refuses a database file that
+does not exist, instead of creating an empty one. It also refuses when classic
+images are tiered to object storage
 (their bytes are not in the database to copy); pass `--skip-tiered` to skip
 them and migrate the rest. It never modifies the classic table.
 
@@ -1224,7 +1242,7 @@ and autovacuum tuning notes specific to a BYTEA-heavy table.
 
 Not yet built, tracked honestly rather than implied:
 
-- [ ] `migrate_classic_to_dedup()` and `zerobucket migrate --to-dedup` on SQLite and MySQL/MariaDB in the Python package (the npm package has them since 0.11.0)
+- [x] `migrate_classic_to_dedup()` and `zerobucket migrate --to-dedup` on SQLite and MySQL/MariaDB in the Python package (0.31.0; the npm package has them since 0.11.0)
 - [ ] `AsyncZeroBucket` parity: `before_get`/`before_put` hooks, `optimize=True`, custom `validator=` and `connection=`
 - [x] TypeScript/npm package with an equivalent API: `zerobucket@0.11.0` ships PostgreSQL, SQLite and MySQL/MariaDB (each in classic + dedup mode), streaming/ranges, hooks, HTTP helpers, S3 tiering, HEIC, a CLI and `migrateClassicToDedup()` on all three databases (see `packages/typescript/`)
 - [x] Optional resize/format-conversion pipeline (`optimize=True, max_width=...`)
