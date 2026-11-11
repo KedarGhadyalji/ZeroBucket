@@ -2,7 +2,7 @@
 
     zerobucket init      -- create the schema if it doesn't exist
     zerobucket migrate   -- apply schema migrations (currently: same as init);
-                            --to-dedup copies classic -> dedup (PostgreSQL only)
+                            --to-dedup copies classic -> dedup
     zerobucket info      -- storage stats: count, size, breakdown by format
     zerobucket verify    -- re-checksum stored images to detect corruption
     zerobucket tier      -- move image(s) into S3-compatible object storage
@@ -228,8 +228,8 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 def _migrate_to_dedup(args: argparse.Namespace) -> None:
     target = _resolve_target(args)
-    if target.kind != "postgres":
-        _fail("Error: --to-dedup is only supported for PostgreSQL.")
+    # Never create an empty SQLite file just to find it has nothing to migrate.
+    _require_sqlite_file(target, "Nothing to migrate.")
     skip_tiered = bool(_opt(args, "skip_tiered"))
 
     # Refuse up front when classic rows are tiered, unless told to skip them:
@@ -252,7 +252,7 @@ def _migrate_to_dedup(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    from .adapters.postgres import migrate_classic_to_dedup
+    from .adapters.migrate import migrate_classic_to_dedup
 
     backend = _open_backend(target, dedup=True, auto_migrate=True)
     try:
@@ -616,7 +616,7 @@ def main(argv: list[str] | None = None) -> None:
     p_migrate.add_argument(
         "--to-dedup",
         action="store_true",
-        help="Copy every classic image into the dedup tables (PostgreSQL only; non-destructive).",
+        help="Copy every classic image into the dedup tables (non-destructive).",
     )
     p_migrate.add_argument(
         "--skip-tiered",
