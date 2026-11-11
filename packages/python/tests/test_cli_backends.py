@@ -365,63 +365,59 @@ def test_tier_bulk_filters_and_dry_run(target, s3_bucket, capsys):
     assert "No matching images to tier (or all already tiered)." in out
 
 
-# ---- migrate --to-dedup (PostgreSQL) -----------------------------------------------------
+# ---- migrate --to-dedup (every database, since 0.31.0) ---------------------------------
 
 
-@pytest.fixture
-def pg(request):
-    request.getfixturevalue("_db_available")
-    t = Target("postgres")
-    _drop_everything(t)
-    yield t
-    _drop_everything(t)
-
-
-def test_migrate_to_dedup_copies_and_is_rerunnable(pg, capsys):
-    pg.seed(False)  # 3 classic images, two identical
-    code, out, err = run(capsys, "migrate", "--to-dedup", *pg.args)
+def test_migrate_to_dedup_copies_and_is_rerunnable(target, capsys):
+    target.seed(False)  # 3 classic images, two identical
+    code, out, err = run(capsys, "migrate", "--to-dedup", *target.args)
     assert code == 0, err
     assert "Migrated 3 image(s) into 2 distinct blob(s)." in out
     assert "Duplicate references found: 1" in out
     assert "The classic table was not modified." in out
 
-    code, out, _ = run(capsys, "info", *pg.args, "--dedup")
+    code, out, _ = run(capsys, "info", *target.args, "--dedup")
     assert "3 image(s) sharing 2 distinct blob(s)" in out
-    code, out, _ = run(capsys, "info", *pg.args)
+    code, out, _ = run(capsys, "info", *target.args)
     assert "zerobucket_images: 3 image(s)" in out  # classic table untouched
 
-    code, out, _ = run(capsys, "migrate", "--to-dedup", *pg.args)  # re-run: nothing new
+    code, out, _ = run(
+        capsys, "migrate", "--to-dedup", *target.args
+    )  # re-run: nothing new
     assert code == 0
     assert "Migrated 0 image(s)" in out
     assert "Already migrated (skipped): 3" in out
 
 
-def test_migrate_to_dedup_refuses_tiered_rows_unless_skip_tiered(pg, s3_bucket, capsys):
-    ids = pg.seed(False, colors=((1, 1, 1), (50, 60, 70)))
-    assert run(capsys, *_tier_args(pg, s3_bucket, ids[0]))[0] == 0
+def test_migrate_to_dedup_refuses_tiered_rows_unless_skip_tiered(
+    target, s3_bucket, capsys
+):
+    ids = target.seed(False, colors=((1, 1, 1), (50, 60, 70)))
+    assert run(capsys, *_tier_args(target, s3_bucket, ids[0]))[0] == 0
 
-    code, out, _ = run(capsys, "migrate", "--to-dedup", *pg.args)
+    code, out, _ = run(capsys, "migrate", "--to-dedup", *target.args)
     assert code == 1
     assert "1 classic image(s) are tiered to object storage" in out
     assert "--skip-tiered" in out
 
-    code, out, err = run(capsys, "migrate", "--to-dedup", "--skip-tiered", *pg.args)
+    code, out, err = run(capsys, "migrate", "--to-dedup", "--skip-tiered", *target.args)
     assert code == 0, err
     assert "Migrated 1 image(s) into 1 distinct blob(s)." in out
     assert "Tiered to object storage (skipped, NOT in the dedup tables): 1" in out
 
 
-def test_migrate_to_dedup_without_a_classic_table_fails_cleanly(pg, capsys):
-    run(capsys, "init", *pg.args, "--dedup")  # dedup tables only
-    code, out, _ = run(capsys, "migrate", "--to-dedup", *pg.args)
+def test_migrate_to_dedup_without_a_classic_table_fails_cleanly(target, capsys):
+    run(capsys, "init", *target.args, "--dedup")  # dedup tables only
+    code, out, _ = run(capsys, "migrate", "--to-dedup", *target.args)
     assert code == 1
     assert "nothing to migrate" in out.lower() or "no classic" in out.lower()
 
 
-def test_migrate_to_dedup_is_postgres_only(sqlite_target, capsys):
-    code, _, err = run(capsys, "migrate", "--to-dedup", *sqlite_target.args)
-    assert code == 2
-    assert "only supported for PostgreSQL" in err
+def test_migrate_to_dedup_does_not_create_a_missing_sqlite_file(sqlite_target, capsys):
+    code, out, _ = run(capsys, "migrate", "--to-dedup", *sqlite_target.args)
+    assert code == 1
+    assert "does not exist" in out
+    assert not os.path.exists(sqlite_target.path)
 
 
 def test_skip_tiered_alone_is_a_usage_error(sqlite_target, capsys):
