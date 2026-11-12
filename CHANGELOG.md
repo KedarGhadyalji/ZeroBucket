@@ -6,6 +6,43 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## Python `zerobucket` [0.32.0] - 2026-11-12
+
+`AsyncZeroBucket` now has the sync client's access-control hooks, `optimize=True` and custom `validator=`. The only feature it still
+lacks is `connection=` (see "Not changed").
+
+### Added
+
+- **`before_get` / `before_put` hooks on `AsyncZeroBucket`, with `context=`.** Same semantics as the sync client: a denial raises
+  `AccessDeniedError` before any validation or database work; a hook that raises is not swallowed (fail closed); `get_many()` evaluates
+  the hook once per id and leaves denied ids out of the database query (`error="access denied"`); `put_many()` evaluates it once for the
+  whole batch and marks every item on a denial or a hook error; a malformed id is "not found" and never reaches the hook; `exists()` and
+  `delete()` stay ungated, as on the sync client. `context=` is accepted by `get()`, `get_many()`, `get_stream()`, `stream_to()`,
+  `metadata()`, `put()` and `put_many()`. **One difference, by design:** a hook may be a plain function or an `async def` function
+  (it is awaited), so it can consult your database or an auth service without blocking the event loop.
+- **`optimize=True` (with `max_width=`, `format=`, `quality=`) on `AsyncZeroBucket.put()` and `put_many()`**, and **custom `validator=`**
+  (for example `PDFValidator()`), with the same incompatibility as the sync client (`optimize=True` together with `validator=` raises
+  `ImageValidationError`). The CPU-bound work runs in a worker thread, so the event loop stays free.
+- Tests: `tests/test_async_client_parity.py` (126 tests: 42 scenarios on each of SQLite, PostgreSQL and MySQL/MariaDB), mirroring the
+  sync access-control, optimization and custom-validator tests case by case, plus checks that the async and sync clients store identical
+  optimized bytes and that optimizing does not block the event loop.
+
+### Changed
+
+- **One implementation of the per-image work.** The read/validate/optimize/checksum code of `ZeroBucket.put()` and `put_many()` moved into
+  a module-level function, `zerobucket.client.prepare_row()`, which both clients now call, so the two cannot drift apart. The sync
+  client's behaviour is unchanged. (The async client used to make three separate worker-thread calls per image; it now makes one.)
+  The existing test `test_put_many_validation_runs_concurrently` patched `validate_image` inside `async_client.py`; it now patches it in
+  `client.py`, where the shared function looks it up. It still proves that a `put_many()` batch validates concurrently.
+- README: the async section, the Limitations list and the roadmap now list `connection=` as the only remaining async gap.
+
+### Not changed
+
+- **`AsyncZeroBucket` still has no `connection=`** (passing your own open connection so a call commits or rolls back with your
+  transaction). The async backends have no such parameter, so adding it means changing every method of all three async adapters; it is
+  left as its own piece of work. Use the sync client, for example through `asyncio.to_thread`, where a call must take part in your
+  own transaction.
+
 ## Python `zerobucket` [0.31.0] - 2026-11-11
 
 `migrate_classic_to_dedup()` and `zerobucket migrate --to-dedup` now work on SQLite and MySQL/MariaDB, not only PostgreSQL, with the same

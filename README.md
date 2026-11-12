@@ -167,13 +167,26 @@ different drivers for the same feature, for no benefit to an async
 FastAPI/Django-async caller. **Zero new dependencies** were needed --
 `psycopg[binary]` and `psycopg_pool` were already required.
 
-This first pass is scoped to core operations + streaming reads, not full
-parity with the sync client yet. Deliberately NOT in `AsyncZeroBucket`
-today, tracked honestly rather than implied:
+`AsyncZeroBucket` has the same features as the sync `ZeroBucket` except one,
+tracked honestly rather than implied: `connection=` transaction participation
+(passing your own open connection so a `put()`/`get()`/`delete()` commits or
+rolls back with the rest of your transaction). Each async call runs in its own
+transaction for now.
 
-- `before_get`/`before_put` access-control hooks.
-- `optimize=True` (resize/re-encode pipeline) and custom `validator=`.
-- `connection=` transaction participation.
+Since 0.32.0 the async client also has `before_get`/`before_put` access-control
+hooks (with `context=`), `optimize=True` (with `max_width=`, `format=`,
+`quality=`) and custom `validator=`, all behaving exactly as on the sync client
+(they share one implementation of the per-image work). The one difference: a
+hook may be a plain function **or** an `async def` one, so it can consult your
+database or an auth service without blocking the event loop:
+
+```python
+async def before_get(image_id: str, context: dict | None) -> bool:
+    return await user_owns_image(context["user_id"], image_id)
+
+images = AsyncZeroBucket(database_url=DATABASE_URL, before_get=before_get)
+image = await images.get(image_id, context={"user_id": 42})
+```
 
 Since 0.30.0 all three async adapters (PostgreSQL, SQLite, MySQL) also
 support `dedup=True` (content-addressed storage) and `object_storage=` tiering
@@ -191,16 +204,16 @@ the `on_operation` observability hook and automatic retry/backoff
 the sync adapters. `AsyncZeroBucket(database_url=...)` accepts them
 directly; with `backend=...`, pass them to that backend's constructor.
 
-Every one of these exists on the sync `ZeroBucket` today and isn't
-architecturally blocked from reaching the async client later -- they
-were left out of this pass specifically to ship the actually-blocking
-gap (a real non-blocking driver for FastAPI/async-Django users) without
-a much larger, slower single change.
+`connection=` exists on the sync `ZeroBucket` today and isn't
+architecturally blocked from reaching the async client later; it needs a
+change in every async adapter, so it is its own piece of work. Until then,
+use the sync client (for example through `asyncio.to_thread`) where a call
+has to take part in your own transaction.
 
 Two implementation details worth knowing:
 
-- **Image validation and file reading run via `asyncio.to_thread()`.**
-  Pillow has no async API, so decode/validate/checksum work is offloaded
+- **Image validation, optimization and file reading run via `asyncio.to_thread()`.**
+  Pillow has no async API, so decode/validate/optimize/checksum work is offloaded
   to a thread rather than blocking the event loop -- only the actual
   database round trips get a genuinely non-blocking driver underneath.
   A nice side effect: `put_many()`'s per-item validation runs
@@ -642,7 +655,8 @@ By default, anything with a `database_url` and an id can read or write
 any image -- there's no notion of ownership or permissions built in.
 `before_get`/`before_put` hooks let you plug in your own authorization
 check without ZeroBucket needing to know anything about your users,
-sessions, or auth system:
+sessions, or auth system (on `AsyncZeroBucket`, since 0.32.0, the hooks work
+the same way and may also be `async def` functions):
 
 ```python
 def before_get(image_id: str, context: dict | None) -> bool:
@@ -1094,7 +1108,6 @@ Be honest with yourself about whether ZeroBucket fits your workload:
   good input. Pass `optimize=True` to strip metadata, resize and
   re-encode on `put()` (see
   [Optimizing images (compression)](#optimizing-images-compression)).
-  `AsyncZeroBucket` doesn't support it yet.
 - **Three databases, nothing else.** ZeroBucket works with PostgreSQL,
   SQLite and MySQL/MariaDB (see [SQLite support](#sqlite-support) and
   [MySQL support](#mysql-support)). The storage layer is abstracted so
@@ -1243,7 +1256,8 @@ and autovacuum tuning notes specific to a BYTEA-heavy table.
 Not yet built, tracked honestly rather than implied:
 
 - [x] `migrate_classic_to_dedup()` and `zerobucket migrate --to-dedup` on SQLite and MySQL/MariaDB in the Python package (0.31.0; the npm package has them since 0.11.0)
-- [ ] `AsyncZeroBucket` parity: `before_get`/`before_put` hooks, `optimize=True`, custom `validator=` and `connection=`
+- [ ] `AsyncZeroBucket` `connection=` transaction participation (the one remaining gap with the sync client; needs a change in every async adapter)
+- [x] `AsyncZeroBucket` `before_get`/`before_put` hooks, `optimize=True` and custom `validator=` (0.32.0)
 - [x] TypeScript/npm package with an equivalent API: `zerobucket@0.11.0` ships PostgreSQL, SQLite and MySQL/MariaDB (each in classic + dedup mode), streaming/ranges, hooks, HTTP helpers, S3 tiering, HEIC, a CLI and `migrateClassicToDedup()` on all three databases (see `packages/typescript/`)
 - [x] Optional resize/format-conversion pipeline (`optimize=True, max_width=...`)
 - [x] Optional HEIC/HEIF support (`pip install zerobucket[heic]`)
