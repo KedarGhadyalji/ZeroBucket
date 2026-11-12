@@ -154,9 +154,11 @@ async def test_put_many_validation_runs_concurrently(async_images):
     asyncio.gather), not serially. Verified by wrapping validate_image
     with an artificial delay and confirming wall-clock time is closer to
     ONE delay than N delays."""
-    import zerobucket.async_client as async_client_module
+    # The per-image work lives in zerobucket.client.prepare_row (shared with the sync
+    # client), which looks validate_image up in zerobucket.client.
+    import zerobucket.client as client_module
 
-    real_validate = async_client_module.validate_image
+    real_validate = client_module.validate_image
     delay = 0.2
     n = 5
 
@@ -164,13 +166,13 @@ async def test_put_many_validation_runs_concurrently(async_images):
         time.sleep(delay)
         return real_validate(*args, **kwargs)
 
-    async_client_module.validate_image = slow_validate
+    client_module.validate_image = slow_validate
     try:
         start = time.monotonic()
         results = await async_images.put_many([_jpeg_bytes()] * n)
         elapsed = time.monotonic() - start
     finally:
-        async_client_module.validate_image = real_validate
+        client_module.validate_image = real_validate
 
     assert all(r.success for r in results)
     # Serial would take >= n * delay (>= 1.0s for n=5); concurrent should
