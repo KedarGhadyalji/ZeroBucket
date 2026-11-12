@@ -246,65 +246,18 @@ class ZeroBucket:
         inherently per-item (Pillow decode/validate/re-encode can't be
         batched), which is why put_many() still does this work in a
         Python loop even though the actual DB insert is batched."""
-        data, resolved_filename = _read_image_input(
-            image, filename, max_bytes=self._max_bytes
+        return prepare_row(
+            image,
+            filename=filename,
+            optimize=optimize,
+            max_width=max_width,
+            format=format,
+            quality=quality,
+            validator=validator,
+            max_bytes=self._max_bytes,
+            max_pixels=self._max_pixels,
+            allowed_formats=self._allowed_formats,
         )
-
-        if validator is not None:
-            if optimize:
-                raise ImageValidationError(
-                    "optimize=True is not supported together with a custom "
-                    "validator= -- the optimize pipeline (resize/re-encode) "
-                    "is image-specific (Pillow-based) and assumes the "
-                    "built-in image validator's output. Validate/transform "
-                    "custom content types yourself before calling put()."
-                )
-            validated_content = validator.validate(data, max_bytes=self._max_bytes)
-            final_data = data
-            mime_type = validated_content.mime_type
-            width = validated_content.width
-            height = validated_content.height
-            size_bytes = validated_content.size_bytes
-        else:
-            validated = validate_image(
-                data,
-                max_bytes=self._max_bytes,
-                max_pixels=self._max_pixels,
-                allowed_formats=self._allowed_formats,
-            )
-
-            if optimize:
-                result = optimize_image(
-                    data,
-                    max_width=max_width,
-                    target_format=format,
-                    quality=quality,
-                    max_bytes=self._max_bytes,
-                    max_pixels=self._max_pixels,
-                )
-                final_data = result.data
-                mime_type = result.mime_type
-                width = result.width
-                height = result.height
-                size_bytes = result.size_bytes
-            else:
-                final_data = data
-                mime_type = validated.mime_type
-                width = validated.width
-                height = validated.height
-                size_bytes = validated.size_bytes
-
-        checksum = hashlib.sha256(final_data).hexdigest()
-
-        return {
-            "data": final_data,
-            "mime_type": mime_type,
-            "original_filename": resolved_filename,
-            "size_bytes": size_bytes,
-            "width": width,
-            "height": height,
-            "checksum_sha256": checksum,
-        }
 
     def put(
         self,
@@ -812,6 +765,85 @@ class ZeroBucket:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+
+def prepare_row(
+    image: ImageInput,
+    *,
+    filename: str | None,
+    optimize: bool,
+    max_width: int | None,
+    format: str | None,
+    quality: int | None,
+    validator: ContentValidator | None,
+    max_bytes: int,
+    max_pixels: int,
+    allowed_formats: frozenset[str],
+) -> dict:
+    """Read, validate, optionally optimize and checksum ONE put() input.
+
+    The single implementation behind ZeroBucket.put()/put_many() and
+    AsyncZeroBucket.put()/put_many() (the async client runs it in a worker
+    thread, since it is all CPU and blocking file I/O), so the two clients
+    cannot drift apart on what gets stored.
+    """
+    data, resolved_filename = _read_image_input(image, filename, max_bytes=max_bytes)
+
+    if validator is not None:
+        if optimize:
+            raise ImageValidationError(
+                "optimize=True is not supported together with a custom "
+                "validator= -- the optimize pipeline (resize/re-encode) "
+                "is image-specific (Pillow-based) and assumes the "
+                "built-in image validator's output. Validate/transform "
+                "custom content types yourself before calling put()."
+            )
+        validated_content = validator.validate(data, max_bytes=max_bytes)
+        final_data = data
+        mime_type = validated_content.mime_type
+        width = validated_content.width
+        height = validated_content.height
+        size_bytes = validated_content.size_bytes
+    else:
+        validated = validate_image(
+            data,
+            max_bytes=max_bytes,
+            max_pixels=max_pixels,
+            allowed_formats=allowed_formats,
+        )
+
+        if optimize:
+            result = optimize_image(
+                data,
+                max_width=max_width,
+                target_format=format,
+                quality=quality,
+                max_bytes=max_bytes,
+                max_pixels=max_pixels,
+            )
+            final_data = result.data
+            mime_type = result.mime_type
+            width = result.width
+            height = result.height
+            size_bytes = result.size_bytes
+        else:
+            final_data = data
+            mime_type = validated.mime_type
+            width = validated.width
+            height = validated.height
+            size_bytes = validated.size_bytes
+
+    checksum = hashlib.sha256(final_data).hexdigest()
+
+    return {
+        "data": final_data,
+        "mime_type": mime_type,
+        "original_filename": resolved_filename,
+        "size_bytes": size_bytes,
+        "width": width,
+        "height": height,
+        "checksum_sha256": checksum,
+    }
 
 
 def _read_image_input(
