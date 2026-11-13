@@ -10,26 +10,31 @@ module docstring for why this is NOT the third-party `asyncpg` package
 despite that being the name on the roadmap) -- zero new dependencies
 beyond what the sync client already requires.
 
-WHAT'S DELIBERATELY NOT HERE YET, tracked honestly rather than implied:
+TRANSACTIONS (connection=, 0.33.0): every method accepts an optional
+`connection=` -- your own open async connection (a psycopg AsyncConnection for
+PostgreSQL, an aiosqlite Connection for SQLite, an aiomysql Connection for
+MySQL/MariaDB) -- so a put()/get()/delete() runs inside YOUR transaction and
+commits or rolls back with the rest of it, exactly as on the sync client:
 
-- connection= transaction participation. Every sync method accepts your own
-  open connection so a put()/get()/delete() commits or rolls back together
-  with the rest of your transaction; the async backends have no such
-  parameter yet, so each call here runs in its own transaction on the
-  backend's own connection. It is the one remaining gap with the sync
-  ZeroBucket, and is not architecturally blocked.
+    async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+        await conn.execute("INSERT INTO users (...) VALUES (...)")
+        avatar_id = await images.put(data, connection=conn)
+        # commits both on leaving the block, rolls back both on an exception
 
-(0.27.0 added the on_operation metrics hook and automatic retry/backoff
-on transient errors, for all three async adapters. 0.30.0 added dedup=True
-(content-addressed storage) and object_storage= tiering, with
-tier_to_object_storage(), for all three. 0.32.0 added the before_get /
-before_put access-control hooks (with context=), optimize=True with
-max_width=/format=/quality=, and custom validator= -- all of which behave
-exactly as on the sync client.)
+With a connection the call runs once on it, never commits, and is never
+retried (replaying part of a caller's transaction could silently half-apply
+it); it still reports an on_operation event. Open the connection for the SAME
+database the client points at. See the README's Transactions section for the
+per-database details (autocommit off for MySQL, isolation_level=None for the
+SQLite tier_to_object_storage()).
 
-If you need connection= today, use the sync ZeroBucket -- e.g. via
-`asyncio.to_thread(images.put, ..., connection=conn)` from async code, at the
-cost of not getting a real non-blocking driver underneath for that call.
+There is nothing left that the sync client has and this one lacks: 0.27.0
+added the on_operation metrics hook and automatic retry/backoff on transient
+errors; 0.30.0 added dedup=True (content-addressed storage) and
+object_storage= tiering with tier_to_object_storage(); 0.32.0 added the
+before_get / before_put access-control hooks (with context=), optimize=True
+with max_width=/format=/quality=, and custom validator=; 0.33.0 added
+connection=.
 
 Image validation (Pillow decode, format/size/decompression-bomb checks),
 optimization (resize/re-encode), custom validators and file-like input reading
@@ -144,6 +149,14 @@ class AsyncZeroBucket:
         self._before_put = before_put
 
     @staticmethod
+    def _conn_kwargs(connection: object | None) -> dict:
+        """`connection=` is forwarded to the backend ONLY when the caller
+        gave one, so a custom backend written before 0.33.0 (whose methods
+        do not accept it) keeps working until someone actually passes a
+        connection to it."""
+        return {} if connection is None else {"connection": connection}
+
+    @staticmethod
     async def _call_hook(hook: Callable, *args: object) -> object:
         """Call an access-control hook that may be a plain function or an
         `async def` one; await the result if it is awaitable."""
@@ -210,13 +223,16 @@ class AsyncZeroBucket:
         quality: int | None = None,
         validator: ContentValidator | None = None,
         context: dict | None = None,
+        connection: object | None = None,
     ) -> str:
         """Validate, optionally optimize, and store an image. Returns its id.
 
         Identical to the sync ZeroBucket.put() (see its docstring for the
         input types accepted, and for what optimize=/max_width=/format=/
-        quality=/validator=/context= do) except that connection= is not yet
-        supported (see this module's docstring). With optimize=False (the
+        quality=/validator=/context=/connection= do). Pass your own open
+        async connection as connection= to store the image inside your own
+        transaction: it is not committed here, and not retried (see this
+        module's docstring). With optimize=False (the
         default) the exact input bytes are stored unchanged. optimize=True
         is incompatible with a custom validator= (ImageValidationError).
         A denying before_put hook raises AccessDeniedError before any
@@ -232,7 +248,7 @@ class AsyncZeroBucket:
             quality=quality,
             validator=validator,
         )
-        return await self._backend.put(**row)
+        return await self._backend.put(**row, **self._conn_kwargs(connection))
 
     async def put_many(
         self,
@@ -245,6 +261,7 @@ class AsyncZeroBucket:
         quality: int | None = None,
         validator: ContentValidator | None = None,
         context: dict | None = None,
+        connection: object | None = None,
     ) -> list[BatchPutResult]:
         """Store multiple images. Best-effort, not all-or-nothing -- same
         semantics as the sync put_many(). Unlike the sync version,
@@ -298,7 +315,9 @@ class AsyncZeroBucket:
 
         if rows:
             try:
-                ids = await self._backend.put_many(rows)
+                ids = await self._backend.put_many(
+                    rows, **self._conn_kwargs(connection)
+                )
                 for idx, image_id in zip(indices, ids, strict=True):
                     results[idx] = BatchPutResult(
                         index=idx, image_id=image_id, error=None
@@ -311,13 +330,19 @@ class AsyncZeroBucket:
 
         return results  # type: ignore[return-value]
 
-    async def get(self, image_id: str, *, context: dict | None = None) -> Image:
+    async def get(
+        self,
+        image_id: str,
+        *,
+        context: dict | None = None,
+        connection: object | None = None,
+    ) -> Image:
         """Retrieve a full image, including bytes. Raises
         ImageNotFoundError if missing. context is passed to the before_get
         hook, if one is configured; a denial raises AccessDeniedError before
         any database round trip."""
         await self._check_before_get(image_id, context)
-        record = await self._backend.get(image_id)
+        record = await self._backend.get(image_id, **self._conn_kwargs(connection))
         if record is None:
             raise ImageNotFoundError(image_id)
         return Image(
@@ -331,7 +356,11 @@ class AsyncZeroBucket:
         )
 
     async def get_many(
-        self, image_ids: list[str], *, context: dict | None = None
+        self,
+        image_ids: list[str],
+        *,
+        context: dict | None = None,
+        connection: object | None = None,
     ) -> list[BatchGetResult]:
         """Retrieve multiple images in a single query. Same not-an-error
         semantics for missing ids as the sync get_many(), and the same
@@ -370,7 +399,9 @@ class AsyncZeroBucket:
 
         allowed_ids = [image_ids[i] for i in allowed_indices]
         if allowed_ids:
-            records = await self._backend.get_many(allowed_ids)
+            records = await self._backend.get_many(
+                allowed_ids, **self._conn_kwargs(connection)
+            )
             records_by_id = {record.id: record for record in records}
             for i in allowed_indices:
                 image_id = image_ids[i]
@@ -401,6 +432,7 @@ class AsyncZeroBucket:
         *,
         chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
         context: dict | None = None,
+        connection: object | None = None,
     ) -> AsyncIterator[bytes]:
         """Retrieve an image's bytes as an async iterator of chunks.
 
@@ -432,7 +464,9 @@ class AsyncZeroBucket:
         database round trip.
         """
         await self._check_before_get(image_id, context)
-        stream = await self._backend.get_stream(image_id, chunk_size=chunk_size)
+        stream = await self._backend.get_stream(
+            image_id, chunk_size=chunk_size, **self._conn_kwargs(connection)
+        )
         if stream is None:
             raise ImageNotFoundError(image_id)
         return stream
@@ -444,6 +478,7 @@ class AsyncZeroBucket:
         *,
         chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
         context: dict | None = None,
+        connection: object | None = None,
     ) -> int:
         """Write an image's bytes directly to `destination` (anything
         with a plain, SYNCHRONOUS .write(bytes) method -- an open file,
@@ -456,19 +491,27 @@ class AsyncZeroBucket:
         using this convenience wrapper.
         """
         total = 0
-        stream = await self.get_stream(image_id, chunk_size=chunk_size, context=context)
+        stream = await self.get_stream(
+            image_id, chunk_size=chunk_size, context=context, connection=connection
+        )
         async for chunk in stream:
             destination.write(chunk)
             total += len(chunk)
         return total
 
     async def metadata(
-        self, image_id: str, *, context: dict | None = None
+        self,
+        image_id: str,
+        *,
+        context: dict | None = None,
+        connection: object | None = None,
     ) -> ImageMetadata:
         """Retrieve image metadata without pulling the (potentially large)
         bytes. context is passed to the before_get hook, as in get()."""
         await self._check_before_get(image_id, context)
-        record = await self._backend.get_metadata(image_id)
+        record = await self._backend.get_metadata(
+            image_id, **self._conn_kwargs(connection)
+        )
         if record is None:
             raise ImageNotFoundError(image_id)
         return ImageMetadata(
@@ -481,20 +524,24 @@ class AsyncZeroBucket:
             checksum_sha256=record.checksum_sha256,
         )
 
-    async def exists(self, image_id: str) -> bool:
+    async def exists(self, image_id: str, *, connection: object | None = None) -> bool:
         """Return whether an image with this id exists."""
-        return await self._backend.exists(image_id)
+        return await self._backend.exists(image_id, **self._conn_kwargs(connection))
 
-    async def delete(self, image_id: str) -> bool:
+    async def delete(self, image_id: str, *, connection: object | None = None) -> bool:
         """Delete an image. Returns True if it existed and was deleted."""
-        return await self._backend.delete(image_id)
+        return await self._backend.delete(image_id, **self._conn_kwargs(connection))
 
-    async def delete_many(self, image_ids: list[str]) -> list[BatchDeleteResult]:
+    async def delete_many(
+        self, image_ids: list[str], *, connection: object | None = None
+    ) -> list[BatchDeleteResult]:
         """Delete multiple images in a single query. Same not-an-error
         semantics for missing ids as the sync delete_many()."""
         if not image_ids:
             return []
-        deleted_ids = set(await self._backend.delete_many(image_ids))
+        deleted_ids = set(
+            await self._backend.delete_many(image_ids, **self._conn_kwargs(connection))
+        )
         return [
             BatchDeleteResult(
                 image_id=image_id, deleted=image_id in deleted_ids, error=None
@@ -502,7 +549,9 @@ class AsyncZeroBucket:
             for image_id in image_ids
         ]
 
-    async def tier_to_object_storage(self, image_id: str) -> bool:
+    async def tier_to_object_storage(
+        self, image_id: str, *, connection: object | None = None
+    ) -> bool:
         """Move an image's bytes out of the database and into object storage
         (see the constructor's object_storage= parameter). Returns True if it
         was tiered by this call, False if it was already tiered (a safe
@@ -512,7 +561,9 @@ class AsyncZeroBucket:
         failed upload leaves the row untouched."""
         # Not part of the generic AsyncStorageBackend interface, like the
         # sync client: a backend without tiering raises AttributeError.
-        result = await self._backend.tier_to_object_storage(image_id)  # type: ignore[attr-defined]
+        result = await self._backend.tier_to_object_storage(  # type: ignore[attr-defined]
+            image_id, **self._conn_kwargs(connection)
+        )
         if result is None:
             raise ImageNotFoundError(image_id)
         return result
