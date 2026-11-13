@@ -167,11 +167,10 @@ different drivers for the same feature, for no benefit to an async
 FastAPI/Django-async caller. **Zero new dependencies** were needed --
 `psycopg[binary]` and `psycopg_pool` were already required.
 
-`AsyncZeroBucket` has the same features as the sync `ZeroBucket` except one,
-tracked honestly rather than implied: `connection=` transaction participation
-(passing your own open connection so a `put()`/`get()`/`delete()` commits or
-rolls back with the rest of your transaction). Each async call runs in its own
-transaction for now.
+`AsyncZeroBucket` has every feature the sync `ZeroBucket` has. Since 0.33.0 that
+includes `connection=` transaction participation (passing your own open async
+connection so a `put()`/`get()`/`delete()` commits or rolls back with the rest
+of your transaction); see [Transactions with `AsyncZeroBucket`](#transactions-with-asynczerobucket).
 
 Since 0.32.0 the async client also has `before_get`/`before_put` access-control
 hooks (with `context=`), `optimize=True` (with `max_width=`, `format=`,
@@ -203,12 +202,6 @@ the `on_operation` observability hook and automatic retry/backoff
 (`max_retries`, `retry_base_delay`), with the same names and defaults as
 the sync adapters. `AsyncZeroBucket(database_url=...)` accepts them
 directly; with `backend=...`, pass them to that backend's constructor.
-
-`connection=` exists on the sync `ZeroBucket` today and isn't
-architecturally blocked from reaching the async client later; it needs a
-change in every async adapter, so it is its own piece of work. Until then,
-use the sync client (for example through `asyncio.to_thread`) where a call
-has to take part in your own transaction.
 
 Two implementation details worth knowing:
 
@@ -832,6 +825,54 @@ prone to -- the _possibility_ of avoiding it is one of the real
 advantages of storing images in your primary database, but only when you
 actually use `connection=` to get it. It isn't automatic.
 
+### Transactions with `AsyncZeroBucket`
+
+Since 0.33.0 every `AsyncZeroBucket` method (`put`, `put_many`, `get`, `get_many`,
+`get_stream`, `stream_to`, `metadata`, `exists`, `delete`, `delete_many`,
+`tier_to_object_storage`) takes the same `connection=` as the sync client, with
+the same rules: the call runs once on **your** connection, never commits, is
+never retried, still reports an `on_operation` event, and leaves the connection
+open. Without it, nothing changes. Pass the async connection type of the
+database you use, opened for the **same database** the client points at:
+
+```python
+import psycopg
+
+async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+    cur = await conn.execute("INSERT INTO users (email) VALUES (%s) RETURNING id", (email,))
+    user_id = (await cur.fetchone())[0]
+    image_id = await images.put(avatar_file, connection=conn)  # same transaction
+    await conn.execute("UPDATE users SET avatar_id = %s WHERE id = %s", (image_id, user_id))
+# leaving the block commits both; an exception inside it rolls both back
+```
+
+Per database:
+
+- **PostgreSQL**: a `psycopg.AsyncConnection` (autocommit off, the default).
+- **MySQL/MariaDB**: an `aiomysql.Connection` opened with `autocommit=False`
+  (aiomysql's default); with autocommit on, every statement commits at once and
+  there is no transaction to take part in.
+- **SQLite**: an `aiosqlite.Connection`. SQLite allows one writer at a time, so
+  while your connection holds an open write transaction, every other writer
+  (including a plain `put()` without `connection=`) waits and then fails with
+  "database is locked" once their busy timeout runs out. Keep the transaction
+  short, and give your own connection a sensible `timeout=` in
+  `aiosqlite.connect()` (the library's own connections wait 10 seconds).
+- **`tier_to_object_storage(connection=...)`** is the one call that does not
+  simply join your transaction on every database. On PostgreSQL and MySQL it
+  does (the row lock and the update roll back with you; an object already
+  uploaded stays in the bucket). On SQLite it runs its own `BEGIN IMMEDIATE ...
+COMMIT` on your connection, exactly as the sync adapter does, so open that
+  connection with `isolation_level=None`; it commits (or rolls back) its own
+  transaction and does not close your connection.
+- **Tiered images and `delete(connection=...)`**: as on the sync client, the
+  object-storage copy is not removed while you hold the transaction; remove it
+  yourself after you commit.
+
+A custom backend written before 0.33.0 (one whose methods have no
+`connection=`) keeps working: `AsyncZeroBucket` only passes `connection=` when
+you give one, and passing one to such a backend raises `TypeError`.
+
 ## Retry behavior
 
 Transient database errors (connection drops, deadlocks, serialization
@@ -1256,7 +1297,7 @@ and autovacuum tuning notes specific to a BYTEA-heavy table.
 Not yet built, tracked honestly rather than implied:
 
 - [x] `migrate_classic_to_dedup()` and `zerobucket migrate --to-dedup` on SQLite and MySQL/MariaDB in the Python package (0.31.0; the npm package has them since 0.11.0)
-- [ ] `AsyncZeroBucket` `connection=` transaction participation (the one remaining gap with the sync client; needs a change in every async adapter)
+- [x] `AsyncZeroBucket` `connection=` transaction participation (0.33.0; with it the async client has everything the sync client has)
 - [x] `AsyncZeroBucket` `before_get`/`before_put` hooks, `optimize=True` and custom `validator=` (0.32.0)
 - [x] TypeScript/npm package with an equivalent API: `zerobucket@0.11.0` ships PostgreSQL, SQLite and MySQL/MariaDB (each in classic + dedup mode), streaming/ranges, hooks, HTTP helpers, S3 tiering, HEIC, a CLI and `migrateClassicToDedup()` on all three databases (see `packages/typescript/`)
 - [x] Optional resize/format-conversion pipeline (`optimize=True, max_width=...`)

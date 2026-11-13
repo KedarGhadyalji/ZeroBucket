@@ -6,6 +6,47 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## Python `zerobucket` [0.33.0] - 2026-11-13
+
+`AsyncZeroBucket` now takes `connection=`, so a call can run inside your own transaction, exactly as on the sync client. With this the
+async client has everything the sync client has.
+
+### Added
+
+- **`connection=` on every `AsyncZeroBucket` method**: `put`, `put_many`, `get`, `get_many`, `get_stream`, `stream_to`, `metadata`,
+  `exists`, `delete`, `delete_many` and `tier_to_object_storage`; and on every method of `AsyncStorageBackend` and the three async
+  adapters (`AsyncPostgresBackend`, `AsyncSQLiteBackend`, `AsyncMySQLBackend`), including their dedup paths. Pass your own open async
+  connection of that database's driver (a `psycopg.AsyncConnection`, an `aiosqlite.Connection` or an `aiomysql.Connection`) and the call
+  runs once on it, never commits, is never retried (a transient error surfaces at once, because replaying part of a caller's
+  transaction could silently half-apply it), still reports an `on_operation` event (`retry_count` is always 0), and leaves your
+  connection open. Without it nothing changes: the call commits on its own, whatever your own transaction does afterwards. Same contract as
+  the sync adapters' `_run()`.
+- **The sync client's transaction rules carry over.** With a connection, `delete()` and `delete_many()` do not remove a tiered image's
+  object from object storage (only you know whether your transaction will commit; a rollback would leave a row pointing at nothing).
+  `tier_to_object_storage()` joins your transaction on PostgreSQL and MySQL; on SQLite it runs its own `BEGIN IMMEDIATE ... COMMIT` on your
+  connection (which must be opened with `isolation_level=None`), exactly as the sync adapter does, and does not close your connection.
+- **Backward compatible for custom backends.** `AsyncZeroBucket` passes `connection=` to the backend only when you give one, so a custom
+  `AsyncStorageBackend` written before 0.33.0 keeps working; passing a connection to such a backend raises `TypeError`.
+- Tests: `tests/test_async_transactions.py` (51 tests: 17 scenarios on each of SQLite, PostgreSQL and MySQL/MariaDB, each opening a
+  real transaction on that database's own async driver): the default still commits independently; a put, `put_many`, delete and
+  `delete_many` roll back or commit with the caller's transaction; the image and the caller's own write are atomic; reads with the
+  connection see uncommitted work that other connections do not; dedup puts leave no blob behind on a rollback; a connection call is
+  reported once and a dead connection fails once, as the library's `StorageError`, without a retry; the connection stays open and usable; tiering follows each
+  database's rules; deleting a tiered image with a connection leaves the object; an old-style backend keeps working.
+
+### Changed
+
+- The three existing tests that wrap an adapter's private `_run()` to inject a failure (the async "retry reruns the whole batch" test
+  for PostgreSQL, its MySQL twin and its SQLite twin) now accept and pass on the new `connection` argument.
+- README: a new "Transactions with `AsyncZeroBucket`" section (one example, and the per-database rules: autocommit off for MySQL,
+  SQLite's single writer and the `isolation_level=None` tier case), and the async section and roadmap no longer list `connection=` as a gap.
+  The `AsyncZeroBucket` module docstring describes it.
+
+### Not changed
+
+- The sync client and adapters. The retry behaviour without a connection. The PostgreSQL migration (still no event, `updated_at` reset),
+  still waiting for a decision.
+
 ## Python `zerobucket` [0.32.0] - 2026-11-12
 
 `AsyncZeroBucket` now has the sync client's access-control hooks, `optimize=True` and custom `validator=`. The only feature it still
