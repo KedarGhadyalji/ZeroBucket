@@ -351,9 +351,17 @@ class AsyncMySQLBackend(AsyncStorageBackend):
         except Exception:  # noqa: BLE001
             pass  # never let a metrics callback break a real operation
 
-    async def _run(self, work, *, operation: str):
+    async def _run(self, work, *, operation: str, connection: object | None = None):
         """Run `work(conn)` (an async callable) on a pooled connection,
         commit, and return its result.
+
+        connection provided (0.33.0) -> run ONCE on that exact aiomysql
+        Connection, never commit, never retry: the caller owns the
+        transaction (open it with autocommit off), and replaying part of it
+        could silently half-apply it. Still emits an OperationEvent
+        (retry_count always 0). Same contract as the sync adapter's
+        `_run()`. The rest of this docstring describes the connection=None
+        path.
 
         A transient failure (see `_is_retryable`) is retried up to
         `max_retries` times with exponential backoff plus jitter, EACH
@@ -375,6 +383,15 @@ class AsyncMySQLBackend(AsyncStorageBackend):
         except Exception as exc:  # noqa: BLE001
             self._emit(operation, start_time, False, str(exc), 0)
             raise
+
+        if connection is not None:
+            try:
+                result = await work(connection)
+            except Exception as exc:  # noqa: BLE001
+                self._emit(operation, start_time, False, str(exc), 0)
+                raise
+            self._emit(operation, start_time, True, None, 0)
+            return result
 
         attempt = 0
         while True:
@@ -419,6 +436,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
         width: int | None,
         height: int | None,
         checksum_sha256: str,
+        connection: object | None = None,
     ) -> str:
         image_id = str(uuid.uuid4())
         now = _now()
@@ -467,13 +485,15 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return image_id
 
         try:
-            return await self._run(work, operation="put")
+            return await self._run(work, connection=connection, operation="put")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to store image: {exc}") from exc
 
-    async def put_many(self, rows: list[dict]) -> list[str]:
+    async def put_many(
+        self, rows: list[dict], *, connection: object | None = None
+    ) -> list[str]:
         if not rows:
             return []
         now = _now()
@@ -529,7 +549,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
             return [image_id for image_id, _ in prepared]
 
         try:
-            return await self._run(work, operation="put_many")
+            return await self._run(work, connection=connection, operation="put_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -566,7 +586,9 @@ class AsyncMySQLBackend(AsyncStorageBackend):
             checksum_sha256=row[7],
         )
 
-    async def get(self, image_id: str) -> StoredRecord | None:
+    async def get(
+        self, image_id: str, *, connection: object | None = None
+    ) -> StoredRecord | None:
         select_sql = _DEDUP_SELECT_FULL if self._dedup else _SELECT_FULL
 
         async def work(conn):
@@ -575,7 +597,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return await cur.fetchone()
 
         try:
-            row = await self._run(work, operation="get")
+            row = await self._run(work, connection=connection, operation="get")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -587,7 +609,9 @@ class AsyncMySQLBackend(AsyncStorageBackend):
             data = await self._fetch_tiered_bytes(row[9], image_id=image_id)
         return self._record(row, data)
 
-    async def get_many(self, image_ids: list[str]) -> list[StoredRecord]:
+    async def get_many(
+        self, image_ids: list[str], *, connection: object | None = None
+    ) -> list[StoredRecord]:
         if not image_ids:
             return []
         placeholders = ", ".join(["%s"] * len(image_ids))
@@ -602,7 +626,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return await cur.fetchall()
 
         try:
-            rows = await self._run(work, operation="get_many")
+            rows = await self._run(work, connection=connection, operation="get_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -615,7 +639,9 @@ class AsyncMySQLBackend(AsyncStorageBackend):
             records.append(self._record(row, data))
         return records
 
-    async def get_metadata(self, image_id: str) -> StoredRecordMetadata | None:
+    async def get_metadata(
+        self, image_id: str, *, connection: object | None = None
+    ) -> StoredRecordMetadata | None:
         select_sql = _DEDUP_SELECT_METADATA if self._dedup else _SELECT_METADATA
 
         async def work(conn):
@@ -624,7 +650,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return await cur.fetchone()
 
         try:
-            row = await self._run(work, operation="get_metadata")
+            row = await self._run(work, connection=connection, operation="get_metadata")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -648,6 +674,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
         image_id: str,
         *,
         chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
+        connection: object | None = None,
     ) -> AsyncIterator[bytes] | None:
         """One metadata lookup (the size, and the not-found check), then
         repeated ranged SUBSTRING reads -- same strategy as the sync adapter.
@@ -664,7 +691,9 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return await cur.fetchone()
 
         try:
-            info_row = await self._run(info_work, operation="get_stream")
+            info_row = await self._run(
+                info_work, connection=connection, operation="get_stream"
+            )
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -699,7 +728,9 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                         return await cur.fetchone()
 
                 try:
-                    row = await self._run(work, operation="get_stream")
+                    row = await self._run(
+                        work, connection=connection, operation="get_stream"
+                    )
                 except Exception as exc:  # noqa: BLE001
                     raise StorageError(f"Failed to stream image: {exc}") from exc
 
@@ -737,7 +768,9 @@ class AsyncMySQLBackend(AsyncStorageBackend):
 
     # ---- tier_to_object_storage ------------------------------------------
 
-    async def tier_to_object_storage(self, image_id: str) -> bool | None:
+    async def tier_to_object_storage(
+        self, image_id: str, *, connection: object | None = None
+    ) -> bool | None:
         """Move an image's bytes out of MySQL into object storage. Same
         contract and safety as MySQLBackend.tier_to_object_storage(): None if
         the id doesn't exist, False if already tiered (a safe no-op), True if
@@ -780,7 +813,9 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return True
 
         try:
-            return await self._run(work, operation="tier_to_object_storage")
+            return await self._run(
+                work, connection=connection, operation="tier_to_object_storage"
+            )
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -790,9 +825,9 @@ class AsyncMySQLBackend(AsyncStorageBackend):
 
     # ---- delete -------------------------------------------------------------
 
-    async def delete(self, image_id: str) -> bool:
+    async def delete(self, image_id: str, *, connection: object | None = None) -> bool:
         if self._dedup:
-            return await self._delete_dedup(image_id)
+            return await self._delete_dedup(image_id, connection=connection)
 
         async def work(conn):
             async with conn.cursor() as cur:
@@ -810,7 +845,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return row
 
         try:
-            row = await self._run(work, operation="delete")
+            row = await self._run(work, connection=connection, operation="delete")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -818,13 +853,19 @@ class AsyncMySQLBackend(AsyncStorageBackend):
         if row is None:
             return False
         storage_backend, object_storage_key = row
-        if storage_backend == "object_storage" and self._object_storage is not None:
+        if (
+            connection is None
+            and storage_backend == "object_storage"
+            and self._object_storage is not None
+        ):
             # After the row is gone, and a failure NEVER fails the delete
             # (see StorageBackend._delete_tiered_object, 0.29.0).
             await self._delete_tiered_object(object_storage_key)
         return True
 
-    async def _delete_dedup(self, image_id: str) -> bool:
+    async def _delete_dedup(
+        self, image_id: str, *, connection: object | None = None
+    ) -> bool:
         async def work(conn):
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -861,17 +902,19 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return True
 
         try:
-            return await self._run(work, operation="delete")
+            return await self._run(work, connection=connection, operation="delete")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to delete image: {exc}") from exc
 
-    async def delete_many(self, image_ids: list[str]) -> list[str]:
+    async def delete_many(
+        self, image_ids: list[str], *, connection: object | None = None
+    ) -> list[str]:
         if not image_ids:
             return []
         if self._dedup:
-            return await self._delete_many_dedup(image_ids)
+            return await self._delete_many_dedup(image_ids, connection=connection)
         placeholders = ", ".join(["%s"] * len(image_ids))
 
         async def work(conn):
@@ -891,7 +934,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return [(str(r[0]), r[1], r[2]) for r in rows]
 
         try:
-            rows = await self._run(work, operation="delete_many")
+            rows = await self._run(work, connection=connection, operation="delete_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -899,11 +942,17 @@ class AsyncMySQLBackend(AsyncStorageBackend):
         deleted_ids = []
         for image_id, storage_backend, object_storage_key in rows:
             deleted_ids.append(image_id)
-            if storage_backend == "object_storage" and self._object_storage is not None:
+            if (
+                connection is None
+                and storage_backend == "object_storage"
+                and self._object_storage is not None
+            ):
                 await self._delete_tiered_object(object_storage_key)
         return deleted_ids
 
-    async def _delete_many_dedup(self, image_ids: list[str]) -> list[str]:
+    async def _delete_many_dedup(
+        self, image_ids: list[str], *, connection: object | None = None
+    ) -> list[str]:
         placeholders = ", ".join(["%s"] * len(image_ids))
 
         async def work(conn):
@@ -949,7 +998,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return [str(row[0]) for row in rows]
 
         try:
-            return await self._run(work, operation="delete_many")
+            return await self._run(work, connection=connection, operation="delete_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -957,7 +1006,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
 
     # ---- exists -------------------------------------------------------------
 
-    async def exists(self, image_id: str) -> bool:
+    async def exists(self, image_id: str, *, connection: object | None = None) -> bool:
         exists_sql = _DEDUP_EXISTS if self._dedup else _EXISTS
 
         async def work(conn):
@@ -966,7 +1015,7 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                 return (await cur.fetchone()) is not None
 
         try:
-            return await self._run(work, operation="exists")
+            return await self._run(work, connection=connection, operation="exists")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001

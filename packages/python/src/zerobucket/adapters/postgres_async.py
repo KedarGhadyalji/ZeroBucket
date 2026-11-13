@@ -267,17 +267,34 @@ class AsyncPostgresBackend(AsyncStorageBackend):
                     raise
                 await asyncio.sleep(_backoff_delay(attempt, self._retry_base_delay))
 
-    async def _run(self, work, *, operation: str):
-        """Run `work(cursor)` (an async callable) on a pooled connection
-        and return its result, with retry and metrics -- see `_attempt`.
-        A failure to open the pool or migrate is reported as a failed
-        event for this operation and is never retried."""
+    async def _run(self, work, *, operation: str, connection: object | None = None):
+        """Run `work(cursor)` (an async callable) and return its result.
+
+        connection provided (0.33.0) -> run ONCE on that exact psycopg
+        AsyncConnection, never commit, never retry: the caller owns the
+        transaction, and replaying part of it could silently half-apply it.
+        Still emits an OperationEvent (retry_count always 0). Same contract
+        as the sync adapter's `_run()`.
+
+        connection is None -> a pooled connection, with retry and metrics
+        -- see `_attempt`. A failure to open the pool or migrate is
+        reported as a failed event for this operation and is never retried.
+        """
         start_time = time.monotonic()
         try:
             await self._ensure_ready()
         except Exception as exc:  # noqa: BLE001
             self._emit(operation, start_time, False, str(exc), 0)
             raise
+        if connection is not None:
+            try:
+                async with connection.cursor() as cur:
+                    result = await work(cur)
+            except Exception as exc:  # noqa: BLE001
+                self._emit(operation, start_time, False, str(exc), 0)
+                raise
+            self._emit(operation, start_time, True, None, 0)
+            return result
         return await self._attempt(work, operation=operation, start_time=start_time)
 
     # ---- put ------------------------------------------------------------
@@ -292,6 +309,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
         width: int | None,
         height: int | None,
         checksum_sha256: str,
+        connection: object | None = None,
     ) -> str:
         if self._dedup:
 
@@ -325,13 +343,15 @@ class AsyncPostgresBackend(AsyncStorageBackend):
                 return str(row[0])
 
         try:
-            return await self._run(work, operation="put")
+            return await self._run(work, connection=connection, operation="put")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to store image: {exc}") from exc
 
-    async def put_many(self, rows: list[dict]) -> list[str]:
+    async def put_many(
+        self, rows: list[dict], *, connection: object | None = None
+    ) -> list[str]:
         """See PostgresBackend.put_many's docstring for the ordering
         guarantee (executemany(returning=True), not a multi-row VALUES
         list) -- identical reasoning applies here, same query, same
@@ -391,7 +411,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
                 return ids
 
         try:
-            return await self._run(work, operation="put_many")
+            return await self._run(work, connection=connection, operation="put_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -418,7 +438,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             self._object_storage.download, object_storage_key
         )
 
-    async def get(self, image_id: str) -> StoredRecord | None:
+    async def get(
+        self, image_id: str, *, connection: object | None = None
+    ) -> StoredRecord | None:
         if not is_valid_id(image_id):
             return None  # can never exist; no database round trip
         select_sql = _DEDUP_SELECT_FULL if self._dedup else _SELECT_FULL
@@ -428,7 +450,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return await cur.fetchone()
 
         try:
-            row = await self._run(work, operation="get")
+            row = await self._run(work, connection=connection, operation="get")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -449,7 +471,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             checksum_sha256=row[7],
         )
 
-    async def get_many(self, image_ids: list[str]) -> list[StoredRecord]:
+    async def get_many(
+        self, image_ids: list[str], *, connection: object | None = None
+    ) -> list[StoredRecord]:
         """Order of results is NOT guaranteed to match `image_ids` -- same
         caveat as the sync adapter; async_client.py re-correlates by id.
         Tiered rows are fetched from object storage one at a time after the
@@ -474,7 +498,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return await cur.fetchall()
 
         try:
-            rows = await self._run(work, operation="get_many")
+            rows = await self._run(work, connection=connection, operation="get_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -498,7 +522,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             )
         return records
 
-    async def get_metadata(self, image_id: str) -> StoredRecordMetadata | None:
+    async def get_metadata(
+        self, image_id: str, *, connection: object | None = None
+    ) -> StoredRecordMetadata | None:
         if not is_valid_id(image_id):
             return None
         select_sql = _DEDUP_SELECT_METADATA if self._dedup else _SELECT_METADATA
@@ -508,7 +534,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return await cur.fetchone()
 
         try:
-            row = await self._run(work, operation="get_metadata")
+            row = await self._run(work, connection=connection, operation="get_metadata")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -532,6 +558,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
         image_id: str,
         *,
         chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
+        connection: object | None = None,
     ) -> AsyncIterator[bytes] | None:
         """See AsyncStorageBackend.get_stream and the sync adapter's
         get_stream for the full contract -- same semantics, awaited:
@@ -544,7 +571,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
         range requests instead (see ObjectStorage.download_stream()); each
         blocking chunk read runs in a worker thread."""
         if self._dedup:
-            metadata = await self.get_metadata(image_id)
+            metadata = await self.get_metadata(image_id, connection=connection)
             if metadata is None:
                 return None
             total_size = metadata.size_bytes
@@ -558,7 +585,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
                 return await cur.fetchone()
 
             try:
-                info_row = await self._run(info_work, operation="get_metadata")
+                info_row = await self._run(
+                    info_work, connection=connection, operation="get_metadata"
+                )
             except StorageError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -591,7 +620,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
                     return await cur.fetchone()
 
                 try:
-                    row = await self._run(work, operation="get_stream")
+                    row = await self._run(
+                        work, connection=connection, operation="get_stream"
+                    )
                 except Exception as exc:  # noqa: BLE001
                     raise StorageError(f"Failed to stream image: {exc}") from exc
 
@@ -629,7 +660,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
 
     # ---- tier_to_object_storage ------------------------------------------
 
-    async def tier_to_object_storage(self, image_id: str) -> bool | None:
+    async def tier_to_object_storage(
+        self, image_id: str, *, connection: object | None = None
+    ) -> bool | None:
         """Move an image's bytes out of PostgreSQL into object storage.
         Same contract and same safety as PostgresBackend.tier_to_object_
         storage(): None if the id doesn't exist, False if it was already
@@ -674,7 +707,9 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return True
 
         try:
-            return await self._run(work, operation="tier_to_object_storage")
+            return await self._run(
+                work, connection=connection, operation="tier_to_object_storage"
+            )
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -684,7 +719,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
 
     # ---- delete -------------------------------------------------------------
 
-    async def delete(self, image_id: str) -> bool:
+    async def delete(self, image_id: str, *, connection: object | None = None) -> bool:
         if not is_valid_id(image_id):
             return False
 
@@ -709,7 +744,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
                 return await cur.fetchone()
 
         try:
-            row = await self._run(work, operation="delete")
+            row = await self._run(work, connection=connection, operation="delete")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -717,19 +752,25 @@ class AsyncPostgresBackend(AsyncStorageBackend):
         if row is None:
             return False
         storage_backend, object_storage_key = row
-        if storage_backend == "object_storage" and self._object_storage is not None:
+        if (
+            connection is None
+            and storage_backend == "object_storage"
+            and self._object_storage is not None
+        ):
             # After the row is gone, and a failure NEVER fails the delete
             # (see StorageBackend._delete_tiered_object, 0.29.0).
             await self._delete_tiered_object(object_storage_key)
         return True
 
-    async def delete_many(self, image_ids: list[str]) -> list[str]:
+    async def delete_many(
+        self, image_ids: list[str], *, connection: object | None = None
+    ) -> list[str]:
         image_ids = [i for i in image_ids if is_valid_id(i)]
         if not image_ids:
             return []
 
         if self._dedup:
-            return await self._delete_many_dedup(image_ids)
+            return await self._delete_many_dedup(image_ids, connection=connection)
 
         async def work(cur):
             await cur.execute(
@@ -740,7 +781,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return await cur.fetchall()
 
         try:
-            rows = await self._run(work, operation="delete_many")
+            rows = await self._run(work, connection=connection, operation="delete_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -748,11 +789,17 @@ class AsyncPostgresBackend(AsyncStorageBackend):
         deleted_ids = []
         for image_id, storage_backend, object_storage_key in rows:
             deleted_ids.append(str(image_id))
-            if storage_backend == "object_storage" and self._object_storage is not None:
+            if (
+                connection is None
+                and storage_backend == "object_storage"
+                and self._object_storage is not None
+            ):
                 await self._delete_tiered_object(object_storage_key)
         return deleted_ids
 
-    async def _delete_many_dedup(self, image_ids: list[str]) -> list[str]:
+    async def _delete_many_dedup(
+        self, image_ids: list[str], *, connection: object | None = None
+    ) -> list[str]:
         async def work(cur):
             await cur.execute(
                 "DELETE FROM zerobucket_image_refs WHERE id = ANY(%s) "
@@ -778,7 +825,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return deleted_ids
 
         try:
-            return await self._run(work, operation="delete_many")
+            return await self._run(work, connection=connection, operation="delete_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -786,7 +833,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
 
     # ---- exists -------------------------------------------------------------
 
-    async def exists(self, image_id: str) -> bool:
+    async def exists(self, image_id: str, *, connection: object | None = None) -> bool:
         if not is_valid_id(image_id):
             return False
         exists_sql = _DEDUP_EXISTS if self._dedup else _EXISTS
@@ -796,7 +843,7 @@ class AsyncPostgresBackend(AsyncStorageBackend):
             return (await cur.fetchone()) is not None
 
         try:
-            return await self._run(work, operation="exists")
+            return await self._run(work, connection=connection, operation="exists")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001

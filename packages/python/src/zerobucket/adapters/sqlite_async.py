@@ -306,13 +306,32 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
                 self._emit(operation, start_time, True, None, attempt)
                 return result
 
-    async def _run(self, work, *, operation: str):
+    async def _run(self, work, *, operation: str, connection: object | None = None):
+        """Run `work(conn)` and return its result.
+
+        connection provided (0.33.0) -> run ONCE on that exact aiosqlite
+        Connection, never commit, never retry: the caller owns the
+        transaction. Still emits an OperationEvent (retry_count always 0).
+        Same contract as the sync adapter's `_run()`.
+
+        connection is None -> a fresh connection per attempt, committed on
+        success, with lock-contention retry (see `_with_retry`).
+        """
         start_time = time.monotonic()
         try:
             await self._ensure_ready()
         except Exception as exc:  # noqa: BLE001
             self._emit(operation, start_time, False, str(exc), 0)
             raise
+
+        if connection is not None:
+            try:
+                result = await work(connection)
+            except Exception as exc:  # noqa: BLE001
+                self._emit(operation, start_time, False, str(exc), 0)
+                raise
+            self._emit(operation, start_time, True, None, 0)
+            return result
 
         async def attempt_fn():
             conn = await self._connect()
@@ -345,6 +364,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         width: int | None,
         height: int | None,
         checksum_sha256: str,
+        connection: object | None = None,
     ) -> str:
         image_id = str(uuid.uuid4())
         now = _now_iso()
@@ -385,13 +405,15 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
                 return str(row[0])
 
         try:
-            return await self._run(work, operation="put")
+            return await self._run(work, connection=connection, operation="put")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(f"Failed to store image: {exc}") from exc
 
-    async def put_many(self, rows: list[dict]) -> list[str]:
+    async def put_many(
+        self, rows: list[dict], *, connection: object | None = None
+    ) -> list[str]:
         if not rows:
             return []
         now = _now_iso()
@@ -451,7 +473,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return ids
 
         try:
-            return await self._run(work, operation="put_many")
+            return await self._run(work, connection=connection, operation="put_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -475,7 +497,9 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             self._object_storage.download, object_storage_key
         )
 
-    async def get(self, image_id: str) -> StoredRecord | None:
+    async def get(
+        self, image_id: str, *, connection: object | None = None
+    ) -> StoredRecord | None:
         select_sql = _DEDUP_SELECT_FULL if self._dedup else _SELECT_FULL
 
         async def work(conn):
@@ -483,7 +507,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return await cur.fetchone()
 
         try:
-            row = await self._run(work, operation="get")
+            row = await self._run(work, connection=connection, operation="get")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -504,7 +528,9 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             checksum_sha256=row[7],
         )
 
-    async def get_many(self, image_ids: list[str]) -> list[StoredRecord]:
+    async def get_many(
+        self, image_ids: list[str], *, connection: object | None = None
+    ) -> list[StoredRecord]:
         if not image_ids:
             return []
         placeholders = ",".join("?" * len(image_ids))
@@ -518,7 +544,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return await cur.fetchall()
 
         try:
-            rows = await self._run(work, operation="get_many")
+            rows = await self._run(work, connection=connection, operation="get_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -542,7 +568,9 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             )
         return records
 
-    async def get_metadata(self, image_id: str) -> StoredRecordMetadata | None:
+    async def get_metadata(
+        self, image_id: str, *, connection: object | None = None
+    ) -> StoredRecordMetadata | None:
         select_sql = _DEDUP_SELECT_METADATA if self._dedup else _SELECT_METADATA
 
         async def work(conn):
@@ -550,7 +578,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return await cur.fetchone()
 
         try:
-            row = await self._run(work, operation="get_metadata")
+            row = await self._run(work, connection=connection, operation="get_metadata")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -574,6 +602,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         image_id: str,
         *,
         chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
+        connection: object | None = None,
     ) -> AsyncIterator[bytes] | None:
         """See module docstring: built on repeated `substr()` range
         queries (like AsyncPostgresBackend), NOT `blobopen()` (which
@@ -598,7 +627,9 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return await cur.fetchone()
 
         try:
-            info_row = await self._run(info_work, operation="get_stream")
+            info_row = await self._run(
+                info_work, connection=connection, operation="get_stream"
+            )
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -634,7 +665,9 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
                     return await cur.fetchone()
 
                 try:
-                    row = await self._run(work, operation="get_stream")
+                    row = await self._run(
+                        work, connection=connection, operation="get_stream"
+                    )
                 except Exception as exc:  # noqa: BLE001
                     raise StorageError(f"Failed to stream image: {exc}") from exc
 
@@ -672,7 +705,9 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
 
     # ---- tier_to_object_storage ------------------------------------------
 
-    async def tier_to_object_storage(self, image_id: str) -> bool | None:
+    async def tier_to_object_storage(
+        self, image_id: str, *, connection: object | None = None
+    ) -> bool | None:
         """Move an image's bytes out of SQLite into object storage. Same
         contract and safety as SQLiteBackend.tier_to_object_storage(): None
         if the id doesn't exist, False if already tiered (a safe no-op),
@@ -681,8 +716,12 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         untouched. TRADEOFF, as in the sync adapter: BEGIN IMMEDIATE takes
         SQLite's single write lock for the whole upload, so every other
         WRITER to this database file waits; readers are not blocked. Like
-        the sync adapter this opens its own connection, so it is not
-        covered by retry or by an OperationEvent."""
+        the sync adapter this opens its own connection (so it is not
+        covered by retry or by an OperationEvent) unless you pass
+        `connection=`: then it uses yours, which must have been opened with
+        `isolation_level=None` (autocommit mode) so the explicit BEGIN
+        IMMEDIATE / COMMIT below can be issued; it COMMITS (or rolls back)
+        its own transaction on it, exactly as the sync adapter does."""
         if self._dedup:
             raise StorageError(
                 "tier_to_object_storage() is not supported in dedup mode "
@@ -697,15 +736,20 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         await self._ensure_ready()
         store = self._object_storage
 
+        owns_connection = connection is None
         try:
-            # isolation_level=None: we issue BEGIN/COMMIT/ROLLBACK ourselves.
-            conn = await self._aiosqlite.connect(
-                self._database_path,
-                timeout=_BUSY_TIMEOUT_SECONDS,
-                isolation_level=None,
-            )
+            if owns_connection:
+                # isolation_level=None: we issue BEGIN/COMMIT/ROLLBACK ourselves.
+                conn = await self._aiosqlite.connect(
+                    self._database_path,
+                    timeout=_BUSY_TIMEOUT_SECONDS,
+                    isolation_level=None,
+                )
+            else:
+                conn = connection
             try:
-                await conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
+                if owns_connection:
+                    await conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
                 await conn.execute("BEGIN IMMEDIATE;")
                 try:
                     cur = await conn.execute(_SELECT_FOR_TIERING, (image_id,))
@@ -730,7 +774,8 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
                     await conn.execute("ROLLBACK;")
                     raise
             finally:
-                await conn.close()
+                if owns_connection:
+                    await conn.close()
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -740,7 +785,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
 
     # ---- delete -------------------------------------------------------------
 
-    async def delete(self, image_id: str) -> bool:
+    async def delete(self, image_id: str, *, connection: object | None = None) -> bool:
         if self._dedup:
 
             async def work(conn):
@@ -766,7 +811,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
                 return await cur.fetchone()
 
         try:
-            row = await self._run(work, operation="delete")
+            row = await self._run(work, connection=connection, operation="delete")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -774,13 +819,19 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         if row is None:
             return False
         storage_backend, object_storage_key = row
-        if storage_backend == "object_storage" and self._object_storage is not None:
+        if (
+            connection is None
+            and storage_backend == "object_storage"
+            and self._object_storage is not None
+        ):
             # After the row is gone, and a failure NEVER fails the delete
             # (see StorageBackend._delete_tiered_object, 0.29.0).
             await self._delete_tiered_object(object_storage_key)
         return True
 
-    async def delete_many(self, image_ids: list[str]) -> list[str]:
+    async def delete_many(
+        self, image_ids: list[str], *, connection: object | None = None
+    ) -> list[str]:
         if not image_ids:
             return []
         placeholders = ",".join("?" * len(image_ids))
@@ -824,7 +875,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
                 return [(str(r[0]), r[1], r[2]) for r in await cur.fetchall()]
 
         try:
-            rows = await self._run(work, operation="delete_many")
+            rows = await self._run(work, connection=connection, operation="delete_many")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -832,13 +883,17 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         deleted_ids = []
         for image_id, storage_backend, object_storage_key in rows:
             deleted_ids.append(image_id)
-            if storage_backend == "object_storage" and self._object_storage is not None:
+            if (
+                connection is None
+                and storage_backend == "object_storage"
+                and self._object_storage is not None
+            ):
                 await self._delete_tiered_object(object_storage_key)
         return deleted_ids
 
     # ---- exists -------------------------------------------------------------
 
-    async def exists(self, image_id: str) -> bool:
+    async def exists(self, image_id: str, *, connection: object | None = None) -> bool:
         exists_sql = _DEDUP_EXISTS if self._dedup else _EXISTS
 
         async def work(conn):
@@ -846,7 +901,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return (await cur.fetchone()) is not None
 
         try:
-            return await self._run(work, operation="exists")
+            return await self._run(work, connection=connection, operation="exists")
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
