@@ -432,7 +432,7 @@ async def test_async_retry_reruns_whole_batch_without_duplicating_rows(path):
     real_run = backend._run  # noqa: SLF001
     state = {"failed": False}
 
-    async def run_with_one_late_failure(work, *, operation):
+    async def run_with_one_late_failure(work, *, operation, connection=None):
         async def wrapped(conn):
             result = await work(conn)
             if not state["failed"]:
@@ -440,7 +440,7 @@ async def test_async_retry_reruns_whole_batch_without_duplicating_rows(path):
                 raise sqlite3.OperationalError("database is locked")
             return result
 
-        return await real_run(wrapped, operation=operation)
+        return await real_run(wrapped, operation=operation, connection=connection)
 
     backend._run = run_with_one_late_failure  # noqa: SLF001
     try:

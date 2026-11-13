@@ -179,14 +179,16 @@ async def test_failed_attempts_do_not_leak_pool_connections(make_backend):
     assert await backend.exists(NIL) is False  # a leaked slot would time out here
 
 
-async def test_retry_reruns_whole_batch_without_duplicating_rows(make_backend, jpeg_bytes):
+async def test_retry_reruns_whole_batch_without_duplicating_rows(
+    make_backend, jpeg_bytes
+):
     """A put_many() that fails AFTER inserting its rows must roll them
     back before the retry, so the batch lands exactly once."""
     backend = make_backend()
     real_run = backend._run  # noqa: SLF001
     state = {"failed": False}
 
-    async def run_with_one_late_failure(work, *, operation):
+    async def run_with_one_late_failure(work, *, operation, connection=None):
         async def wrapped(cur):
             result = await work(cur)  # the rows are inserted here...
             if not state["failed"]:
@@ -194,7 +196,7 @@ async def test_retry_reruns_whole_batch_without_duplicating_rows(make_backend, j
                 raise psycopg.OperationalError("lost after inserting")
             return result
 
-        return await real_run(wrapped, operation=operation)
+        return await real_run(wrapped, operation=operation, connection=connection)
 
     backend._run = run_with_one_late_failure  # noqa: SLF001
     try:
@@ -252,7 +254,9 @@ async def test_retry_recovers_from_a_real_deadlock(make_backend, jpeg_bytes):
         backend._run(work_a, operation="deadlock_a"),  # noqa: SLF001
         backend._run(work_b, operation="deadlock_b"),  # noqa: SLF001
     )
-    assert attempts["a"] + attempts["b"] >= 3, "one side should have been the deadlock victim"
+    assert (
+        attempts["a"] + attempts["b"] >= 3
+    ), "one side should have been the deadlock victim"
     assert len(events) == 2
     assert all(e.success for e in events)
     assert max(e.retry_count for e in events) >= 1
@@ -317,7 +321,9 @@ async def test_on_operation_exception_does_not_break_real_operation(
 
     zb = AsyncZeroBucket(database_url=TEST_DATABASE_URL, on_operation=bad_callback)
     try:
-        image_id = await zb.put(jpeg_bytes)  # must not raise despite the callback failing
+        image_id = await zb.put(
+            jpeg_bytes
+        )  # must not raise despite the callback failing
         assert await zb.exists(image_id) is True
     finally:
         await zb.close()

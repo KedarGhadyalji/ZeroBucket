@@ -646,7 +646,7 @@ async def test_async_retry_reruns_whole_batch_without_duplicating_rows(
     real_run = backend._run  # noqa: SLF001
     state = {"failed": False}
 
-    async def run_with_one_late_failure(work, *, operation):
+    async def run_with_one_late_failure(work, *, operation, connection=None):
         async def wrapped(conn):
             result = await work(conn)  # the rows are inserted here...
             if not state["failed"]:
@@ -654,7 +654,7 @@ async def test_async_retry_reruns_whole_batch_without_duplicating_rows(
                 raise pymysql.err.OperationalError(2013, "lost after inserting")
             return result
 
-        return await real_run(wrapped, operation=operation)
+        return await real_run(wrapped, operation=operation, connection=connection)
 
     backend._run = run_with_one_late_failure  # noqa: SLF001
     try:
