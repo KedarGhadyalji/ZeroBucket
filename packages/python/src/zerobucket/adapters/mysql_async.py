@@ -38,8 +38,8 @@ never require this.
 
 **A REAL, VERIFIED VERSION-COMPATIBILITY BUG, caught by actually
 running this against a real database, not assumed safe from aiomysql's
-description alone**: aiomysql 0.3.2 (its latest release; the project
-has been effectively unmaintained since 2023) imports `escape_dict`,
+description alone**: aiomysql 0.3.2 (its latest release, October 2025,
+which still has not caught up with PyMySQL) imports `escape_dict`,
 `escape_bytes_prefixed`, and related helpers directly from
 `pymysql.converters` -- internal names that were never public API and
 that PyMySQL has been actively removing/repurposing: **PyMySQL 1.2.1
@@ -62,7 +62,11 @@ explicitly (aiomysql itself declares no useful upper bound, and
 `<1.2.2` alone isn't tight enough -- see above). `pip install
 "zerobucket[mysql,mysql-async]"` together resolves to a PyMySQL version
 satisfying both `>=1.1` and `<1.2.0` -- a real, stable, previous minor
-release, not an ancient one. Confirmed working end to end afterward,
+release, not an ancient one. Re-checked against PyMySQL 1.2.4 (November 2026):
+unchanged -- the bytes-binding query still fails -- so the pin stays. Since 0.33.1 an
+incompatible pair now fails at start-up
+with a message that names the problem, instead of at the first upload (see
+`_pymysql_breaks_aiomysql()`). Confirmed working end to end afterward,
 from a genuinely fresh venv install of the built wheel, against real
 MariaDB.
 
@@ -160,6 +164,42 @@ if TYPE_CHECKING:
 __all__ = ["AsyncMySQLBackend", "DEFAULT_STREAM_CHUNK_SIZE"]
 
 
+def _installed_version(distribution: str) -> str:
+    from importlib import metadata
+
+    try:
+        return metadata.version(distribution)
+    except metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _incompatible_pymysql_message() -> str:
+    return (
+        f"aiomysql {_installed_version('aiomysql')} is installed but cannot work with "
+        f"PyMySQL {_installed_version('PyMySQL')}: aiomysql imports internal PyMySQL names "
+        "that PyMySQL 1.2 removed or replaced (every image upload would fail). "
+        "Install PyMySQL<1.2.0, for example `pip install 'PyMySQL<1.2.0'`; "
+        '`pip install "zerobucket[mysql,mysql-async]"` pins it for you. See this module\'s '
+        "docstring for the details."
+    )
+
+
+def _pymysql_breaks_aiomysql() -> bool:
+    """True when the installed PyMySQL is one that aiomysql 0.3.2 cannot work with.
+
+    PyMySQL 1.2.1 removed `pymysql.converters.escape_dict`, so `import aiomysql` itself
+    fails (handled where the import happens); PyMySQL 1.2.2+ replaced it with a poison-pill
+    string, so the import succeeds and the failure only comes later, as a cryptic
+    `TypeError: 'str' object is not callable` on the first query that sends bytes -- that
+    is, on the first image upload. Checked once at start-up so it fails early and clearly.
+    """
+    try:
+        from pymysql import converters
+    except ImportError:  # PyMySQL itself missing: nothing to compare against
+        return False
+    return isinstance(getattr(converters, "escape_dict", None), str)
+
+
 class AsyncMySQLBackend(AsyncStorageBackend):
     """Async storage backend for MySQL/MariaDB, classic mode only. See
     module docstring for exact scope, driver choice, and the inherited
@@ -235,6 +275,12 @@ class AsyncMySQLBackend(AsyncStorageBackend):
             try:
                 import aiomysql
             except ImportError as exc:
+                from importlib.util import find_spec
+
+                if find_spec("aiomysql") is not None:
+                    # Installed, but its import failed: the PyMySQL 1.2.1 case.
+                    # "Install aiomysql" would be exactly the wrong advice.
+                    raise StorageError(_incompatible_pymysql_message()) from exc
                 raise StorageError(
                     "Async MySQL/MariaDB support requires aiomysql. Install "
                     "it with `pip install zerobucket[mysql-async]` (or "
@@ -242,6 +288,8 @@ class AsyncMySQLBackend(AsyncStorageBackend):
                     "zerobucket` and the SYNC MySQLBackend never require "
                     "this -- only AsyncMySQLBackend does."
                 ) from exc
+            if _pymysql_breaks_aiomysql():
+                raise StorageError(_incompatible_pymysql_message())
             self._aiomysql = aiomysql
 
             # aiomysql.create_pool() takes `db=`, not `database=` -- a
