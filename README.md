@@ -560,9 +560,12 @@ DUPLICATE KEY UPDATE ref_count = ref_count + 1` (not Postgres's/
   documented UPSERT form.
 - **`AsyncMySQLBackend` uses `aiomysql`, not `asyncmy`** -- pure
   Python (consistent with PyMySQL being chosen over mysqlclient for
-  the sync side), but a genuinely unmaintained library with a real
-  version-compatibility landmine: aiomysql 0.3.2 imports internal
-  PyMySQL names that PyMySQL 1.2.x has removed/poisoned. The
+  the sync side), but a library that has not kept pace with PyMySQL, with a real
+  version-compatibility landmine: aiomysql 0.3.2 (October 2025, still the latest)
+  imports internal PyMySQL names that PyMySQL 1.2.x has removed/poisoned.
+  Re-checked against PyMySQL 1.2.4 in November 2026: unchanged. Since 0.33.1
+  an incompatible pair fails at start-up with a message naming the cause,
+  not at the first upload. The
   `zerobucket[mysql-async]` extra pins `PyMySQL<1.2.0` explicitly to
   work around this -- confirmed necessary by hitting two different
   failure modes while narrowing the correct version boundary, not

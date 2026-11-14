@@ -291,8 +291,8 @@ blob upsert uses MySQL's `ON DUPLICATE KEY UPDATE` (not Postgres's/
 SQLite's `ON CONFLICT`) -- verified atomic under 20 concurrent
 threads, not just assumed. `AsyncMySQLBackend` uses `aiomysql`, pinned
 against `PyMySQL<1.2.0` in the `zerobucket[mysql-async]` extra to work
-around a real, verified incompatibility in the (unmaintained) aiomysql
-library with newer PyMySQL releases -- see the full explanation for
+around a real, verified incompatibility between aiomysql 0.3.2 and
+newer PyMySQL releases -- see the full explanation for
 what was actually hit and how it was root-caused. See the
 [full explanation](https://github.com/KedarGhadyalji/ZeroBucket#mysql-support)
 on GitHub for every verified design divergence.

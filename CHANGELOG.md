@@ -6,6 +6,42 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## Python `zerobucket` [0.33.1] - 2026-11-14
+
+A fix for a misleading error, and two things checked and now proven by tests. No change to how images are stored or read.
+
+### Fixed
+
+- **An incompatible `aiomysql` + PyMySQL pair now fails at start-up, and says why.** `aiomysql` 0.3.2 imports internal PyMySQL names that
+  PyMySQL 1.2 removed (1.2.1) or replaced with a poison-pill string (1.2.2 and later). With PyMySQL 1.2.1, `import aiomysql` failed and
+  `AsyncMySQLBackend` reported "Async MySQL/MariaDB support requires aiomysql. Install it ...", the wrong advice, since it was installed.
+  With 1.2.2 or later the import succeeded and the first query that sends bytes, that is the first image upload, failed with
+  `TypeError: 'str' object is not callable`. Both cases now raise a `StorageError` on first use, before any connection is made, naming the
+  installed `aiomysql` and PyMySQL versions and telling you to install `PyMySQL<1.2.0` (the `zerobucket[mysql,mysql-async]` extra already
+  pins it). A genuinely missing `aiomysql` still gets the original "install it" message.
+
+### Verified, no code change
+
+- **The `PyMySQL<1.2.0` pin stays.** Re-tested with PyMySQL 1.2.4 (released 2026-11-09) and `aiomysql` 0.3.2, the latest `aiomysql`:
+  `import aiomysql` succeeds, a plain query works, and a query that binds bytes still fails with `TypeError: 'str' object is not callable`.
+  The same query works on PyMySQL 1.1.x. The pin is lifted only when `aiomysql` catches up, or is replaced.
+- **`older_than_days` (and so `zerobucket tier --older-than`) on MySQL/MariaDB is correct whatever time zone the session is in.** It
+  compares the naive-UTC `created_at` against `UTC_TIMESTAMP(6)`, never `NOW()`. Until now every test ran on a UTC server, where the two agree,
+  so a wrong `NOW()` would have passed everything. New tests set the session time zone to `+13:00` (the most MariaDB accepts), `-12:00` and
+  `+00:00`, and use images 23 and 25 hours old; with `NOW()` the first two zones each misclassify one image, in opposite directions.
+
+### Added
+
+- Tests: `tests/test_mysql_async_compat_guard.py` (4 tests, no database needed: the poison pill, an installed-but-broken `aiomysql`,
+  a missing `aiomysql`, and the detector itself) and `tests/test_mysql_session_timezone.py` (6 tests: three session time zones, in classic and
+  dedup mode, each first checking that the session time zone really changed). Also run against real MySQL 8.0.
+
+### Changed
+
+- Documentation only: `aiomysql` is no longer described as "unmaintained since 2023". Its latest release, 0.3.2, is from October 2025; the
+  accurate statement is that it has not kept pace with PyMySQL. Reworded in the `mysql_async` module docstring and both READMEs (the earlier
+  CHANGELOG entry that used the old wording is left as written).
+
 ## Python `zerobucket` [0.33.0] - 2026-11-13
 
 `AsyncZeroBucket` now takes `connection=`, so a call can run inside your own transaction, exactly as on the sync client. With this the
