@@ -6,6 +6,40 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.11.1] - 2026-11-14
+
+Documentation and tests only; no change to how images are stored or read.
+
+### Fixed (documentation)
+
+- **The README's "Differences from the Python package" section was out of date after Python 0.31.0 to 0.33.0.** The Python column is now
+  "0.33.0 or later" (it said 0.30.0). The "databases" row for `migrateClassicToDedup` ("Python: PostgreSQL only") and the "CLI" row
+  ("`migrate --to-dedup` on PostgreSQL only") are removed: since Python 0.31.0 both packages do all three databases, so they are no longer
+  differences. The Limitations bullet that said the Python package "still has it for PostgreSQL only" now says npm since 0.11.0, Python since
+  0.31.0. The row "Async clients: dedup and tiering" is now "Async client feature set": the Python async client has everything the sync
+  client has (hooks, `optimize` and `validator` since 0.32.0, `connection=` since 0.33.0).
+- **A real difference is now documented: Python's PostgreSQL migration takes no lock.** This package runs `migrateClassicToDedup()` under a
+  PostgreSQL advisory lock; the Python one does not, so two Python runs started at once make the second fail with a unique-key error and
+  roll back (checked: 40 rows migrated once, reference counts correct, one run reporting the error). Python's SQLite and MySQL/MariaDB
+  migrations do exclude each other (write lock; the same named lock this package uses).
+- **"Tested versions" described an older CI.** CI runs PostgreSQL 16, MariaDB 10.11 and MySQL 8.0 on Node 20, 22 and 24, runs the Node/Python
+  conformance harness on both MySQL servers, and runs the SQLite and filesystem tests on Windows. The README said MySQL 8.0.46 "was also run
+  by hand".
+
+### Added
+
+- Tests: `tests/mysql_timezone.test.ts` (6 tests: `olderThanDays` under session time zones `+13:00` (the most MariaDB accepts), `-12:00` and
+  `+00:00`, in classic and dedup mode, each first checking the session time zone really changed). The age filter already compared against
+  `UTC_TIMESTAMP(6)` and never `NOW()`, so no code changed; until now every test ran on a UTC server, where the two agree, so a wrong `NOW()`
+  would have passed everything. Also run against real MySQL 8.0; replacing `UTC_TIMESTAMP` with `NOW` makes the `+13:00` and `-12:00` cases fail.
+
+### Not changed
+
+- **The `vitest` dev dependency stays on 2.x.** `npm audit` reports 0 vulnerabilities in what this package ships and 6 in dev tooling (vitest,
+  vite, esbuild and others, 2 critical), all reached through vitest. The fix npm offers is vitest 5.1.0, which needs Node 22.12 or newer and so
+  could not run the suite on Node 20, which this package supports and tests. Checked: vitest 3.2.7 leaves 4 of the 6 (2 critical), and vitest 4
+  could not be resolved by npm against this project's lockfile (npm error). Left for a decision about the Node 20 test matrix.
+
 ## Python `zerobucket` [0.33.1] - 2026-11-14
 
 A fix for a misleading error, and two things checked and now proven by tests. No change to how images are stored or read.
