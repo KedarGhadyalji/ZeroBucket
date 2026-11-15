@@ -1022,7 +1022,10 @@ export class PostgresBackend implements StorageBackend {
    * re-running is safe (already-migrated ids are skipped and reported, not an error). Classic rows
    * already tiered to object storage are refused up front with a clear message (their bytes are
    * not in the database to copy) unless `skipTiered: true`, which skips and counts them instead.
-   * Still all-or-nothing: one transaction.
+   * Still all-or-nothing: one transaction, under an advisory lock (the Python package takes the same
+   * one since 0.34.0, so a Node and a Python migration of one database exclude each other).
+   * Both `created_at` and `updated_at` are kept exactly (before 0.12.0 `updated_at` became the time of
+   * the migration), and one `migrate_to_dedup` event is reported to `onOperation` (before 0.12.0, none).
    */
   async migrateClassicToDedup(
     opts: MigrateToDedupOptions = {},
@@ -1032,6 +1035,21 @@ export class PostgresBackend implements StorageBackend {
         "migrateClassicToDedup() must be called on an instance created with dedup: true.",
       );
     }
+    // One `migrate_to_dedup` event per call, success or failure (as on SQLite and MySQL/MariaDB).
+    const start = performance.now();
+    try {
+      const result = await this.migrateClassicToDedupInner(opts);
+      this.emit("migrate_to_dedup", start, true, null, 0);
+      return result;
+    } catch (exc) {
+      this.emit("migrate_to_dedup", start, false, msg(exc), 0);
+      throw exc;
+    }
+  }
+
+  private async migrateClassicToDedupInner(
+    opts: MigrateToDedupOptions,
+  ): Promise<MigrateToDedupResult> {
     await this.ready();
     const client = await this.pool!.connect();
     let destroy = false;
@@ -1075,19 +1093,19 @@ export class PostgresBackend implements StorageBackend {
       const seen = new Set<string>();
       let migrated = 0;
       let already = 0;
-      // created_at travels as TEXT, never a JS Date: Postgres keeps microseconds, a Date keeps only
+      // created_at and updated_at travel as TEXT, never a JS Date: Postgres keeps microseconds, a Date keeps only
       // milliseconds, and a truncated keyset cursor sorts before its own row (infinite loop).
       let cursor: { createdAt: string; id: string } | null = null;
       const BATCH = 20;
       for (;;) {
         const page: { rows: any[] } = cursor
           ? await client.query(
-              `SELECT id, data, mime_type, original_filename, size_bytes, width, height, checksum_sha256, created_at::text AS created_at_txt
+              `SELECT id, data, mime_type, original_filename, size_bytes, width, height, checksum_sha256, created_at::text AS created_at_txt, updated_at::text AS updated_at_txt
                FROM zerobucket_images WHERE (created_at, id) > ($1::timestamptz, $2::uuid)${onlyInDb ? " AND storage_backend = 'postgres'" : ""} ORDER BY created_at, id LIMIT ${BATCH}`,
               [cursor.createdAt, cursor.id],
             )
           : await client.query(
-              `SELECT id, data, mime_type, original_filename, size_bytes, width, height, checksum_sha256, created_at::text AS created_at_txt
+              `SELECT id, data, mime_type, original_filename, size_bytes, width, height, checksum_sha256, created_at::text AS created_at_txt, updated_at::text AS updated_at_txt
                FROM zerobucket_images${onlyInDb ? " WHERE storage_backend = 'postgres'" : ""} ORDER BY created_at, id LIMIT ${BATCH}`,
             );
         if (page.rows.length === 0) break;
@@ -1134,8 +1152,14 @@ export class PostgresBackend implements StorageBackend {
         }
         for (const r of fresh) {
           await client.query(
-            "INSERT INTO zerobucket_image_refs (id, checksum_sha256, original_filename, created_at) VALUES ($1, $2, $3, $4::timestamptz)",
-            [r.id, r.checksum_sha256, r.original_filename, r.created_at_txt],
+            "INSERT INTO zerobucket_image_refs (id, checksum_sha256, original_filename, created_at, updated_at) VALUES ($1, $2, $3, $4::timestamptz, $5::timestamptz)",
+            [
+              r.id,
+              r.checksum_sha256,
+              r.original_filename,
+              r.created_at_txt,
+              r.updated_at_txt,
+            ],
           );
           seen.add(r.checksum_sha256);
           migrated += 1;

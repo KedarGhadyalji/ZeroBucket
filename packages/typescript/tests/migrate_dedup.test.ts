@@ -37,6 +37,13 @@ const FIXED_TS: Record<Kind, string> = {
   sqlite: "2026-01-02T03:04:05.123456+00:00",
 };
 
+// A second, different one, for updated_at: it must come out exactly as it went in, not as "now".
+const FIXED_UPDATED_TS: Record<Kind, string> = {
+  postgres: "2026-03-04 05:06:07.654321+00",
+  mysql: "2026-03-04 05:06:07.654321",
+  sqlite: "2026-03-04T05:06:07.654321+00:00",
+};
+
 for (const kind of kinds) {
   describe(`migrateClassicToDedup on ${kind}`, () => {
     let dir: string;
@@ -59,13 +66,21 @@ for (const kind of kinds) {
     };
 
     /** Run SQL on the raw database, whatever it is. `?` placeholders for every kind (converted for pg). */
-    const sql = async (text: string, params: unknown[] = []): Promise<any[]> => {
+    const sql = async (
+      text: string,
+      params: unknown[] = [],
+    ): Promise<any[]> => {
       if (kind === "postgres") {
         let i = 0;
-        return (await pgPool!.query(text.replace(/\?/g, () => `$${++i}`), params))
-          .rows;
+        return (
+          await pgPool!.query(
+            text.replace(/\?/g, () => `$${++i}`),
+            params,
+          )
+        ).rows;
       }
-      if (kind === "mysql") return (await myPool!.query(text, params))[0] as any[];
+      if (kind === "mysql")
+        return (await myPool!.query(text, params))[0] as any[];
       const Database = (await import("better-sqlite3")).default;
       const db = new Database(path);
       try {
@@ -111,7 +126,8 @@ for (const kind of kinds) {
 
     beforeAll(async () => {
       dir = mkdtempSync(join(tmpdir(), "zb-migrate-"));
-      if (kind === "postgres") pgPool = new pg.Pool({ connectionString: DATABASE_URL });
+      if (kind === "postgres")
+        pgPool = new pg.Pool({ connectionString: DATABASE_URL });
       if (kind === "mysql") myPool = mysql.createPool({ uri: MYSQL_URL! });
     });
     afterAll(async () => {
@@ -152,13 +168,11 @@ for (const kind of kinds) {
       expect(await count("zerobucket_images")).toBe(5); // classic untouched
       expect(await count("zerobucket_image_refs")).toBe(5);
       expect(await count("zerobucket_blobs")).toBe(4);
-      // exact timestamps survive (microseconds, not truncated to JS milliseconds). SQLite and MySQL
-      // carry updated_at over too; the PostgreSQL migration has always let it reset to the migration time.
+      // exact timestamps survive (microseconds, not truncated to JS milliseconds), both created_at and
+      // updated_at, on every database (PostgreSQL only since 0.12.0).
       const joinOn = kind === "postgres" ? "USING (id)" : "ON c.id = r.id";
       const stamps =
-        kind === "postgres"
-          ? "c.created_at <> r.created_at"
-          : "c.created_at <> r.created_at OR c.updated_at <> r.updated_at";
+        "c.created_at <> r.created_at OR c.updated_at <> r.updated_at";
       expect(
         Number(
           (
@@ -211,6 +225,25 @@ for (const kind of kinds) {
       await closeAll();
     });
 
+    it("keeps created_at and updated_at exactly, even when updated_at differs from created_at and from now", async () => {
+      const classic = make(false);
+      for (let i = 0; i < 3; i++)
+        await classic.put(await makeImage("png", 26 + i, 26, { seed: 70 + i }));
+      await sql("UPDATE zerobucket_images SET created_at = ?, updated_at = ?", [
+        FIXED_TS[kind],
+        FIXED_UPDATED_TS[kind],
+      ]);
+      await make(true).migrateClassicToDedup();
+      const matching = (
+        await sql(
+          "SELECT count(*) AS n FROM zerobucket_image_refs WHERE created_at = ? AND updated_at = ?",
+          [FIXED_TS[kind], FIXED_UPDATED_TS[kind]],
+        )
+      )[0].n;
+      expect(Number(matching)).toBe(3);
+      await closeAll();
+    });
+
     it("handles more rows than one batch, including rows that all share one created_at (keyset paging ties)", async () => {
       const classic = make(false);
       const imgs = await Promise.all(
@@ -221,7 +254,9 @@ for (const kind of kinds) {
       const res = await classic.putMany(imgs);
       expect(res.every((r) => r.success)).toBe(true);
       // Force the worst case for paging: every row has exactly the same created_at.
-      await sql("UPDATE zerobucket_images SET created_at = ?", [FIXED_TS[kind]]);
+      await sql("UPDATE zerobucket_images SET created_at = ?", [
+        FIXED_TS[kind],
+      ]);
       const stats = await make(true).migrateClassicToDedup();
       expect(stats.imagesMigrated).toBe(47);
       expect(await count("zerobucket_image_refs")).toBe(47);
@@ -236,7 +271,9 @@ for (const kind of kinds) {
       await expect(dedup.migrateClassicToDedup()).rejects.toThrow(
         /1 classic image\(s\) are tiered to object storage/,
       );
-      await expect(dedup.migrateClassicToDedup()).rejects.toThrow(/skipTiered: true/);
+      await expect(dedup.migrateClassicToDedup()).rejects.toThrow(
+        /skipTiered: true/,
+      );
       expect(await count("zerobucket_image_refs")).toBe(0);
       expect(await count("zerobucket_blobs")).toBe(0);
       await closeAll();
@@ -268,7 +305,9 @@ for (const kind of kinds) {
           )[0].n,
         ),
       ).toBe(2);
-      expect(await dedup.migrateClassicToDedup({ skipTiered: true })).toMatchObject({
+      expect(
+        await dedup.migrateClassicToDedup({ skipTiered: true }),
+      ).toMatchObject({
         imagesMigrated: 0,
         alreadyMigrated: 2,
         tieredSkipped: 2,
@@ -278,7 +317,9 @@ for (const kind of kinds) {
 
     it("skipTiered with nothing tiered behaves exactly like the default", async () => {
       await make(false).put(await makeImage("png", 38, 38, { seed: 72 }));
-      expect(await make(true).migrateClassicToDedup({ skipTiered: true })).toEqual({
+      expect(
+        await make(true).migrateClassicToDedup({ skipTiered: true }),
+      ).toEqual({
         imagesMigrated: 1,
         distinctBlobsCreated: 1,
         duplicateReferencesFound: 0,
@@ -289,7 +330,9 @@ for (const kind of kinds) {
     });
 
     it("errors clearly on a non-dedup instance, and when there is no classic table", async () => {
-      await expect(make(false).migrateClassicToDedup()).rejects.toBeInstanceOf(StorageError);
+      await expect(make(false).migrateClassicToDedup()).rejects.toBeInstanceOf(
+        StorageError,
+      );
       await expect(make(false).migrateClassicToDedup()).rejects.toThrow(
         /created with dedup: true/,
       );
@@ -301,7 +344,6 @@ for (const kind of kinds) {
     });
 
     it("reports a migrate_to_dedup event to onOperation, success and failure", async () => {
-      if (kind === "postgres") return; // the PostgreSQL migration has never reported an event
       await make(false).put(await makeImage("png", 21, 21, { seed: 2 }));
       const events: { operation: string; success: boolean }[] = [];
       const dedup = make(true, { onOperation: (e: any) => events.push(e) });
@@ -335,9 +377,12 @@ for (const kind of kinds) {
       if (kind === "postgres") return; // covered by the PostgreSQL tests in dedup.test.ts
       const classic = make(false);
       for (let i = 0; i < 5; i++)
-        await classic.put(await makeImage("png", 20 + i, 20, { seed: 90 + i }), {
-          filename: i === 3 ? "boom" : `f${i}.png`,
-        });
+        await classic.put(
+          await makeImage("png", 20 + i, 20, { seed: 90 + i }),
+          {
+            filename: i === 3 ? "boom" : `f${i}.png`,
+          },
+        );
       await closeAll();
 
       let dedup: ZeroBucket;
@@ -378,11 +423,17 @@ for (const kind of kinds) {
           },
           end: async () => {},
         };
-        dedup = make(true, { mysql: undefined, mysqlPool: pool, maxRetries: 0 });
+        dedup = make(true, {
+          mysql: undefined,
+          mysqlPool: pool,
+          maxRetries: 0,
+        });
         (globalThis as any).__zbDisarm = () => (armed = false);
       }
 
-      await expect(dedup.migrateClassicToDedup()).rejects.toThrow(/injected failure/);
+      await expect(dedup.migrateClassicToDedup()).rejects.toThrow(
+        /injected failure/,
+      );
       expect(await count("zerobucket_image_refs")).toBe(0);
       expect(await count("zerobucket_blobs")).toBe(0);
       expect(await count("zerobucket_images")).toBe(5);
@@ -398,7 +449,9 @@ for (const kind of kinds) {
       if (kind !== "mysql") return;
       const classic = make(false);
       for (let i = 0; i < 6; i++)
-        await classic.put(await makeImage("png", 25, 30 + i, { seed: 700 + i }));
+        await classic.put(
+          await makeImage("png", 25, 30 + i, { seed: 700 + i }),
+        );
       await closeAll();
 
       // A slow COMMIT widens the window between "the copy is done" and "the rows are visible to others".
@@ -437,7 +490,11 @@ for (const kind of kinds) {
       const classic = make(false);
       const dup = await makeImage("png", 25, 25, { seed: 5 });
       for (let i = 0; i < 12; i++)
-        await classic.put(i % 3 === 0 ? dup : await makeImage("png", 25, 26 + i, { seed: 6 + i }));
+        await classic.put(
+          i % 3 === 0
+            ? dup
+            : await makeImage("png", 25, 26 + i, { seed: 6 + i }),
+        );
       await closeAll();
 
       const [a, b] = await Promise.all([
