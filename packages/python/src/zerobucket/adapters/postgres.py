@@ -1407,13 +1407,49 @@ def migrate_classic_to_dedup(
     memory use does not grow with table size. The whole migration is
     still ONE transaction (all rows migrated, or none).
 
+    Both `created_at` and `updated_at` are kept exactly (before 0.34.0 only
+    `created_at` was: the migrated rows' `updated_at` became the time of the
+    migration). The call is reported to `on_operation` as one
+    `migrate_to_dedup` event, success or failure (before 0.34.0 it reported
+    nothing). It runs under a PostgreSQL advisory lock, the same one the npm
+    package takes, so two migrations started at once cannot race: the second
+    waits for the first to commit and then finds every id already migrated
+    (before 0.34.0 the second one failed with a unique-key error and rolled
+    back). Raises StorageError if `dedup_backend` was not created with
+    dedup=True, and ValueError if `batch_size` is below 1 (it used to migrate
+    nothing, silently).
+
     Returns {"images_migrated", "distinct_blobs_created",
     "duplicate_references_found", "already_migrated_skipped",
     "tiered_rows_skipped"}. `distinct_blobs_created` is the number of
     distinct checksums among the rows migrated by THIS call.
     """
+    if not dedup_backend._dedup:  # noqa: SLF001
+        raise StorageError(
+            "migrate_classic_to_dedup() needs a PostgresBackend created with dedup=True."
+        )
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1.")
+
+    start_time = time.monotonic()
+    try:
+        summary = _migrate_classic_to_dedup_postgres(dedup_backend, batch_size)
+    except Exception as exc:
+        dedup_backend._emit("migrate_to_dedup", start_time, False, str(exc), 0)  # noqa: SLF001
+        raise
+    dedup_backend._emit("migrate_to_dedup", start_time, True, None, 0)  # noqa: SLF001
+    return summary
+
+
+def _migrate_classic_to_dedup_postgres(dedup_backend: PostgresBackend, batch_size: int) -> dict:
     with dedup_backend._pool.connection() as conn:  # noqa: SLF001
         with conn.cursor() as cur:
+            # Held until this transaction commits or rolls back. Taken before
+            # anything is read, so a second migration started at once waits here
+            # and then sees every id the first one copied. The key is the one
+            # the npm package uses, so a Python and a Node migration of one
+            # database exclude each other too.
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext('zerobucket_migrate_dedup'));")
             cur.execute("SELECT to_regclass('zerobucket_images');")
             if cur.fetchone()[0] is None:
                 raise StorageError(
@@ -1433,7 +1469,7 @@ def migrate_classic_to_dedup(
         with conn.cursor(name="zerobucket_migrate") as src, conn.cursor() as cur:
             src.execute(
                 "SELECT id, data, mime_type, original_filename, size_bytes, "
-                "width, height, checksum_sha256, created_at, storage_backend "
+                "width, height, checksum_sha256, created_at, updated_at, storage_backend "
                 "FROM zerobucket_images ORDER BY created_at, id;"
             )
             while True:
@@ -1451,6 +1487,7 @@ def migrate_classic_to_dedup(
                         height,
                         checksum,
                         created_at,
+                        updated_at,
                         storage_backend,
                     ) = row
 
@@ -1472,15 +1509,15 @@ def migrate_classic_to_dedup(
                     )
                     seen_checksums.add(checksum)
 
-                    # Preserve the ORIGINAL id and created_at exactly --
+                    # Preserve the ORIGINAL id and both timestamps exactly --
                     # what makes the migration safe for anything that
                     # already references these ids (URLs, foreign keys in
                     # the caller's own app tables, etc.).
                     cur.execute(
                         "INSERT INTO zerobucket_image_refs "
-                        "(id, checksum_sha256, original_filename, created_at) "
-                        "VALUES (%s, %s, %s, %s);",
-                        (image_id, checksum, original_filename, created_at),
+                        "(id, checksum_sha256, original_filename, created_at, updated_at) "
+                        "VALUES (%s, %s, %s, %s, %s);",
+                        (image_id, checksum, original_filename, created_at, updated_at),
                     )
                     migrated += 1
 
