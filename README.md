@@ -1041,14 +1041,37 @@ the same result on each. What differs:
   once cannot race there either. It is the same lock name the npm package
   uses, so a Python and a Node migration of one database also exclude each
   other.
+- **PostgreSQL** takes a transaction-level advisory lock, released at commit or
+  rollback, so two migrations started at once cannot race either: the second
+  waits and then finds every id already migrated. It is the same lock the npm
+  package takes, so a Python and a Node migration of one database exclude each
+  other here too. (Before 0.34.0 there was no lock, and the second of two
+  simultaneous runs failed with a unique-key error and rolled back; nothing was
+  double-counted.)
 - On SQLite and MySQL/MariaDB the image bytes are copied inside the database
-  and never pass through Python, and **both `created_at` and `updated_at` are
-  kept**. The PostgreSQL migration keeps `created_at`; `updated_at` of the
-  migrated rows is the time of the migration.
-- On SQLite and MySQL/MariaDB the migration reports one `migrate_to_dedup`
-  event to `on_operation` (success or failure). The PostgreSQL migration does
-  not.
-- `batch_size` must be at least 1 (a `ValueError` otherwise).
+  and never pass through Python; PostgreSQL streams the rows through Python in
+  batches of `batch_size`.
+- **All three databases keep both `created_at` and `updated_at`** of every
+  migrated row, and report one `migrate_to_dedup` event to `on_operation`
+  (success or failure). Before 0.34.0 the PostgreSQL migration kept only
+  `created_at` (the migrated rows' `updated_at` became the time of the
+  migration) and reported no event.
+- `batch_size` must be at least 1 (a `ValueError` otherwise), and the backend
+  must have been created with `dedup=True` (a `StorageError` otherwise).
+
+**Migrated on PostgreSQL before 0.34.0?** The classic table is never modified,
+so it still holds the original `updated_at` of every image. This one statement
+copies it over; it is safe to run more than once:
+
+```sql
+UPDATE zerobucket_image_refs r
+SET updated_at = c.updated_at
+FROM zerobucket_images c
+WHERE c.id = r.id;
+```
+
+It changes nothing except `updated_at`, and only restores values that the
+migration overwrote.
 
 ## Tuning and observability
 
