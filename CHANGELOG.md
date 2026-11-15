@@ -6,6 +6,71 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.12.0] - 2026-11-15
+
+The PostgreSQL `migrateClassicToDedup()` now behaves like the SQLite and MySQL/MariaDB ones (0.11.0), and like the Python package from 0.34.0.
+It is a change to released behaviour, so it gets its own release.
+
+### Changed
+
+- **`updated_at` is kept.** The PostgreSQL migration used to copy `created_at` only, so every migrated image got `updated_at` = the time of the
+  migration and looked modified that day. It now copies both timestamps exactly, as text, so microseconds survive (the same way `created_at`
+  always did). Neither library reads or exposes `updated_at` through its API, so this only shows if you query the table directly. Rows you
+  already migrated stay as they are; because a migration never touches the classic table, the original values are still there, and the README
+  gives one `UPDATE` statement that restores them.
+- **It reports an event.** One `migrate_to_dedup` event goes to `onOperation`, success or failure, as on SQLite and MySQL/MariaDB (before, the
+  PostgreSQL migration reported nothing).
+
+### Added
+
+- Tests: in `tests/migrate_dedup.test.ts` the PostgreSQL exceptions are gone: the main test now compares both timestamps on all three databases,
+  the event test runs on PostgreSQL, and a new test sets distinct known `created_at` and `updated_at` values (with microseconds) and checks they
+  come out exactly. Reverting either change makes the PostgreSQL cases fail.
+
+### Changed (documentation)
+
+- README: the migration section says it runs under a lock on every database and keeps both timestamps, and gives the repair statement for
+  PostgreSQL migrations run before 0.12.0. The Python comparison table now says "0.34.0 or later", and its "other behaviour" row (Python's
+  PostgreSQL migration had no lock) is removed: since Python 0.34.0 that difference is gone.
+
+### Not changed
+
+- The advisory lock (this package has had it since 0.11.0; Python 0.34.0 now takes the same one). SQLite and MySQL/MariaDB (already correct).
+  The `vitest` dev dependency (see 0.11.1). Bun and Deno are still untested.
+
+## Python `zerobucket` [0.34.0] - 2026-11-15
+
+The PostgreSQL `migrate_classic_to_dedup()` now behaves like the SQLite and MySQL/MariaDB ones (0.31.0). It is a change to released behaviour,
+so it gets its own release.
+
+### Changed
+
+- **`updated_at` is kept.** The PostgreSQL migration used to copy `created_at` only, so every migrated image got `updated_at` = the time of the
+  migration and looked modified that day. It now copies both timestamps exactly. Neither library reads or exposes `updated_at` through its API,
+  so this only shows if you query the table directly (for example "which images changed since March?"). Rows you already migrated stay as they
+  are; because a migration never touches the classic table, the original values are still there, and the README gives one `UPDATE` statement
+  that restores them (the statement is covered by a test).
+- **It reports an event.** One `migrate_to_dedup` event goes to `on_operation`, success or failure, as on SQLite and MySQL/MariaDB (before, the
+  PostgreSQL migration reported nothing).
+- **Two migrations started at once can no longer collide.** The migration now takes a transaction-level advisory lock
+  (`pg_advisory_xact_lock(hashtext('zerobucket_migrate_dedup'))`), released at commit or rollback; the second run waits and then finds every id
+  already migrated. It is the same lock the npm package takes, so a Python and a Node migration of one database exclude each other. Before, the
+  second run failed with a unique-key error and rolled back (checked: nothing was double-counted, but one run errored).
+- **Argument checks, as on the other two databases.** `batch_size` below 1 raises `ValueError` (it used to migrate nothing, silently), and a
+  backend created without `dedup=True` raises a `StorageError` saying so (it used to fail with a raw database error).
+
+### Added
+
+- Tests: `tests/test_migrate_dedup_postgres.py` (9 tests): both timestamps kept exactly; one event on success; a failure part-way (a unique
+  index makes the fourth image fail) is reported and leaves the dedup tables untouched, and a re-run completes; two simultaneous migrations
+  both succeed and copy each image once; the migration waits for the lock when another session holds it (the one npm takes) and then runs; the
+  lock is released after both success and failure; the argument checks; and the documented repair statement.
+
+### Not changed
+
+- SQLite and MySQL/MariaDB (already correct). The async clients (migration is a one-time, synchronous maintenance operation). Events and retry
+  for sync SQLite `get_stream()` and `tier_to_object_storage()` stay as documented (a later release).
+
 ## npm `zerobucket` [0.11.1] - 2026-11-14
 
 Documentation and tests only; no change to how images are stored or read.
