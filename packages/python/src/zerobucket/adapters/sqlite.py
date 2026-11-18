@@ -324,6 +324,7 @@ def _stream_with_substr(
     chunk_size: int,
     image_id: str,
     owns_connection: bool,
+    report: Callable[[float, str | None], None] | None = None,
 ) -> Iterator[bytes]:
     """get_stream() for Pythons without Connection.blobopen() (3.10).
 
@@ -335,15 +336,23 @@ def _stream_with_substr(
     each see the current state). If the caller passed their own connection that is
     already inside a transaction, that transaction is used as it is and left open.
 
+    `report(start_time, error)` is called once per chunk read (error is None on
+    success) and on a failure to start the read transaction. The first chunk's time
+    includes starting the transaction. Time the consumer spends between chunks is
+    never counted.
+
     `table` is one of two constants chosen by the caller, never user input.
     """
     began = False
+    start = time.monotonic()
     try:
         if not conn.in_transaction:
             try:
                 conn.execute("BEGIN")
                 began = True
             except Exception as exc:  # noqa: BLE001
+                if report is not None:
+                    report(start, str(exc))
                 raise StorageError(f"Failed to stream image: {exc}") from exc
         delivered = 0
         while delivered < total_size:
@@ -354,14 +363,22 @@ def _stream_with_substr(
                     (delivered + 1, want, rowid),  # substr() is 1-indexed
                 ).fetchone()
             except Exception as exc:  # noqa: BLE001
+                if report is not None:
+                    report(start, str(exc))
                 raise StorageError(f"Failed to stream image: {exc}") from exc
             chunk = bytes(row[0]) if row is not None and row[0] is not None else b""
             if not chunk:
-                raise StorageError(
+                message = (
                     f"Image {image_id!r} was deleted while streaming "
                     f"(delivered {delivered} of {total_size} bytes)."
                 )
+                if report is not None:
+                    report(start, message)
+                raise StorageError(message)
+            if report is not None:
+                report(start, None)
             yield chunk
+            start = time.monotonic()
             delivered += len(chunk)
     finally:
         if began:
@@ -417,8 +434,12 @@ class SQLiteBackend(StorageBackend):
             except Exception as exc:  # noqa: BLE001
                 raise StorageError(f"Migration failed: {exc}") from exc
 
-    def _connect(self) -> sqlite3.Connection:
-        """Explicit busy_timeout at two layers -- see
+    def _connect(self, *, autocommit: bool = False) -> sqlite3.Connection:
+        """`autocommit=True` opens the connection with `isolation_level=None`, for
+        work that issues its own BEGIN IMMEDIATE / COMMIT / ROLLBACK
+        (`tier_to_object_storage()`); everything else uses the default.
+
+        Explicit busy_timeout at two layers -- see
         AsyncSQLiteBackend._connect()'s docstring in sqlite_async.py for
         the full reasoning (a real, observed-on-Windows gap under
         concurrent connections, not theoretical caution). Python's
@@ -441,7 +462,14 @@ class SQLiteBackend(StorageBackend):
         prevents a `SQLiteBackend` instance from being used across
         multiple threads.
         """
-        conn = sqlite3.connect(self._database_path, timeout=_BUSY_TIMEOUT_SECONDS)
+        if autocommit:
+            conn = sqlite3.connect(
+                self._database_path,
+                timeout=_BUSY_TIMEOUT_SECONDS,
+                isolation_level=None,
+            )
+        else:
+            conn = sqlite3.connect(self._database_path, timeout=_BUSY_TIMEOUT_SECONDS)
         conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
         if not self._wal_configured:
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -471,7 +499,30 @@ class SQLiteBackend(StorageBackend):
         except Exception:  # noqa: BLE001
             pass  # never let a metrics callback break a real operation
 
-    def _run(self, connection, work, *, operation: str):
+    def _with_retry(self, attempt_fn, *, operation: str, start_time: float | None = None):
+        """Runs `attempt_fn()` (one complete attempt, which opens and cleans up its
+        own connection), retrying lock contention (see `_is_retryable`) up to
+        max_retries times with exponential backoff plus jitter. Emits exactly one
+        OperationEvent after the final attempt. Same loop as the async adapter's
+        `_with_retry()`; `_run()` below keeps its own copy because it also owns the
+        commit/rollback/close of the connection."""
+        if start_time is None:
+            start_time = time.monotonic()
+        attempt = 0
+        while True:
+            try:
+                result = attempt_fn()
+            except Exception as exc:  # noqa: BLE001
+                attempt += 1
+                if attempt > self._max_retries or not _is_retryable(exc):
+                    self._emit(operation, start_time, False, str(exc), attempt - 1)
+                    raise
+                time.sleep(_backoff_delay(attempt, self._retry_base_delay))
+            else:
+                self._emit(operation, start_time, True, None, attempt)
+                return result
+
+    def _run(self, connection, work, *, operation: str, autocommit: bool = False):
         """Mirrors the Postgres adapter's `_run()` shape (a `work(conn)`
         callable, connection=None vs connection=provided).
 
@@ -489,6 +540,11 @@ class SQLiteBackend(StorageBackend):
         (max_retries + 1) x 10 s to fail; pass max_retries=0 to keep the
         old single-wait behaviour. Emits exactly one OperationEvent per
         call, after the final attempt.
+
+        autocommit=True (own connection only) opens it with `isolation_level=None`
+        for work that manages its own transaction; the commit/rollback here are then
+        no-ops unless `work` left a transaction open, in which case the rollback
+        ends it.
         """
         start_time = time.monotonic()
         if connection is not None:
@@ -504,7 +560,7 @@ class SQLiteBackend(StorageBackend):
         while True:
             conn = None
             try:
-                conn = self._connect()
+                conn = self._connect(autocommit=autocommit)
                 result = work(conn)
                 conn.commit()
             except Exception as exc:  # noqa: BLE001
@@ -844,10 +900,15 @@ class SQLiteBackend(StorageBackend):
         returns None immediately if the id doesn't exist (checked
         eagerly, before any generator is even created).
 
-        Not instrumented: this method opens its own connection outside
-        `_run()`, so it neither emits `on_operation` events nor retries
-        (0.27.0). A WAL-mode read does not block on writers, so there is
-        no lock contention to retry.
+        Instrumented (0.35.0), the same way the Postgres and async SQLite adapters
+        are: one `get_stream` OperationEvent for the size lookup, then one per chunk
+        read. The lookup (connection + query) is retried on lock contention like
+        every other operation; chunk reads are not, because the stream holds one
+        connection and one read snapshot, and replaying a read on it cannot fix
+        anything. A failed chunk read reports a failure event and raises
+        StorageError as before. Each chunk's duration covers only the read, never
+        the time your code spends between chunks. A caller-supplied `connection=`
+        runs the lookup once, with no retry.
 
         MID-STREAM CONCURRENT DELETION BEHAVES DIFFERENTLY FROM
         POSTGRES, verified directly rather than assumed to match: on
@@ -876,38 +937,47 @@ class SQLiteBackend(StorageBackend):
         non-tiered rows.
         """
         owns_connection = connection is None
-        conn = connection if connection is not None else self._connect()
+        if self._dedup:
+            info_sql, table = _DEDUP_STREAM_INFO, "zerobucket_blobs"
+        else:
+            info_sql, table = _SELECT_STREAM_INFO, "zerobucket_images"
+
+        def lookup(c):
+            return c.execute(info_sql, (image_id,)).fetchone()
+
+        try:
+            if owns_connection:
+
+                def attempt():
+                    c = self._connect()
+                    try:
+                        return c, lookup(c)
+                    except BaseException:
+                        c.close()
+                        raise
+
+                conn, info_row = self._with_retry(attempt, operation="get_stream")
+            else:
+                conn = connection
+                start = time.monotonic()
+                try:
+                    info_row = lookup(conn)
+                except Exception as exc:  # noqa: BLE001
+                    self._emit("get_stream", start, False, str(exc), 0)
+                    raise
+                self._emit("get_stream", start, True, None, 0)
+        except Exception as exc:  # noqa: BLE001
+            raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
+
+        if info_row is None:
+            if owns_connection:
+                conn.close()
+            return None
 
         if self._dedup:
-            try:
-                cur = conn.execute(_DEDUP_STREAM_INFO, (image_id,))
-                dedup_row = cur.fetchone()
-            except Exception as exc:  # noqa: BLE001
-                if owns_connection:
-                    conn.close()
-                raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
-            if dedup_row is None:
-                if owns_connection:
-                    conn.close()
-                return None
-            rowid, total_size = dedup_row
-            table = "zerobucket_blobs"
+            rowid, total_size = info_row
         else:
-            try:
-                cur = conn.execute(_SELECT_STREAM_INFO, (image_id,))
-                info_row = cur.fetchone()
-            except Exception as exc:  # noqa: BLE001
-                if owns_connection:
-                    conn.close()
-                raise StorageError(f"Failed to retrieve image metadata: {exc}") from exc
-
-            if info_row is None:
-                if owns_connection:
-                    conn.close()
-                return None
-
             rowid, total_size, storage_backend, object_storage_key = info_row
-
             if storage_backend == "object_storage":
                 if owns_connection:
                     conn.close()
@@ -922,7 +992,9 @@ class SQLiteBackend(StorageBackend):
                 return self._object_storage.download_stream(
                     object_storage_key, chunk_size=chunk_size
                 )
-            table = "zerobucket_images"
+
+        def report(start: float, error: str | None) -> None:
+            self._emit("get_stream", start, error is None, error, 0)
 
         def generator() -> Iterator[bytes]:
             if not _HAS_BLOBOPEN:
@@ -934,11 +1006,14 @@ class SQLiteBackend(StorageBackend):
                     chunk_size,
                     image_id,
                     owns_connection,
+                    report,
                 )
                 return
+            start = time.monotonic()
             try:
                 blob = conn.blobopen(table, "data", rowid, readonly=True)
             except Exception as exc:  # noqa: BLE001
+                report(start, str(exc))
                 if owns_connection:
                     conn.close()
                 raise StorageError(f"Failed to stream image: {exc}") from exc
@@ -948,13 +1023,18 @@ class SQLiteBackend(StorageBackend):
                     try:
                         chunk = blob.read(min(chunk_size, total_size - delivered))
                     except Exception as exc:  # noqa: BLE001
+                        report(start, str(exc))
                         raise StorageError(f"Failed to stream image: {exc}") from exc
                     if not chunk:
-                        raise StorageError(
+                        message = (
                             f"Image {image_id!r} was deleted while streaming "
                             f"(delivered {delivered} of {total_size} bytes)."
                         )
+                        report(start, message)
+                        raise StorageError(message)
+                    report(start, None)
                     yield chunk
+                    start = time.monotonic()
                     delivered += len(chunk)
             finally:
                 blob.close()
@@ -997,6 +1077,16 @@ class SQLiteBackend(StorageBackend):
         opens its own connection configured that way. If you pass your
         own `connection=`, set `conn.isolation_level = None` on it
         yourself first, or this will raise.
+
+        Instrumented (0.35.0): reports one `tier_to_object_storage` OperationEvent
+        per call, and lock contention (SQLITE_BUSY/LOCKED, for example when
+        BEGIN IMMEDIATE cannot get the write lock) is retried like every other
+        operation. A retry replays the whole transaction including the upload; that
+        is safe for the same reason as on Postgres: the key is deterministic
+        (str(image_id)) and an S3 PutObject to the same key just overwrites it with
+        the same bytes. Only SQLite lock errors are retried, never an upload
+        failure. A caller-supplied `connection=` runs once, with no retry, and
+        still reports an event.
         """
         if self._object_storage is None:
             raise StorageError(
@@ -1005,23 +1095,9 @@ class SQLiteBackend(StorageBackend):
                 "in object_storage.py."
             )
 
-        owns_connection = connection is None
-        conn = connection
-        if owns_connection:
-            conn = sqlite3.connect(
-                self._database_path,
-                isolation_level=None,
-                timeout=_BUSY_TIMEOUT_SECONDS,
-            )
-            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
-            # Same one-time-only guard as _connect() -- see that
-            # method's docstring for why re-issuing this on every
-            # connection was itself a real bug, not just redundant work.
-            if not self._wal_configured:
-                conn.execute("PRAGMA journal_mode=WAL;")
-                self._wal_configured = True
+        store = self._object_storage
 
-        try:
+        def work(conn):
             conn.execute("BEGIN IMMEDIATE;")
             try:
                 cur = conn.execute(_SELECT_FOR_TIERING, (image_id,))
@@ -1035,25 +1111,30 @@ class SQLiteBackend(StorageBackend):
                     return False
 
                 key = str(image_id)
-                self._object_storage.upload(key, bytes(data), mime_type=mime_type)
+                store.upload(key, bytes(data), mime_type=mime_type)
                 conn.execute(
                     _UPDATE_AFTER_TIERING,
-                    (self._object_storage.bucket, key, _now_iso(), image_id),
+                    (store.bucket, key, _now_iso(), image_id),
                 )
                 conn.execute("COMMIT;")
                 return True
             except Exception:
                 conn.execute("ROLLBACK;")
                 raise
+
+        try:
+            return self._run(
+                connection,
+                work,
+                operation="tier_to_object_storage",
+                autocommit=True,
+            )
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise StorageError(
                 f"Failed to tier image to object storage: {exc}"
             ) from exc
-        finally:
-            if owns_connection:
-                conn.close()
 
     # ---- delete -------------------------------------------------------------
 

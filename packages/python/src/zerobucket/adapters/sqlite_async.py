@@ -235,8 +235,12 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
                 raise StorageError(f"Migration failed: {exc}") from exc
             self._ready = True
 
-    async def _connect(self) -> aiosqlite.Connection:
-        """Busy timeout only, deliberately at two layers -- `timeout=`
+    async def _connect(self, *, autocommit: bool = False) -> aiosqlite.Connection:
+        """`autocommit=True` opens the connection with `isolation_level=None`, for
+        work that issues its own BEGIN IMMEDIATE / COMMIT / ROLLBACK
+        (`tier_to_object_storage()`).
+
+        Busy timeout only, deliberately at two layers -- `timeout=`
         on connect() sets sqlite3's own Python-level busy handler (a
         retry loop it runs internally before giving up and raising
         `OperationalError: database is locked`); `PRAGMA busy_timeout`
@@ -251,9 +255,16 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         docstring for why re-issuing it here was the actual bug, not
         just redundant work.
         """
-        conn = await self._aiosqlite.connect(
-            self._database_path, timeout=_BUSY_TIMEOUT_SECONDS
-        )
+        if autocommit:
+            conn = await self._aiosqlite.connect(
+                self._database_path,
+                timeout=_BUSY_TIMEOUT_SECONDS,
+                isolation_level=None,
+            )
+        else:
+            conn = await self._aiosqlite.connect(
+                self._database_path, timeout=_BUSY_TIMEOUT_SECONDS
+            )
         await conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
         return conn
 
@@ -306,7 +317,14 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
                 self._emit(operation, start_time, True, None, attempt)
                 return result
 
-    async def _run(self, work, *, operation: str, connection: object | None = None):
+    async def _run(
+        self,
+        work,
+        *,
+        operation: str,
+        connection: object | None = None,
+        autocommit: bool = False,
+    ):
         """Run `work(conn)` and return its result.
 
         connection provided (0.33.0) -> run ONCE on that exact aiosqlite
@@ -334,7 +352,7 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
             return result
 
         async def attempt_fn():
-            conn = await self._connect()
+            conn = await self._connect(autocommit=autocommit)
             try:
                 result = await work(conn)
                 await conn.commit()
@@ -715,10 +733,13 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
         IMMEDIATE transaction, so a failed upload rolls back and the row is
         untouched. TRADEOFF, as in the sync adapter: BEGIN IMMEDIATE takes
         SQLite's single write lock for the whole upload, so every other
-        WRITER to this database file waits; readers are not blocked. Like
-        the sync adapter this opens its own connection (so it is not
-        covered by retry or by an OperationEvent) unless you pass
-        `connection=`: then it uses yours, which must have been opened with
+        WRITER to this database file waits; readers are not blocked. Since
+        0.35.0, like the sync adapter, it reports one
+        `tier_to_object_storage` OperationEvent per call and retries SQLite lock
+        contention (a retry replays the whole transaction including the upload,
+        which is safe: the key is deterministic and S3 overwrites it with the same
+        bytes). With `connection=` it uses yours, once and without retry; it must
+        have been opened with
         `isolation_level=None` (autocommit mode) so the explicit BEGIN
         IMMEDIATE / COMMIT below can be issued; it COMMITS (or rolls back)
         its own transaction on it, exactly as the sync adapter does."""
@@ -733,49 +754,40 @@ class AsyncSQLiteBackend(AsyncStorageBackend):
                 "constructed with object_storage=... -- see ObjectStorage "
                 "in object_storage.py."
             )
-        await self._ensure_ready()
         store = self._object_storage
 
-        owns_connection = connection is None
-        try:
-            if owns_connection:
-                # isolation_level=None: we issue BEGIN/COMMIT/ROLLBACK ourselves.
-                conn = await self._aiosqlite.connect(
-                    self._database_path,
-                    timeout=_BUSY_TIMEOUT_SECONDS,
-                    isolation_level=None,
-                )
-            else:
-                conn = connection
+        async def work(conn):
+            await conn.execute("BEGIN IMMEDIATE;")
             try:
-                if owns_connection:
-                    await conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS};")
-                await conn.execute("BEGIN IMMEDIATE;")
-                try:
-                    cur = await conn.execute(_SELECT_FOR_TIERING, (image_id,))
-                    row = await cur.fetchone()
-                    if row is None:
-                        await conn.execute("ROLLBACK;")
-                        return None
-                    data, mime_type, _size_bytes, storage_backend = row
-                    if storage_backend != "sqlite":
-                        await conn.execute("ROLLBACK;")
-                        return False
-                    key = str(image_id)
-                    await asyncio.to_thread(
-                        store.upload, key, bytes(data), mime_type=mime_type
-                    )
-                    await conn.execute(
-                        _UPDATE_AFTER_TIERING, (store.bucket, key, _now_iso(), image_id)
-                    )
-                    await conn.execute("COMMIT;")
-                    return True
-                except Exception:
+                cur = await conn.execute(_SELECT_FOR_TIERING, (image_id,))
+                row = await cur.fetchone()
+                if row is None:
                     await conn.execute("ROLLBACK;")
-                    raise
-            finally:
-                if owns_connection:
-                    await conn.close()
+                    return None
+                data, mime_type, _size_bytes, storage_backend = row
+                if storage_backend != "sqlite":
+                    await conn.execute("ROLLBACK;")
+                    return False
+                key = str(image_id)
+                await asyncio.to_thread(
+                    store.upload, key, bytes(data), mime_type=mime_type
+                )
+                await conn.execute(
+                    _UPDATE_AFTER_TIERING, (store.bucket, key, _now_iso(), image_id)
+                )
+                await conn.execute("COMMIT;")
+                return True
+            except Exception:
+                await conn.execute("ROLLBACK;")
+                raise
+
+        try:
+            return await self._run(
+                work,
+                connection=connection,
+                operation="tier_to_object_storage",
+                autocommit=True,
+            )
         except StorageError:
             raise
         except Exception as exc:  # noqa: BLE001
