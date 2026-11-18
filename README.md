@@ -396,13 +396,14 @@ adapters. Only lock contention (`SQLITE_BUSY`/`SQLITE_LOCKED`) is
 retried, as a whole-operation re-run. SQLite already waits up to 10 s per
 attempt inside the engine, so a lock that is truly stuck can take up to
 `(max_retries + 1) x 10 s` to fail; pass `max_retries=0` for the old
-single wait. `get_stream()` and `tier_to_object_storage()` are partly exempt; see the
-fourth difference below.
+single wait. Since Python 0.35.0 this covers `get_stream()` and
+`tier_to_object_storage()` too, on both the sync and async backends; see the
+last bullet below for how.
 `dedup=True` combined with `object_storage=` raises `ValueError` at construction --
 same restriction as the Postgres adapter; combining content-addressed
 storage with tiering is out of scope for both.
 
-Four real, verified differences worth knowing before you rely on
+Three real, verified differences worth knowing before you rely on
 identical behavior across backends -- not theoretical ones:
 
 - **`tier_to_object_storage()` locks the whole database file, not just
@@ -436,15 +437,21 @@ UPDATE`-based version has, but `BEGIN IMMEDIATE` is a coarser lock --
   differently from each other for this exact scenario, not just
   differently from Postgres. Confirmed directly with a dedicated test
   for each, not assumed consistent just because both are "SQLite."
-- **Which operations report to `on_operation` and retry differs between
-  the sync and async backends.** On both, the core operations (`put`,
-  `get`, `delete` and the rest) report events and retry lock
-  contention. Two operations are exempt, and not the same two. Sync
-  `get_stream()` and sync `tier_to_object_storage()` do neither, because
-  each opens its own connection outside the retry path. Async
-  `get_stream()` does both: each of its queries (the size lookup and
-  every chunk) goes through the retry and reporting path. Async
-  `tier_to_object_storage()` still does neither.
+
+Every SQLite operation reports to `on_operation` and retries lock contention,
+sync and async alike (from 0.35.0; before that, sync `get_stream()` and both
+`tier_to_object_storage()` versions did neither). Two details on streams and
+tiering:
+
+- `get_stream()` reports one `get_stream` event for the size lookup plus one per
+  chunk read, as on Postgres and async SQLite. Only the lookup is retried: the
+  stream holds one connection and one read snapshot, so replaying a chunk read
+  cannot help. The time you spend between chunks is not counted in the events.
+  Streaming a tiered image reports only the lookup (the bytes come from S3).
+- `tier_to_object_storage()` reports one event per call. A retry replays the whole
+  transaction, including the upload; that is safe because the object key is the
+  image id, so the retry overwrites the same object with the same bytes. Upload
+  failures are not retried, only SQLite lock errors.
 
 ### MySQL support
 

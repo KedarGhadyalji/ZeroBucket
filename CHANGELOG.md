@@ -6,6 +6,50 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## Python `zerobucket` [0.35.0] - 2026-11-16
+
+SQLite now reports and retries every operation. Since 0.27.0 three of them were left out on purpose: sync `get_stream()`, sync
+`tier_to_object_storage()` and async `tier_to_object_storage()`. They are in now, so the two SQLite backends and the other databases no longer
+differ in what `on_operation` sees.
+
+### Added
+
+- **Sync `SQLiteBackend.get_stream()` reports to `on_operation`:** one `get_stream` event for the size lookup, then one per chunk read, the same
+  shape as Postgres and async SQLite. Each chunk's duration covers the read only, never the time your code spends between chunks. A failed read
+  (for example a row that ran out of bytes) reports a failure event before it raises `StorageError`, as before. A tiered image reports only
+  the lookup, because its bytes come from S3. Same on Python 3.10 (the `substr()` fallback) and 3.11+ (`blobopen()`), and in dedup mode.
+- **Sync `get_stream()` retries the lookup** on `SQLITE_BUSY`/`SQLITE_LOCKED`, up to `max_retries`, with the usual backoff. Chunk reads are not
+  retried: the stream holds one connection and one read snapshot, so replaying a read cannot fix anything, and reopening would lose the
+  snapshot. A caller-supplied `connection=` runs once, without retry, and still reports.
+- **`tier_to_object_storage()` reports and retries on both SQLite backends:** one `tier_to_object_storage` event per call (success, already
+  tiered, not found, or failure), and lock contention (including `BEGIN IMMEDIATE` not getting the write lock) is retried like every other
+  operation. A retry replays the whole transaction including the upload. That is safe for the reason Postgres' is: the object key is the image
+  id, so the repeat upload overwrites the same object with the same bytes. Only SQLite lock errors are retried, never an upload failure. A
+  caller-supplied `connection=` runs once, without retry, and still reports.
+- Tests: `tests/test_sqlite_instrumentation.py` (41 tests), covering events, retry (injected and real lock contention), the exhausted and
+  `max_retries=0` cases, failures, caller-supplied connections, tiered rows, abandoned streams, both read implementations and dedup mode.
+  Each behaviour was reverted in turn and the matching tests failed.
+
+### Changed
+
+- **A failure to open the database in sync `get_stream()` is now a `StorageError`** ("Failed to retrieve image metadata: ..."). Before, the raw
+  `sqlite3.OperationalError` came out of `get_stream()` unwrapped, unlike every other method. Code that caught `sqlite3.OperationalError`
+  around `get_stream()` should catch `StorageError`.
+- Internal: `_connect()` and `_run()` take `autocommit=True` for work that issues its own `BEGIN IMMEDIATE`/`COMMIT`, and the sync adapter
+  gets the same `_with_retry()` the async one has. Tiering now opens its connection through `_connect()`, so it also gets `foreign_keys=ON`
+  like every other operation (no effect: the only statement it runs touches one table).
+- Tests: `test_sync_get_stream_is_not_instrumented` became `test_sync_get_stream_is_instrumented`.
+
+### Changed (documentation)
+
+- README: the SQLite section no longer lists these operations as exempt; it describes what they report and what is retried. "Four
+  differences" became three. The 0.27.0 "Not instrumented" note is left as written, because it was true for that release.
+
+### Not changed
+
+- Behaviour of the data: nothing is stored differently, and return values, errors (other than the one above) and locking are the same.
+  Tiering still takes `BEGIN IMMEDIATE` for the whole upload. Postgres and MySQL are untouched.
+
 ## npm `zerobucket` [0.12.0] - 2026-11-15
 
 The PostgreSQL `migrateClassicToDedup()` now behaves like the SQLite and MySQL/MariaDB ones (0.11.0), and like the Python package from 0.34.0.
