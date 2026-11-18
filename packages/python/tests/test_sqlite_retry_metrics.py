@@ -341,18 +341,18 @@ def test_sync_callback_exception_does_not_break_operation(path):
     assert zb.exists(image_id) is True
 
 
-def test_sync_get_stream_is_not_instrumented(path):
-    """Documented: sync SQLite streams over ONE connection it opens
-    itself, outside `_run()`, so it emits no events and has no retry (a
-    WAL read does not block on writers). Async SQLite, which does go
-    through `_run()` per chunk, is covered below."""
+def test_sync_get_stream_is_instrumented(path):
+    """Since 0.35.0 sync get_stream() reports one event for the size lookup plus one
+    per chunk, like async SQLite. The detailed scenarios (retry, failures, the
+    caller-supplied connection, both read implementations) are in
+    test_sqlite_instrumentation.py."""
     events = []
     zb = ZeroBucket(backend=SQLiteBackend(path, on_operation=events.append))
     image_id = zb.put(_noisy_jpeg())
     events.clear()
     chunks = list(zb.get_stream(image_id, chunk_size=1000))
     assert len(chunks) > 1
-    assert events == []
+    assert [e.operation for e in events] == ["get_stream"] * (1 + len(chunks))
 
 
 # ---- async -----------------------------------------------------------------
