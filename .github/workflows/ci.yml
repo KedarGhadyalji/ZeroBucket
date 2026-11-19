@@ -220,6 +220,113 @@ jobs:
   # GitHub's Windows runners cannot run service containers, so these jobs have no PostgreSQL, MySQL or S3 server. The tests for
   # those backends skip themselves when their ZEROBUCKET_TEST_* setting is missing; what runs is everything that needs only
   # SQLite and the filesystem, which is where the Windows-only bugs (locked files, path separators, CRLF) have been.
+  # Bun and Deno run the built package and the whole test suite. Node is still needed to install and build (and, on Deno, to run
+  # the few test helper processes that are written for Node; see tests/support/nodeBinary.ts). The versions are the ones this
+  # was verified on; bump them on purpose, not by accident.
+  test-runtimes:
+    name: ${{ matrix.runtime }} ${{ matrix.version }}
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: zerobucket_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      mysql:
+        image: mariadb:10.11
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: zerobucket_test
+          MYSQL_USER: zerobucket
+          MYSQL_PASSWORD: zerobucket
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -u root -proot"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      moto:
+        image: motoserver/moto:latest
+        ports:
+          - 5000:5000
+
+    env:
+      ZEROBUCKET_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/zerobucket_test
+      ZEROBUCKET_TEST_MYSQL_URL: mysql://zerobucket:zerobucket@127.0.0.1:3306/zerobucket_test
+      ZEROBUCKET_TEST_S3_ENDPOINT: http://localhost:5000
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: Bun
+            version: "1.4.4"
+          - runtime: Deno
+            version: "2.9.6"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node 22 (install and build)
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/typescript/package-lock.json
+
+      - name: Set up Bun
+        if: matrix.runtime == 'Bun'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ matrix.version }}
+
+      - name: Set up Deno
+        if: matrix.runtime == 'Deno'
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: ${{ matrix.version }}
+
+      - name: Install and build
+        working-directory: packages/typescript
+        run: |
+          npm ci
+          npm run build
+
+      - name: Built package on Bun
+        if: matrix.runtime == 'Bun'
+        working-directory: packages/typescript
+        run: bun tests/runtimes/check.mjs
+
+      - name: Built package on Deno
+        if: matrix.runtime == 'Deno'
+        working-directory: packages/typescript
+        run: deno run -A --node-modules-dir=manual tests/runtimes/check.mjs
+
+      - name: Test suite on Bun
+        if: matrix.runtime == 'Bun'
+        working-directory: packages/typescript
+        run: bun --bun ./node_modules/vitest/vitest.mjs run
+
+      - name: Test suite on Deno
+        if: matrix.runtime == 'Deno'
+        working-directory: packages/typescript
+        run: deno run -A --node-modules-dir=manual ./node_modules/vitest/vitest.mjs run
+
   test-windows:
     name: Python 3.12 / Windows (SQLite only)
     runs-on: windows-latest
