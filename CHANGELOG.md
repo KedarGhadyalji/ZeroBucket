@@ -6,6 +6,46 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
+## npm `zerobucket` [0.12.1] - 2026-11-18
+
+Bun and Deno are now tested, instead of "expected to work". No change to the library code: the package behaves the same, and the
+published `dist/` is the same code as 0.12.0 (checked against the published tarball: `index.cjs` is byte-identical, and in the ESM files and the shared chunk only a build hash in one filename and its sourcemap line differ).
+
+### Verified
+
+- **Bun 1.4.4 and Deno 2.9.6 (Linux) pass the whole test suite: 440 of 440**, the same as Node 22, against PostgreSQL 16,
+  MariaDB 10.11, SQLite and an S3 server (so SQLite, tiering, HEIC, the CLI, the HTTP handler, streaming and the validation memory
+  test all ran on those runtimes). Checked first that the tests really run on Bun: the test process and its child processes report
+  Bun, not Node.
+- **Installing the packed tarball into a fresh project and importing `zerobucket` and `zerobucket/http` by name works on Node, Bun
+  and Deno.**
+- Two ways of using Deno that do **not** work, now documented: bare `npm:zerobucket` imports with no `node_modules` cannot see the
+  optional drivers (`better-sqlite3`, `pg`, `mysql2`); an import map does not help. What does work is in the README
+  ("Runtime notes").
+
+### Added
+
+- `npm run test:runtimes` (`tests/runtimes/check.mjs`, started by `run.mjs`): 23 checks of the **built** package in plain JavaScript,
+  with no vitest and no TypeScript loader. It covers loading as ESM and as CommonJS, SQLite (put, get, streaming, putMany, delete,
+  20 concurrent writes), validation errors, a size limit, optimize, HEIC, the HTTP handler (200, 304, 206, 404) and a real
+  `node:http` socket, the CLI run by the same runtime (`init`, `info`, `verify` exiting 1 on a corrupted image, a usage error),
+  PostgreSQL, MySQL/MariaDB and S3 tiering. PostgreSQL, MySQL and S3 run when the same `ZEROBUCKET_TEST_*` settings the suite uses
+  are present. It runs on every runtime found on PATH and fails if any fails or does not exit by itself (so an unclosed pool or a
+  HEIC worker thread that keeps the process alive is caught). Checked that it can fail: pointing it at an unreachable S3 endpoint
+  makes it exit 1 on all three runtimes.
+- **CI: a `test-runtimes` job** runs the check and the full suite on Bun 1.4.4 and Deno 2.9.6 against PostgreSQL 16, MariaDB 10.11
+  and moto. The versions are pinned to the ones this was verified on. This is the one part not run before release (it needs GitHub's
+  runners); the commands in it are the ones that were run locally.
+
+### Changed
+
+- Tests: helper processes (the SQLite write-lock holder, the `--import tsx` child scripts) now start through
+  `tests/support/nodeBinary.ts`, which is `process.execPath` everywhere except on Deno, where it is `node`. Those helpers are written
+  for Node, and before this 5 of the 440 tests failed on Deno for that reason alone: with a real Node for the helpers, the same 5
+  pass. The library code under test still runs on Deno itself. On Node and Bun nothing changes.
+- README, "Runtime notes": "Bun/Deno: expected to work, not yet tested" is replaced by what was tested, what was not (Windows
+  and macOS on Bun/Deno, MySQL 8.0 on them, Deno Deploy, `bun:sqlite`) and the Deno setup that works.
+
 ## Python `zerobucket` [0.35.0] - 2026-11-16
 
 SQLite now reports and retries every operation. Since 0.27.0 three of them were left out on purpose: sync `get_stream()`, sync
@@ -80,7 +120,7 @@ It is a change to released behaviour, so it gets its own release.
 ### Not changed
 
 - The advisory lock (this package has had it since 0.11.0; Python 0.34.0 now takes the same one). SQLite and MySQL/MariaDB (already correct).
-  The `vitest` dev dependency (see 0.11.1). Bun and Deno are still untested.
+  The `vitest` dev dependency (see 0.11.1). Bun and Deno are still untested. (Tested in 0.12.1.)
 
 ## Python `zerobucket` [0.34.0] - 2026-11-15
 
