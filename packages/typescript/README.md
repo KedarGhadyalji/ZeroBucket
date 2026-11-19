@@ -552,7 +552,26 @@ memory, event-loop impact, throughput, and the before and after of each release)
 
 ## Runtime notes
 
-Node 20+ for Postgres and MySQL/MariaDB, Node 22+ for SQLite. Bun/Deno: expected to work, not yet tested. Edge runtimes (Cloudflare Workers, Vercel Edge) cannot open raw
+Node 20+ for Postgres and MySQL/MariaDB, Node 22+ for SQLite.
+
+**Bun and Deno are tested** (from 0.12.1; Bun 1.4.4 and Deno 2.9.6, on Linux). On each of them, the entire test suite
+(440 tests: PostgreSQL 16, MariaDB 10.11, SQLite, S3 tiering, HEIC, the CLI and the HTTP handler) passes, and so does
+`npm run test:runtimes`, which runs the _built_ package through 23 checks: ESM and CommonJS loading, SQLite, validation,
+optimize, HEIC, the HTTP handler over a real socket, the CLI (including `verify` catching a corrupted image), PostgreSQL,
+MySQL/MariaDB and S3 tiering. Not tested: Windows or macOS on Bun/Deno, MySQL 8.0 on them, Deno Deploy, and Bun's built-in
+`bun:sqlite` (this package uses `better-sqlite3`, which works on Bun).
+
+- **Bun:** nothing special. `bun add zerobucket pg sharp` (plus the driver you use) and import as usual.
+- **Deno:** install into a `node_modules` folder, the same as for Node: put the packages you use in a `package.json`
+  (`zerobucket` plus `sharp`, and `pg`, `mysql2` or `better-sqlite3`), run `deno install`, then `deno run -A main.ts`.
+  No `--allow-scripts` is needed: `sharp` and `better-sqlite3` ship prebuilt binaries.
+- **Deno with bare `npm:` imports and no `node_modules`** does not work for the optional drivers: Deno cannot find
+  `better-sqlite3`, `pg` or `mysql2` from inside the `zerobucket` package, and says so as "SQLiteBackend requires the
+  'better-sqlite3' package". It works if you run with `--node-modules-dir=auto` and also import the driver yourself in
+  your own code (for example `import "npm:better-sqlite3@^13";`), which is what makes Deno install it where
+  `zerobucket` can see it. An import map does not help, because it does not apply inside npm packages.
+
+Edge runtimes (Cloudflare Workers, Vercel Edge) cannot open raw
 Postgres TCP connections through `pg` without a proxy such as Hyperdrive; use the Node runtime for these routes.
 In serverless, keep `poolMaxSize` small (1-2) or inject a pool shared across invocations.
 

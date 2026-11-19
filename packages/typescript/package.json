@@ -1,6 +1,6 @@
 {
   "name": "zerobucket",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "Database-native image storage for Node.js. Your database. Your images. Zero buckets.",
   "license": "MIT",
   "author": "Kedar Ghadyalji",
@@ -76,6 +76,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:env": "tsx tests/support/checkEnv.ts",
+    "test:runtimes": "node tests/runtimes/run.mjs",
     "prepublishOnly": "npm run typecheck && npm run build"
   },
   "peerDependencies": {
