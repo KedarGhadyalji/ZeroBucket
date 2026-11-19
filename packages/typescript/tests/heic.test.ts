@@ -16,6 +16,7 @@ import {
 import { createImageHandler } from "../src/http.js";
 import { _testing, decodeHeic, looksLikeHeic } from "../src/heic.js";
 import { DATABASE_URL, makeImage, newBucket } from "./helpers.js";
+import { nodeBinary } from "./support/nodeBinary.js";
 
 const fixture = (n: string) =>
   readFileSync(join(process.cwd(), "tests/fixtures", n));
@@ -222,7 +223,7 @@ describe("HEIC worker lifecycle", () => {
       ms: number;
     }>((resolve) => {
       const t0 = Date.now();
-      const c = spawn(process.execPath, ["--import", "tsx", file], {
+      const c = spawn(nodeBinary, ["--import", "tsx", file], {
         cwd: process.cwd(),
       });
       let out = "";

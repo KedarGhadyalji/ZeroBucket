@@ -28,6 +28,7 @@ import {
 } from "../src/index.js";
 import { createImageHandler } from "../src/http.js";
 import { makeGif, makeImage } from "./helpers.js";
+import { nodeBinary } from "./support/nodeBinary.js";
 
 const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
 const collect = async (it: AsyncIterable<Buffer>) => {
@@ -46,7 +47,7 @@ function lockFromAnotherProcess(
   ms: number,
 ): Promise<{ done: Promise<void> }> {
   const script = `const D=require('better-sqlite3');const d=new D(process.argv[1]);d.pragma('busy_timeout=0');d.exec('BEGIN IMMEDIATE');console.log('locked');setTimeout(()=>{d.exec('COMMIT');d.close();},Number(process.argv[2]));`;
-  const child = spawn(process.execPath, ["-e", script, path, String(ms)], {
+  const child = spawn(nodeBinary, ["-e", script, path, String(ms)], {
     cwd: ROOT,
     stdio: ["ignore", "pipe", "inherit"],
   });
@@ -557,7 +558,7 @@ describe("SQLite: lock contention without blocking the event loop", () => {
         new Promise<{ code: number | null; out: string; err: string }>(
           (resolve) => {
             const c = spawn(
-              process.execPath,
+              nodeBinary,
               ["--import", "tsx", join(dir, "child.mts")],
               { cwd: ROOT },
             );

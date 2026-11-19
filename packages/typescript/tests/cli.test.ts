@@ -16,6 +16,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ZeroBucket } from "../src/index.js";
 import { main } from "../src/cli.js";
 import { DATABASE_URL, makeImage } from "./helpers.js";
+import { nodeBinary } from "./support/nodeBinary.js";
 
 const ENDPOINT = process.env.ZEROBUCKET_TEST_S3_ENDPOINT;
 const MYSQL_URL = process.env.ZEROBUCKET_TEST_MYSQL_URL;
@@ -780,7 +781,7 @@ describe("the real executable", () => {
       new Promise<{ code: number | null; out: string; err: string }>(
         (resolve) => {
           const c = spawn(
-            process.execPath,
+            nodeBinary,
             ["--import", "tsx", "src/bin.ts", ...args],
             {
               cwd: process.cwd(),

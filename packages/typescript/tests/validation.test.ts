@@ -14,6 +14,7 @@ import {
   ImageTooLargeError,
   validateImage,
 } from "../src/index.js";
+import { nodeBinary } from "./support/nodeBinary.js";
 
 const MAX = 64 * 1024 * 1024;
 
@@ -276,7 +277,7 @@ describe("validateImage: memory", () => {
       err: string;
     }>((resolve) => {
       const c = spawn(
-        process.execPath,
+        nodeBinary,
         ["--input-type=module", "-e", launcher, file],
         { cwd: process.cwd() },
       );
