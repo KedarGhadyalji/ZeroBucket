@@ -499,7 +499,9 @@ class SQLiteBackend(StorageBackend):
         except Exception:  # noqa: BLE001
             pass  # never let a metrics callback break a real operation
 
-    def _with_retry(self, attempt_fn, *, operation: str, start_time: float | None = None):
+    def _with_retry(
+        self, attempt_fn, *, operation: str, start_time: float | None = None
+    ):
         """Runs `attempt_fn()` (one complete attempt, which opens and cleans up its
         own connection), retrying lock contention (see `_is_retryable`) up to
         max_retries times with exponential backoff plus jitter. Emits exactly one
