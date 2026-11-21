@@ -31,20 +31,46 @@ subclass of it) with Django's own decorators the normal way:
 
 (and skip including django_zerobucket.urls' own unprotected route, or
 your images will still be reachable there too.)
+
+ASYNC (0.2.0): AsyncServeImageView is the same view on the async client, for
+projects running under ASGI. To make ZeroBucketStorage.url() point at it, include
+"django_zerobucket.urls_async" INSTEAD of "django_zerobucket.urls" (both define the
+same route name, so use one or the other), or mount the view yourself. Under ASGI
+it never blocks the event loop and streams the response asynchronously. Under WSGI
+Django runs an async view in a throwaway event loop per request, and the async
+client's connection pool cannot survive that (see storage.py), so there the view
+serves the request with the synchronous client in a worker thread instead: same
+response, no pool per request. It tells the two apart by whether the request is an
+ASGIRequest (it has a `scope`).
 """
 
 from __future__ import annotations
 
+from asgiref.sync import sync_to_async
 from django.http import (
     HttpRequest,
     HttpResponse,
     HttpResponseNotFound,
     StreamingHttpResponse,
 )
+from django.utils.http import content_disposition_header
 from django.views import View
 from zerobucket import ImageNotFoundError
 
 from .storage import ZeroBucketStorage
+
+
+def _apply_image_headers(response: StreamingHttpResponse, metadata) -> None:
+    """Content-Length and Content-Disposition, shared by both views.
+
+    Content-Disposition is built by Django's own helper (RFC 6266), so a filename with a double
+    quote or non-ASCII characters is escaped or encoded properly instead of producing a
+    malformed header."""
+    response["Content-Length"] = str(metadata.size_bytes)
+    if metadata.filename:
+        response["Content-Disposition"] = content_disposition_header(
+            False, metadata.filename
+        )
 
 
 class ServeImageView(View):
@@ -98,7 +124,51 @@ class ServeImageView(View):
 
         stream = client.get_stream(image_id)
         response = StreamingHttpResponse(stream, content_type=metadata.mime_type)
-        response["Content-Length"] = str(metadata.size_bytes)
-        if metadata.filename:
-            response["Content-Disposition"] = f'inline; filename="{metadata.filename}"'
+        _apply_image_headers(response, metadata)
         return response
+
+
+class AsyncServeImageView(View):
+    """ServeImageView on the async client (see this module's docstring for when to use it).
+
+    `storage_class` works exactly as on ServeImageView: it is instantiated once, and if your
+    model field's storage has OPTIONS beyond a bare database_url, override it in a subclass so
+    this view uses an identically configured client.
+
+    Two round trips per request, as in the sync view (metadata for the headers, then
+    get_stream()'s own existence check). The response body is an async iterator, which Django's
+    ASGI handler streams without blocking; it is read after this coroutine returns, on the same
+    event loop. If the image is deleted between the two calls the answer is a 404, not a 500.
+    """
+
+    storage_class = ZeroBucketStorage
+
+    @property
+    def storage(self) -> ZeroBucketStorage:
+        if not hasattr(self, "_storage"):
+            self._storage = self.storage_class()
+        return self._storage
+
+    async def get(self, request: HttpRequest, image_id: str) -> HttpResponse:
+        if not hasattr(request, "scope"):
+            # Not an ASGIRequest: Django is running this async view under WSGI, in a loop that
+            # ends with the request. Use the synchronous path (see the module docstring).
+            return await sync_to_async(self._get_sync)(request, image_id)
+
+        client = (
+            self.storage._aclient()
+        )  # noqa: SLF001 -- same package, deliberate reuse
+        try:
+            metadata = await client.metadata(image_id)
+            stream = await client.get_stream(image_id)
+        except ImageNotFoundError:
+            return HttpResponseNotFound()
+
+        response = StreamingHttpResponse(stream, content_type=metadata.mime_type)
+        _apply_image_headers(response, metadata)
+        return response
+
+    def _get_sync(self, request: HttpRequest, image_id: str) -> HttpResponse:
+        view = ServeImageView()
+        view.storage_class = self.storage_class
+        return view.get(request, image_id)
