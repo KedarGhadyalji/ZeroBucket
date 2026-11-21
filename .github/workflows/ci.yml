@@ -327,6 +327,66 @@ jobs:
         working-directory: packages/typescript
         run: deno run -A --node-modules-dir=manual ./node_modules/vitest/vitest.mjs run
 
+  # The Django package had no CI job before 0.2.0 (its tests were only run locally). Django 6.0 needs Python 3.12 or newer, so
+  # 3.10 is covered with Django 5.2 only. The core package is installed from this checkout first, so the suite runs against the
+  # code in the repository and not against whatever zerobucket is on PyPI.
+  test-django:
+    name: Django ${{ matrix.django }} / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: zerobucket_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.10"
+            django: "5.2"
+            django-next: "5.3"
+          - python-version: "3.12"
+            django: "5.2"
+            django-next: "5.3"
+          - python-version: "3.12"
+            django: "6.0"
+            django-next: "6.1"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the core package, then the Django package with Django ${{ matrix.django }}
+        run: |
+          pip install -e packages/python
+          pip install -e "packages/django-zerobucket[dev]" "Django>=${{ matrix.django }},<${{ matrix.django-next }}"
+          python -c "import django; print('Django', django.get_version())"
+
+      - name: Lint
+        working-directory: packages/django-zerobucket
+        run: ruff check src/ tests/
+
+      - name: Test
+        working-directory: packages/django-zerobucket
+        env:
+          ZEROBUCKET_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/zerobucket_test
+        run: pytest -v
+
   test-windows:
     name: Python 3.12 / Windows (SQLite only)
     runs-on: windows-latest
