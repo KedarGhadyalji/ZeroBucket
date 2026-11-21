@@ -13,8 +13,8 @@ S3/GCS backends do for their targets.
 pip install django-zerobucket
 ```
 
-Requires Django >= 5.2 and a PostgreSQL database ZeroBucket can store
-images in (see the [core `zerobucket` package](https://github.com/KedarGhadyalji/ZeroBucket)
+Requires Django >= 5.2 (tested on 5.2 and 6.0, Python 3.10 to 3.12) and a
+PostgreSQL database ZeroBucket can store images in (see the [core `zerobucket` package](https://github.com/KedarGhadyalji/ZeroBucket)
 for schema/setup details -- this package doesn't change any of that,
 it's a thin adapter on top).
 
@@ -111,6 +111,96 @@ S3 objects, presigned S3 URLs for images you've moved via
 override `url()`. This backend has no special knowledge of tiering one
 way or the other, since transparent reads mean it doesn't need any.
 
+## Async (ASGI)
+
+From 0.2.0 `ZeroBucketStorage` has async counterparts of the Storage methods,
+built on the core library's `AsyncZeroBucket`, and there is an async serving
+view. Django's own `Storage` has no async API, so these names are this
+package's:
+
+```python
+name = await storage.asave("photo.jpg", content)   # like storage.save()
+f = await storage.aopen(name)                       # like storage.open()
+await storage.aexists(name)
+await storage.asize(name)
+await storage.adelete(name)
+```
+
+`asave()` makes the same name checks as `Storage.save()` and returns the new
+image id, as `save()` does. Everything above and `save()`/`open()` and friends
+read and write the same data. Django's model layer is not wired to
+these: `FieldFile` has no async methods, and `await instance.asave()` simply
+runs the model's synchronous `save()` (and so the synchronous storage) in a
+thread. Call the storage's async methods directly when you want the async
+client.
+
+To serve images with the async view, include `django_zerobucket.urls_async`
+**instead of** `django_zerobucket.urls` (both define the route name
+`django_zerobucket:serve`, so use one or the other):
+
+```python
+urlpatterns = [
+    ...,
+    path("images/", include("django_zerobucket.urls_async")),
+]
+```
+
+or mount `django_zerobucket.views.AsyncServeImageView` yourself, as the sync
+view's access-control example above does. If an image is deleted between the
+view's two lookups, the answer is a 404.
+
+### Use ASGI. What happens under WSGI
+
+Async support only pays off under an ASGI server (uvicorn, daphne, hypercorn).
+The reason is specific: an async connection pool belongs to the event loop it
+was first used on and cannot move to another. So the async client is cached
+**per event loop**. Under ASGI there is one loop for the life of the process,
+so there is one pool, shared by every request.
+
+Under WSGI Django runs each async call in a throwaway event loop of its own.
+Two things then happen, and both are deliberate:
+
+- **`AsyncServeImageView` notices and does not use the async client.** It sees
+  that the request is not an `ASGIRequest` and serves it with the synchronous
+  client in a worker thread. Same response, no pool built per request. (Measured
+  on gunicorn with the sync workers: about 2 ms per request this way, against
+  about 13 ms when every request built its own pool.)
+- **Calling `asave()` and friends yourself under WSGI** works, but each call
+  would build a pool on its own short-lived loop. The first time the package
+  sees a new loop after an earlier one ended without being closed, it emits a
+  `RuntimeWarning` saying so (once per process). Use the synchronous methods
+  under WSGI.
+
+If you run your own short-lived event loop (a script, a test), close the
+client before the loop ends so its pool is closed rather than abandoned:
+
+```python
+await storage.aclose()                    # this storage's client, on this loop
+# or
+from django_zerobucket.storage import aclose_async_clients
+await aclose_async_clients()              # every client of this loop
+```
+
+Under ASGI you do not need to; the loop ends with the process.
+
+**Windows.** psycopg3's async mode cannot run on Windows' default
+`ProactorEventLoop`, only on a `SelectorEventLoop`. This is a psycopg limitation,
+and the core `AsyncZeroBucket` raises a clear `StorageError` that tells you so
+instead of timing out. The async storage methods and the async view inherit it:
+on Windows, run your async code on a selector loop (for example
+`asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop)`, or set
+`asyncio.WindowsSelectorEventLoopPolicy()` before your server creates its
+loop). The synchronous API, and `AsyncServeImageView` under WSGI, are
+unaffected. The package's own test suite sets the selector policy in its
+`conftest.py` for the same reason.
+
+**Access-control hooks.** `before_get` and `before_put` in `OPTIONS` may be
+plain functions or `async def` functions. The async client awaits an async
+hook. The synchronous client runs it through asgiref's `async_to_sync`, so the
+same rule applies on both paths. (Without that, the sync client would take the
+coroutine object an `async def` hook returns as a truthy answer and allow every
+read.)
+
 ## Management commands
 
 Thin wrappers around the core `zerobucket` CLI's already-tested
@@ -140,10 +230,6 @@ in a cron job or CI/deploy step, not just interactively.
   leverage, more idiomatic choice for a first pass -- it composes with
   Django's existing `FileField`/`ImageField`, forms, and admin, rather
   than asking every adopting project to learn a new field type.
-- **No async support.** The core `zerobucket` package ships
-  `AsyncZeroBucket`; this package's `ZeroBucketStorage`/`ServeImageView`
-  are both built on the sync client. Django's own async views/ORM paths
-  aren't wired up to it yet.
 - **No signal-based cleanup.** Django does not automatically delete
   storage files when a model instance is deleted (this is a general
   Django behavior, not specific to this backend -- confirmed directly,
@@ -165,6 +251,8 @@ export ZEROBUCKET_TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:543
 pytest -q
 ruff check src tests
 ```
+
+The async tests use `pytest-asyncio` (in the `dev` extra; `asyncio_mode = "auto"`).
 
 Tests run against a real PostgreSQL instance, used for two separate
 roles simultaneously: Django's own `DATABASES` (its internal tables plus

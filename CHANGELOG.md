@@ -6,7 +6,61 @@ with which one they apply to. The core `zerobucket` package's version
 history continues below unbroken; `django-zerobucket` starts its own
 version sequence from 0.1.0.
 
-## npm `zerobucket` [0.12.1] - 2026-11-18
+## django-zerobucket [0.2.0] - 2026-11-19
+
+Async support, on the core library's async client, plus a Django CI job (the package had none).
+
+### Added
+
+- **Async storage methods on `ZeroBucketStorage`:** `asave()`, `aopen()`, `aexists()`, `asize()`, `adelete()` and `aclose()`. Django's
+  `Storage` has no async API, so these names are this package's. `asave()` makes the same name checks as `Storage.save()`
+  (`validate_file_name` before and after `get_available_name`, and on the result), reads the upload in a worker thread so the event
+  loop is not blocked, and returns the new image id. They read and write the same data as the sync methods.
+- **`AsyncServeImageView`** and a second route module, **`django_zerobucket.urls_async`**. Include it instead of
+  `django_zerobucket.urls`: both define the route name `django_zerobucket:serve`. Under ASGI the view uses the async client and
+  Django streams the response without blocking the loop. If the image is deleted between the view's two lookups the answer is a 404.
+- **Under WSGI the async view serves the request with the sync client, in a worker thread.** Django runs an async view in a throwaway
+  event loop per request under WSGI, and an async connection pool cannot survive that. The view tells the two apart by whether the
+  request is an `ASGIRequest`. Measured on gunicorn (1 sync worker, 100 sequential requests): median 2.2 ms with this, 13.4 ms without
+  (every request builds and opens a pool), and the "new event loop" warning below appears without it.
+- **The async client is cached per event loop**, not globally. The first time a new loop is seen after an earlier one was closed without
+  `aclose()`, a one-time `RuntimeWarning` explains that this looks like WSGI. `await storage.aclose()` and
+  `aclose_async_clients()` (in `django_zerobucket.storage`) close a loop's clients so a short-lived loop does not abandon its pool.
+- **Async access-control hooks.** `before_get` / `before_put` in `OPTIONS` may be `async def`. The async client awaits them, and the
+  sync client runs them through `async_to_sync`. Without that, the sync client would treat the coroutine object an `async def` hook returns
+  as truthy and silently allow every read and write.
+- A **`test-django` CI job**: the Django package's tests were never run in CI before (only locally). It runs the suite on Python 3.10 and
+  3.12 with Django 5.2, and on 3.12 with Django 6.0, against PostgreSQL 16.
+- Tests: `tests/test_async_storage.py` (24) and `tests/test_async_views.py` (12), 62 in all with the existing 26. Each behaviour above
+  was reverted in turn and the matching test failed. Also run by hand, outside the suite: a real uvicorn server (180 concurrent requests,
+  PostgreSQL connections steady at 7 across rounds) and a real gunicorn WSGI server with the same async view (steady at 4), both with
+  correct bytes and a 404 for a missing id.
+
+### Changed
+
+- **`zerobucket>=0.33.0`** (was `>=0.26.0`), also for the `[s3]` extra. The suite was run against exactly 0.33.0 from PyPI.
+- `Content-Disposition` is now built by Django's `content_disposition_header()` (RFC 6266) in both views. For an ordinary filename the
+  header is unchanged (`inline; filename="photo.jpg"`). A filename containing a double quote used to produce a malformed header, and a
+  non-ASCII one was encoded wrongly; now they are escaped (`filename="a\"b.jpg"`) or sent as `filename*=utf-8''caf%C3%A9.jpg`.
+- `pytest-asyncio>=0.23` joins the `dev` extra; `asyncio_mode = "auto"` in `pyproject.toml`.
+- Tests: `tests/conftest.py` selects a `SelectorEventLoop` on Windows, the same way the core package's conftest does. psycopg3's async mode
+  cannot run on Windows' default `ProactorEventLoop`, and without this 20 of the 62 tests (every one that opens the async pool) failed on
+  Windows with the core package's "cannot run under Windows' default ProactorEventLoop" error. Found by running the suite on Windows; the
+  first version of this release had only been run on Linux. The Windows CI jobs are SQLite-only, so the Django suite is not run on Windows
+  in CI.
+- README: a "Windows" note in the async section (async code needs a selector loop; the sync API and the async view under WSGI are unaffected).
+- README: new "Async (ASGI)" section; "No async support" is removed from the list of things the package doesn't do.
+
+### Fixed
+
+- The 0.12.1 npm entry below is now dated 2026-11-19, the day it was published (it said 2026-11-18).
+
+### Not changed
+
+- The synchronous API, the model field behaviour, the management commands and the default URL route (`django_zerobucket.urls`). Nothing
+  changes for existing sync users except the dependency floor and the corrected `Content-Disposition` for unusual filenames.
+
+## npm `zerobucket` [0.12.1] - 2026-11-19
 
 Bun and Deno are now tested, instead of "expected to work". No change to the library code: the package behaves the same, and the
 published `dist/` is the same code as 0.12.0 (checked against the published tarball: `index.cjs` is byte-identical, and in the ESM files and the shared chunk only a build hash in one filename and its sourcemap line differ).

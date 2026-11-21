@@ -81,7 +81,8 @@ Requires Python 3.10+ and a PostgreSQL 13+ database (uses
 
 Using Django? See [`django-zerobucket`](packages/django-zerobucket) --
 a separate package, a Storage backend adapter that plugs ZeroBucket into
-your existing `FileField`/`ImageField` (`pip install django-zerobucket`).
+your existing `FileField`/`ImageField`, with async storage methods and an
+async serving view for ASGI (`pip install django-zerobucket`).
 
 ## Usage
 
@@ -1221,7 +1222,8 @@ zerobucket/
 │   └── django-zerobucket/  # separate package: Django Storage backend adapter
 │       ├── src/django_zerobucket/
 │       │   ├── storage.py      # ZeroBucketStorage(Storage)
-│       │   ├── views.py        # ServeImageView
+│       │   ├── views.py        # ServeImageView, AsyncServeImageView
+│       │   ├── urls.py / urls_async.py  # the sync / async serving route
 │       │   └── management/commands/  # zerobucket_info/verify/tier
 │       └── tests/
 ├── benchmarks/
