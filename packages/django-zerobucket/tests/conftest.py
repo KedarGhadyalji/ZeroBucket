@@ -8,16 +8,30 @@ setup, separate table). pytest-django's `db`/`django_db` fixture
 handles the former; the `zb_client` fixture below handles the latter,
 truncating between tests the same way the main zerobucket package's own
 test suite does.
+
+WINDOWS: psycopg3's async mode cannot run under the default ProactorEventLoop,
+only a SelectorEventLoop (a documented psycopg3 limitation, the same one the
+main package's conftest works around). Without the policy set below, every test
+that opens the async connection pool fails with zerobucket's "cannot run under
+Windows' default ProactorEventLoop" error. It has to be set at import time,
+before pytest-asyncio creates its event loop for a test.
 """
 
 from __future__ import annotations
 
 import io
+import sys
 
 import pytest
 from PIL import Image as PILImage
 
-from django_zerobucket.storage import _client_cache
+if sys.platform == "win32":
+    import asyncio
+
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+from django_zerobucket import storage as storage_module
+from django_zerobucket.storage import _async_client_cache, _client_cache
 from tests.django_settings import DOTENV_LOADED, ZEROBUCKET_DATABASE_URL
 
 
@@ -35,10 +49,16 @@ def _clear_client_cache():
     already-open connection pool) left over from a previous test.
     Cleared before AND after each test so neither direction leaks."""
     _client_cache.clear()
+    _async_client_cache.clear()
+    storage_module._warned_about_throwaway_loops = False
     yield
     for client in _client_cache.values():
         client.close()
     _client_cache.clear()
+    # Async clients belong to a test's own event loop, which is closed by now: tests close what
+    # they open (see `astorage`), and anything left is only forgotten here.
+    _async_client_cache.clear()
+    storage_module._warned_about_throwaway_loops = False
 
 
 @pytest.fixture
@@ -55,6 +75,16 @@ def zb_client(_clear_client_cache):
         cur.execute("TRUNCATE TABLE zerobucket_images;")
     yield client
     client.close()
+
+
+@pytest.fixture
+async def astorage(zb_client):
+    """A ZeroBucketStorage for async tests; closes its async pool on this test's event loop."""
+    from django_zerobucket.storage import ZeroBucketStorage
+
+    storage = ZeroBucketStorage(database_url=ZEROBUCKET_DATABASE_URL)
+    yield storage
+    await storage.aclose()
 
 
 @pytest.fixture
